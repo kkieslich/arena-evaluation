@@ -35,6 +35,9 @@ MEMBER_ROLE_PARTICIPANT = 0
 MEMBER_ROLE_QUEUED = 1
 ENV_STATE_TABLES = ("peds_physics", "ped_gestures", "interactions", "interaction_events", "animation_states")
 KEPT_EMPTY_TABLES = ("ped_gestures",)
+# Beside an env's peds.parquet when it is a copy of the crowd engine's agent_states (no arena_peds recorded): those
+# positions are in the world frame already and take no env offset.
+ENGINE_PEDS_MARKER = "peds.from_agent_states"
 
 Anchor = tuple[int, float, float]
 
@@ -871,6 +874,7 @@ class MCAPReader:
                 arena_peds = env_dir / "peds.parquet"
                 if engine_peds.exists() and not arena_peds.exists():
                     shutil.copyfile(engine_peds, arena_peds)
+                    (env_dir / ENGINE_PEDS_MARKER).touch()
 
         return self.load_bundles(out_dir, run_dir, map_name_fallback=map_name_fallback)
 
@@ -1072,7 +1076,10 @@ class MCAPReader:
                     logging.getLogger(__name__).warning(f"Failed to offset episode_record coordinates: {e}")
                     pass
 
-            for table in ("peds", "peds_physics") if shifted else ():
+            # The crowd engine runs in the world frame and its adapter adds the env offset for arena_peds only: agent_states
+            # (peds_physics, and peds when it is a copy of them) are in the world frame already and stay as recorded.
+            engine_only = (env_dir / ENGINE_PEDS_MARKER).exists()
+            for table in ("peds",) if shifted and not engine_only else ():
                 peds = getattr(rb, table)
                 if peds is None:
                     continue

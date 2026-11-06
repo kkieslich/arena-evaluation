@@ -108,7 +108,7 @@ class ParquetStore:
 class TopicParquetStore:
     """Reads and writes TopicBundle DataFrames to per-topic Parquet files."""
 
-    VERSION = 2
+    VERSION = 3
     VERSION_FILE = ".cache_version"
 
     @staticmethod
