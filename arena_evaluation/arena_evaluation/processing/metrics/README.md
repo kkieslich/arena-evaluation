@@ -105,6 +105,15 @@ The pipeline keeps each env's tracks while it processes the episode, under the t
 
 The pooled divergence is the primary score: it measures the systematic flow change. The paired one also counts a crowd that ran differently after one pedestrian was turned another way, so an inert footprint can score clearly above 0 per seed while its pooled map barely moves.
 
+**Maps** (`flow_cells.parquet`, next to `combined_metrics.parquet`): `process_benchmark` also writes the map of every evaluated run it scored, one row per cell and bin that holds time, for the report's `flow_map` plot (data source `flow_cells`). A benchmark without `flowedit suite` stages has none, and a stale file is removed.
+
+| Column | Definition |
+|---|---|
+| `planner`, `stage`, `flow_world`, `flow_base`, `flow_seed` | the run, as on its metrics row |
+| `x`, `y`, `cell_m` | cell centre in the world frame, on the base world's grid, and the cell size |
+| `heading_rad` | centre of the walking-direction bin, None for standing |
+| `ped_seconds` | pedestrian-seconds in the cell and bin |
+
 ## Mechanism metrics (mechanisms)
 
 Robot behaviour at doors, elevators and alarms, replayed from the episode's `semantic_snapshot`

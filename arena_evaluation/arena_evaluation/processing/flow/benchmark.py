@@ -14,7 +14,7 @@ from arena_simulation_setup.generative.flowedit.suite import parse_stage_name, s
 
 from ..mcap_reader import bundle_env
 from ..ped_track_store import pair, tracks_for_episode
-from .grid import FlowGrid
+from .grid import CELL_SCHEMA, FlowGrid
 from .maps import jsd, occupancy, pooled
 
 FLOW_REFERENCE_DTYPES = {
@@ -31,6 +31,8 @@ FLOW_REFERENCE_DTYPES = {
     "flow_jsd_pooled_occupancy": pl.Float64,
     "flow_pooled_seeds": pl.Int64,
 }
+# the cell rows of every evaluated run, as process_benchmark writes them to grid.FLOW_CELLS_FILE
+FLOW_CELL_SCHEMA = {"planner": pl.String, "stage": pl.String, "flow_world": pl.String, "flow_base": pl.String, "flow_seed": pl.Int64, **CELL_SCHEMA}
 
 Run = tuple[int, str]
 
@@ -51,6 +53,14 @@ def world_grid(world: str, run_dir: pathlib.Path | None) -> FlowGrid | None:
 
     view = world_view(world, run_dir)
     return None if view is None else FlowGrid.from_world(view)
+
+
+@dataclasses.dataclass(frozen=True)
+class FlowOutput:
+    """How many rows took part in the flow measures, and the flow map of each run they scored (FLOW_CELL_SCHEMA rows)."""
+
+    rows: int
+    cells: pl.DataFrame
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,8 +86,8 @@ def add_flow_reference_metrics(
     evaluated: str = "evaluated",
     tracks: Callable[[pathlib.Path, str], pl.DataFrame] = tracks_for_episode,
     grid: Callable[[str, pathlib.Path | None], FlowGrid | None] = world_grid,
-) -> int:
-    """Write the flow outputs into every evaluated `flowedit suite` row of `rows` in place, each edit against its contestant's base run; returns how many rows took part."""
+) -> FlowOutput:
+    """Write the flow outputs into every evaluated `flowedit suite` row of `rows` in place, each edit against its contestant's base run."""
     entries: list[_Entry] = []
     for i, row in enumerate(rows):
         parsed = parse_stage(row.get("stage"))
@@ -87,7 +97,7 @@ def add_flow_reference_metrics(
         run = None if episode is None else (int(episode), bundle_env(str(row.get("robot") or "")))
         entries.append(_Entry(i, str(row.get("planner") or ""), *parsed, run))
     if not entries:
-        return 0
+        return FlowOutput(0, pl.DataFrame(schema=FLOW_CELL_SCHEMA))
 
     grids: dict[str, FlowGrid | None] = {}
     maps: dict[Run, np.ndarray] = {}
@@ -112,6 +122,11 @@ def add_flow_reference_metrics(
     stages: dict[tuple[str, str, int], Run | None] = {}
     for entry in entries:
         stages.setdefault((entry.planner, entry.world, entry.seed), entry.run)
+    cells = [pl.DataFrame(schema=FLOW_CELL_SCHEMA)]
+    for (planner, world, seed), run in stages.items():
+        if run in maps:
+            labels = {"planner": planner, "stage": stage_name(world, seed), "flow_world": world, "flow_base": base_of(world), "flow_seed": seed}
+            cells.append(grids[base_of(world)].cells(maps[run]).with_columns(pl.lit(v, FLOW_CELL_SCHEMA[k]).alias(k) for k, v in labels.items()).select(list(FLOW_CELL_SCHEMA)))
 
     for entry in entries:
         if entry.world == entry.base or (entry.planner, entry.base, entry.seed) not in stages:
@@ -147,7 +162,7 @@ def add_flow_reference_metrics(
         for entry in entries:
             if (entry.planner, entry.world) == (planner, world):
                 rows[entry.row].update(result)
-    return len(entries)
+    return FlowOutput(len(entries), pl.concat(cells))
 
 
-__all__ = ["FLOW_REFERENCE_DTYPES", "add_flow_reference_metrics", "parse_stage", "world_grid"]
+__all__ = ["FLOW_CELL_SCHEMA", "FLOW_REFERENCE_DTYPES", "FlowOutput", "add_flow_reference_metrics", "parse_stage", "world_grid"]

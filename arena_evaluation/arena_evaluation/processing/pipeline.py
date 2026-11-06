@@ -275,6 +275,7 @@ def _fleet_poses(robots: dict[str, TopicBundle], window: tuple[int | None, int |
 
 from arena_evaluation.benchmark.profiler import PipelineProfiler
 from arena_evaluation.processing.episode_topics import RECORD_RUNNING, episode_window, native_topics
+from arena_evaluation.processing.flow import FLOW_CELLS_FILE
 from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES, add_flow_reference_metrics
 from arena_evaluation.processing.mcap_reader import MCAPReader, bundle_env
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
@@ -888,11 +889,17 @@ class ProcessingPipeline:
 
         episode_dir_of = functools.partial(self.folder_manager.episode_dir, benchmark_id)
         run_dir = self.folder_manager.episodes_dir(benchmark_id).parent
-        if flowed := add_flow_reference_metrics(all_metrics, episode_dir_of, run_dir=run_dir, evaluated=_STATUS_EVALUATED):
-            print(f"Phase 2 Post-Processing: flow change of {flowed} flowedit suite rows against their base worlds", flush=True)
+        flowed = add_flow_reference_metrics(all_metrics, episode_dir_of, run_dir=run_dir, evaluated=_STATUS_EVALUATED)
+        if flowed.rows:
+            print(f"Phase 2 Post-Processing: flow change of {flowed.rows} flowedit suite rows against their base worlds", flush=True)
         add_paired_ped_measures(all_metrics, ref_ped_by_stage, episode_dir_of, evaluated=_STATUS_EVALUATED)
 
         combined_path = self.folder_manager.combined_metrics_path(benchmark_id)
+        cells_path = combined_path.with_name(FLOW_CELLS_FILE)
+        if len(flowed.cells):
+            ParquetStore.write(flowed.cells, cells_path)
+        else:
+            cells_path.unlink(missing_ok=True)
         ParquetStore.write_rows(all_metrics, combined_path, schema_overrides=_METRIC_DTYPES)
         print(f"Done. {len(all_metrics)} episode rows -> {combined_path}")
         return combined_path
