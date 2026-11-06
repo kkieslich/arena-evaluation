@@ -308,6 +308,7 @@ def _collect_native_topics(bundle: TopicBundle) -> dict[str, pl.DataFrame]:
 from arena_evaluation.benchmark.profiler import PipelineProfiler
 from arena_evaluation.processing.mcap_reader import KEPT_EMPTY_TABLES, MCAPReader
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
+from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
 from arena_evaluation.processing.pose_anchor import resolve_pose_source
 from arena_evaluation.processing.pose_segments import ride_arrival_times
@@ -340,6 +341,7 @@ _METRIC_DTYPES = {
     "stuck": pl.Boolean,
     "start": pl.List(pl.Float64),
     "goal": pl.List(pl.Float64),
+    **PED_MEASURE_DTYPES,
 }
 
 from .metrics.registry import MetricRegistry

@@ -9,6 +9,7 @@ from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
 M = MutualAccommodationCalculator
 ALL_NONE = {"mar": None, "pfi": None, "robot_path_deviation_m": None, "relative_throughput": None, "kcsc_wh": None}
+REPLACED = dict.fromkeys(("ped_path_deflection_m_per_ped", "ped_path_deflection_m_by_group", "ped_path_deflection_m_worst_group"))
 PED_SHIFTED = [[[0.0, 1.0], [1.0, 1.0]]]
 PED_REFERENCE = [[[0.0, 0.0], [1.0, 0.0]]]
 
@@ -115,17 +116,24 @@ def test_reconcile_skips_flow_terms_without_both_ped_paths(dynamic: dict, ref_pe
 
 
 def test_reconcile_pedestrian_flow_reports_pfi_and_deflection():
-    assert _reconcile({"pedestrian_path": PED_SHIFTED}, None, {"pedestrian_path": PED_REFERENCE}) == {**ALL_NONE, "pfi": 1.0, "ped_path_deflection_m": 1.0}
+    assert _reconcile({"pedestrian_path": PED_SHIFTED}, None, {"pedestrian_path": PED_REFERENCE}) == {**ALL_NONE, **REPLACED, "pfi": 1.0, "ped_path_deflection_m": 1.0}
 
 
 def test_reconcile_reports_deflection_when_pfi_is_undefined():
-    assert _reconcile({"pedestrian_path": [[[0.0, 1.0]]]}, None, {"pedestrian_path": [[[0.0, 0.0]]]}) == {**ALL_NONE, "ped_path_deflection_m": 1.0}
+    assert _reconcile({"pedestrian_path": [[[0.0, 1.0]]]}, None, {"pedestrian_path": [[[0.0, 0.0]]]}) == {**ALL_NONE, **REPLACED, "ped_path_deflection_m": 1.0}
 
 
 def test_reconcile_deflection_pools_samples_and_skips_empty_paths():
     dynamic = {"pedestrian_path": [[], [[0.0, 1.0], [1.0, 1.0]], [[5.0, 3.0], [6.0, 3.0]]]}
     ref_ped = {"pedestrian_path": [[[0.0, 0.0], [1.0, 0.0]], [[0.0, 0.0], [1.0, 0.0]], [[5.0, 0.0], [6.0, 0.0]]]}
-    assert _reconcile(dynamic, None, ref_ped) == {**ALL_NONE, "pfi": 2.0, "ped_path_deflection_m": 2.0}
+    assert _reconcile(dynamic, None, ref_ped) == {**ALL_NONE, **REPLACED, "pfi": 2.0, "ped_path_deflection_m": 2.0}
+
+
+def test_reconcile_clears_the_breakdown_of_the_deflection_it_replaces():
+    row = {"pedestrian_path": PED_SHIFTED, "ped_path_deflection_m": 0.4, "ped_path_deflection_m_per_ped": [{"ped": "a", "value": 0.4}], "ped_path_deflection_m_by_group": [{"group": "adult", "value": 0.4, "peds": 1}], "ped_path_deflection_m_worst_group": "adult"}
+    row.update(_reconcile(row, None, {"pedestrian_path": PED_REFERENCE}))
+    assert row["ped_path_deflection_m"] == 1.0
+    assert {key: row[key] for key in REPLACED} == REPLACED
 
 
 def test_reconcile_omits_deflection_for_mixed_dimension_paths():
@@ -155,6 +163,7 @@ def test_reconcile_full_stage_comparison():
         "relative_throughput": 0.5,
         "kcsc_wh": 2.0,
         "ped_path_deflection_m": 0.25,
+        **REPLACED,
     }
 
 
@@ -177,7 +186,7 @@ def test_reconcile_mar_falls_back_to_path_length_excess_without_lateral_detour(d
 @pytest.mark.parametrize(("dynamic", "ref_robot"), [({"path_length": 12.0}, {"path": [[0.0, 0.0], [10.0, 0.0]], "path_length": 10.0}), ({"path": [[0.0, 0.0], [10.0, 0.0]], "path_length": 12.0}, {"path_length": 10.0})])
 def test_reconcile_mar_uses_path_length_when_a_robot_path_is_missing(dynamic: dict, ref_robot: dict):
     result = _reconcile({**dynamic, "pedestrian_path": PED_SHIFTED}, ref_robot, {"pedestrian_path": PED_REFERENCE})
-    assert result == {**ALL_NONE, "pfi": 1.0, "ped_path_deflection_m": 1.0, "mar": 0.5}
+    assert result == {**ALL_NONE, **REPLACED, "pfi": 1.0, "ped_path_deflection_m": 1.0, "mar": 0.5}
 
 
 def test_reconcile_ragged_robot_path_leaves_deviation_unset_and_uses_path_length():
@@ -190,7 +199,7 @@ def test_reconcile_ragged_robot_path_leaves_deviation_unset_and_uses_path_length
 def test_reconcile_mar_is_none_without_detour_or_path_lengths():
     path = [[0.0, 0.0], [10.0, 0.0]]
     result = _reconcile({"path": path, "pedestrian_path": PED_SHIFTED}, {"path": path, "path_length": 10.0}, {"pedestrian_path": PED_REFERENCE})
-    assert result == {**ALL_NONE, "pfi": 1.0, "ped_path_deflection_m": 1.0, "robot_path_deviation_m": 0.0}
+    assert result == {**ALL_NONE, **REPLACED, "pfi": 1.0, "ped_path_deflection_m": 1.0, "robot_path_deviation_m": 0.0}
 
 
 def test_reconcile_mar_is_none_without_pfi():
