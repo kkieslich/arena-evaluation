@@ -242,6 +242,7 @@ def test_arena_peds_win_over_engine_agent_states(every_topic: tuple[pathlib.Path
             "num_pedestrians": 1,
             "peds_names": ["alice"],
             "peds_agent_types": [],
+            "peds_desired_velocities": [],
             "peds_positions": [3.0, 4.0, 0.0],
             "peds_headings": [pytest.approx(math.pi / 2)],
             "peds_twists": [pytest.approx(0.3), pytest.approx(-0.1), 0.0],
@@ -402,7 +403,8 @@ def test_collision_events_count_kinds_only_when_the_schema_has_them(every_topic:
     burger = bundles["env_0_burger"].collision_events.collect().row(0, named=True)
     assert (jackal["collision_event"], jackal["collision_wall"], jackal["collision_static"], jackal["collision_pedestrian"]) == (4, 1, 1, 1)
     assert jackal["collision_obstacle_ids"] == ["p1", "s1", "w1"]
-    assert (burger["collision_event"], burger["collision_wall"], burger["collision_static"], burger["collision_pedestrian"]) == (1, None, None, None)
+    assert jackal["collision_pedestrian_ids"] == ["p1"]
+    assert (burger["collision_event"], burger["collision_wall"], burger["collision_static"], burger["collision_pedestrian"], burger["collision_pedestrian_ids"]) == (1, None, None, None, None)
 
 
 def test_monitor_power_energy_and_plan_topics(every_topic: tuple[pathlib.Path, dict]):

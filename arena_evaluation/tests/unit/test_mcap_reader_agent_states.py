@@ -67,6 +67,7 @@ def test_agent_states_nested_and_flat_layouts_read_into_identical_peds(tmp_path:
             "num_pedestrians": 2,
             "peds_names": ["3", "7"],
             "peds_agent_types": [],
+            "peds_desired_velocities": [],
             "peds_positions": [1.5, -2.0, 0.0, -0.5, 3.25, 0.0],
             "peds_headings": [0.75, -1.5],
             "peds_twists": [0.3, 0.4, 0.0, -0.2, 0.1, 0.0],
@@ -76,6 +77,16 @@ def test_agent_states_nested_and_flat_layouts_read_into_identical_peds(tmp_path:
             "peds_interaction_types": [0, 0],
         }
     ]
+
+
+def test_agent_frames_keep_each_humans_desired_speed(tmp_path: pathlib.Path) -> None:
+    msg = _flat()
+    msg.desired_velocity = [1.1, 0.5, 0.8]
+
+    (row,) = _peds_rows(tmp_path, "desired", "arena_humansim_msgs/msg/AgentFrame", msg)
+
+    assert row["peds_ids"] == [3, 7]
+    assert row["peds_desired_velocities"] == [1.1, 0.8]
 
 
 def _robot_only() -> AgentFrame:
@@ -110,6 +121,7 @@ def test_agent_frames_without_humans_before_the_first_flush_keep_the_peds_schema
             "num_pedestrians": 2,
             "peds_names": ["3", "7"],
             "peds_agent_types": [],
+            "peds_desired_velocities": [],
             "peds_positions": [1.5, -2.0, 0.0, -0.5, 3.25, 0.0],
             "peds_headings": [0.75, -1.5],
             "peds_twists": [0.3, 0.4, 0.0, -0.2, 0.1, 0.0],
