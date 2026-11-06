@@ -63,6 +63,7 @@ Report layouts are defined in `configs/benchmark/manifests/*.yaml`:
 | `social` | Proxemics, gaze, pedestrian interaction |
 | `safety` | Success rate, collisions, trajectories |
 | `characterization` | Open-loop energy/acoustic profiles |
+| `flow` | FLOWEDIT flow change of a `flowedit suite` benchmark: score per edit, flow maps, per-stage table |
 
 ### Resolution Precedence (`manifest_registry.py`)
 
@@ -96,7 +97,7 @@ plots: [ ... ]
 | Field | Type | Description |
 |---|---|---|
 | `id` | `str` | Unique plot identifier and PNG filename |
-| `type` | `str` | Plot type (`violin`, `box`, `bar`, `histogram`, `scatter`, `trajectory`, `radar`, `heatmap`, `timeseries`, `line`, `table`) |
+| `type` | `str` | Plot type (`violin`, `box`, `bar`, `histogram`, `scatter`, `trajectory`, `radar`, `heatmap`, `timeseries`, `line`, `table`, `flow_map`, `flow_jsd`) |
 | `title` | `str` | Plot title |
 | `data_key` | `str` | Column name in data source (or `"*"` for multi-metric plots) |
 | `group_by` | `str \| list[str]` | Grouping columns |
@@ -121,6 +122,8 @@ plots: [ ... ]
 - `trajectory`: paths over the world map, broken at teleports (resets, elevator rides, stair crossings), with doors and elevator cabins drawn from the world. Options: `show_map`, `overlay_markers`, `overlay_pedestrians`, `overlay_theta_star`, `overlay_reference`, `overlay_mechanisms` (default on), `facet` (a column, one panel per value), `crop` (view limited to the tracks, default on with `facet`). With `--generate-gifs` the static plot is replayed on sim time: paths grow, pedestrians walk, doors and cabin doors follow the recorded `mechanism_states`, goal and collision marks appear when their episode ends. Doors animate only on a panel that holds one episode, so `facet: local_planner` compares planners.
 - `radar`: Normalized multi-metric profile.
 - `heatmap`: Correlation matrix or pivot grid.
+- `flow_map` (data source `flow_cells`): per edit of a `flowedit suite` benchmark and contestant, three maps over the base world's rooms: the base world's pedestrian-seconds per m², the edit's, and their difference, each the mean of the seeds both ran, with arrows along the main walking direction of the busiest cells. Every edit shares one colour scale, so a small change looks small. One interactive figure and one PNG (`<id>_<world>.png`) per edit, the largest change first.
+- `flow_jsd`: flow JSD per edit on a log axis, a bar for the pooled score and a dot per seed (values under 1e-4 bits drawn at 1e-4).
 
 ---
 

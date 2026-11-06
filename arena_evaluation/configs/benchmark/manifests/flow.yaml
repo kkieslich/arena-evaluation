@@ -1,0 +1,53 @@
+# FLOWEDIT flow change: each layout edit of a `flowedit suite` benchmark against its base world run on the same seeds.
+manifest_version: "1.0"
+name: flow
+title: Flow Change Report
+description: Where pedestrians walk, stand and head in each layout edit against its base world, run by the same contestant on the same seeds. The maps show pedestrian-seconds per m² per run (mean of the seeds both ran) and their difference, all on one scale. The scores are Jensen-Shannon divergences in bits, 0 for the same flow, 1 for disjoint flow, per seed and pooled over seeds (the primary score).
+data_source: metrics
+summary:
+  - {metric: flow_jsd_pooled, label: Pooled JSD (bits), format: "{:.3f}"}
+  - {metric: flow_jsd_pooled_occupancy, label: Pooled JSD occupancy (bits), format: "{:.3f}"}
+  - {metric: flow_jsd, label: Mean JSD per seed (bits), format: "{:.3f}"}
+  - {metric: flow_pooled_seeds, label: Seeds pooled, format: "{:.0f}"}
+  - {metric: flow_peds, label: Peds per run, format: "{:.1f}"}
+summary_group_by: [planner, flow_world]
+groups:
+  - {id: overview, title: Flow Change per Edit}
+  - {id: maps, title: "Flow Maps: base world, edit and difference"}
+  - {id: per_stage, title: Per Stage (against the base world at the same seed)}
+units:
+  flow_jsd: bits
+  flow_jsd_occupancy: bits
+  flow_jsd_pooled: bits
+  flow_jsd_pooled_occupancy: bits
+  flow_room_ped_seconds: ped·s
+  flow_peds: ""
+  flow_paired_peds: ""
+  flow_unpaired_peds: ""
+  flow_pooled_seeds: ""
+plots:
+  - id: flow_jsd_overview
+    type: flow_jsd
+    title: Flow change per edit (bar pooled over seeds, dot per seed)
+    data_key: flow_jsd_pooled
+    layout_group: overview
+  - id: flow_map
+    type: flow_map
+    title: Flow map
+    data_source: flow_cells
+    data_key: ped_seconds
+    layout_group: maps
+  - id: flow_stage_table
+    type: table
+    title: Flow change per stage
+    data_key: "*"
+    layout_group: per_stage
+    options:
+      group_by: [planner, stage, flow_reference_stage]
+      columns:
+        - {metric: flow_jsd, label: JSD (bits), format: "{:.3f}"}
+        - {metric: flow_jsd_occupancy, label: JSD occupancy (bits), format: "{:.3f}"}
+        - {metric: flow_paired_peds, label: Paired peds, format: "{:.0f}"}
+        - {metric: flow_unpaired_peds, label: Unpaired peds, format: "{:.0f}"}
+        - {metric: flow_room_ped_seconds, label: Room ped·s, format: "{:.0f}"}
+        - {metric: flow_peds, label: Peds, format: "{:.0f}"}

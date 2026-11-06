@@ -1,6 +1,7 @@
 from .acoustic_field import AcousticFieldAnimationRenderer, AcousticFieldRenderer
 from .bar import BarRenderer
 from .box import BoxRenderer
+from .flow import FlowJsdRenderer, FlowMapRenderer
 from .heatmap import HeatmapRenderer
 from .histogram import HistogramRenderer
 from .line import LineRenderer
@@ -25,4 +26,6 @@ __all__ = [
     "TableRenderer",
     "AcousticFieldRenderer",
     "AcousticFieldAnimationRenderer",
+    "FlowJsdRenderer",
+    "FlowMapRenderer",
 ]

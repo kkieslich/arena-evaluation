@@ -21,6 +21,8 @@ class PlotlyRenderer:
             AcousticFieldRenderer,
             BarRenderer,
             BoxRenderer,
+            FlowJsdRenderer,
+            FlowMapRenderer,
             HeatmapRenderer,
             HistogramRenderer,
             LineRenderer,
@@ -46,6 +48,8 @@ class PlotlyRenderer:
             "table": TableRenderer,
             "acoustic_field": AcousticFieldRenderer,
             "acoustic_field_animation": AcousticFieldAnimationRenderer,
+            "flow_map": FlowMapRenderer,
+            "flow_jsd": FlowJsdRenderer,
         }
 
     def render(self, spec: PlotSpec, df: pl.DataFrame, run_dir: pathlib.Path | None = None) -> str | list[str] | None:
