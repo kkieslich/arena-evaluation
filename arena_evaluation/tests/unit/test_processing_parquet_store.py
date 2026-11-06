@@ -347,6 +347,36 @@ def test_topic_globals_written_once_for_multiple_robots(tmp_path):
     assert list(dest.glob("*/peds.parquet")) == []
 
 
+def test_topic_cache_keeps_each_envs_own_pedestrians(tmp_path: pathlib.Path) -> None:
+    first, second = _df(3, 1_000), _df(2, 9_000)
+    bundles = {
+        "env_1_jackal": TopicBundle(odom=_df(2), peds=first, agent_meta=first),
+        "env_1_burger": TopicBundle(odom=_df(2), peds=first, agent_meta=first),
+        "env_2_jackal": TopicBundle(odom=_df(2), peds=second, agent_meta=second),
+    }
+    dest = tmp_path / "cache"
+    TopicParquetStore.write(bundles, dest)
+
+    restored = TopicParquetStore.read(dest)
+    assert restored is not None
+    assert restored["env_1_jackal"].peds.collect().equals(first.sort("time_ns"))
+    assert restored["env_1_burger"].peds is restored["env_1_jackal"].peds
+    assert restored["env_2_jackal"].peds.collect().equals(second.sort("time_ns"))
+    assert restored["env_2_jackal"].agent_meta.collect().equals(second.sort("time_ns"))
+
+
+def test_topic_cache_write_clears_its_derived_tables_and_read_skips_them(tmp_path: pathlib.Path) -> None:
+    bundles, dest = _topics(tmp_path)
+    TopicParquetStore.write(bundles, dest)
+    derived = TopicParquetStore.derived_dir(dest) / "tracks"
+    derived.mkdir(parents=True)
+    _df(2).write_parquet(derived / "env_0.parquet")
+
+    assert set(TopicParquetStore.read(dest) or {}) == {"robot_1", "robot_2"}
+    TopicParquetStore.write(bundles, dest)
+    assert not TopicParquetStore.derived_dir(dest).exists()
+
+
 def test_topic_empty_frames_not_written(tmp_path):
     empty = pl.DataFrame({"time_ns": pl.Series([], dtype=pl.Int64)}, schema={"time_ns": pl.Int64})
     dest = tmp_path / "cache"

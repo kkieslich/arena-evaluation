@@ -40,6 +40,13 @@ KEPT_EMPTY_TABLES = ("ped_gestures",)
 ENGINE_PEDS_MARKER = "peds.from_agent_states"
 
 Anchor = tuple[int, float, float]
+_ENV = re.compile(r"(env_\d+)")
+
+
+def bundle_env(key: str) -> str:
+    """The env of a bundle key (`env_<n>_<robot>`), env_0 for a key that names none."""
+    match = _ENV.search(key)
+    return match.group(1) if match else "env_0"
 
 
 def anchor_at(anchors: list[Anchor], time_ns: int) -> tuple[float, float]:
@@ -1068,8 +1075,7 @@ class MCAPReader:
 
             rb = TopicBundle()
 
-            match = re.search(r'(env_\d+)', robot_name)
-            env_key = match.group(1) if match else "env_0"
+            env_key = bundle_env(robot_name)
             if env_anchors and env_key not in env_anchors:
                 raise ValueError(f"{env_key}: no map -> {env_key}/map anchor in tf_static, anchors recorded: {dict(sorted(env_anchors.items()))}")
 
