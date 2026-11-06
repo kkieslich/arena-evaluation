@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import logging
 import multiprocessing
 import os
@@ -274,12 +275,13 @@ def _fleet_poses(robots: dict[str, TopicBundle], window: tuple[int | None, int |
 
 from arena_evaluation.benchmark.profiler import PipelineProfiler
 from arena_evaluation.processing.episode_topics import RECORD_RUNNING, episode_window, native_topics
-from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES
+from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES, add_flow_reference_metrics
 from arena_evaluation.processing.mcap_reader import MCAPReader
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
 from arena_evaluation.processing.metrics.flow.flow_episode import FLOW_EPISODE_DTYPES
 from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
+from arena_evaluation.processing.ped_track_store import write_tracks
 from arena_evaluation.processing.pose_anchor import resolve_pose_source
 from arena_evaluation.processing.pose_segments import ride_arrival_times
 from arena_evaluation.processing.topic_aligner import TopicAligner
@@ -574,6 +576,11 @@ class ProcessingPipeline:
         bundles = self.extract_episode(ep, force_extract=force_extract)
         if bundles is None or len(bundles) == 0:
             return finish([_status_row(ep, metadata, _metadata_robot(metadata), "no_recording", "no MCAP or empty extraction")])
+
+        try:
+            write_tracks(episode_dir, bundles)
+        except Exception as e:
+            _log.warning(f"episode_{ep.episode_id:03d}: pedestrian tracks not kept, they are built again on use: {e!r}")
 
         _ctx = self.profiler.phase("process") if self.profiler else contextlib.nullcontext()
         with _ctx:
@@ -875,18 +882,10 @@ class ProcessingPipeline:
             )
             row.update(reconciled)
 
-        def episode_dir_of(row: dict) -> pathlib.Path | None:
-            """The directory of a metrics row's episode, None for a row without one."""
-            episode = row.get("episode")
-            return None if episode is None else self.folder_manager.episode_dir(benchmark_id, int(episode))
-
-        # INFRA: paired pedestrian measures against the stage's robot-free reference
-
-        # FLOWEDIT: each edit stage against its base world at the same seed, seed by seed and pooled
-        from .flow.benchmark import add_flow_reference_metrics
-
-        if flowed := add_flow_reference_metrics(all_metrics, episode_dir_of, evaluated=_STATUS_EVALUATED):
-            print(f"Phase 2 Post-Processing: flow change of {flowed} FLOWEDIT episodes against their base worlds", flush=True)
+        episode_dir_of = functools.partial(self.folder_manager.episode_dir, benchmark_id)
+        run_dir = self.folder_manager.episodes_dir(benchmark_id).parent
+        if flowed := add_flow_reference_metrics(all_metrics, episode_dir_of, run_dir=run_dir, evaluated=_STATUS_EVALUATED):
+            print(f"Phase 2 Post-Processing: flow change of {flowed} flowedit suite rows against their base worlds", flush=True)
 
         combined_path = self.folder_manager.combined_metrics_path(benchmark_id)
         ParquetStore.write_rows(all_metrics, combined_path, schema_overrides=_METRIC_DTYPES)

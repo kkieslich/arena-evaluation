@@ -9,7 +9,7 @@ import re
 import shutil
 import typing
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 import polars as pl
@@ -96,6 +96,7 @@ _PEDS_SCHEMA = pa.schema(
         ("peds_animation_states", pa.list_(pa.int64())),
         ("peds_interaction_ids", pa.list_(pa.int64())),
         ("peds_interaction_types", pa.list_(pa.int64())),
+        ("peds_radii", pa.list_(pa.float64())),
     ]
 )
 
@@ -226,18 +227,53 @@ _TOPIC_SCHEMAS: dict[str, pa.Schema] = {
 }
 
 
-def _ped_fields(schema: Schema, cache: dict[int, tuple[bool, bool, bool, bool, bool]]) -> tuple[bool, bool, bool, bool, bool]:
-    """Whether a recorded pedestrian schema carries animation_state, interaction_id, gestures, agent_type and per-agent desired_velocity, by schema id."""
+class _PedFields(typing.NamedTuple):
+    """Which optional fields a recorded pedestrian schema carries."""
+
+    animation_state: bool
+    interaction: bool
+    gestures: bool
+    agent_type: bool
+    desired_velocity: bool
+    radius: bool
+
+
+def _ped_fields(schema: Schema, cache: dict[int, _PedFields]) -> _PedFields:
+    """The optional fields of a recorded pedestrian schema, by schema id."""
     if schema.id not in cache:
         text = schema.data.decode()
-        cache[schema.id] = (
-            re.search(r"^\s*uint8(\[\])?\s+animation_state\b", text, re.M) is not None,
-            re.search(r"^\s*int32(\[\])?\s+interaction_id\b", text, re.M) is not None and re.search(r"^\s*uint8(\[\])?\s+interaction_type\b", text, re.M) is not None,
-            re.search(r"^\s*Gesture\[\]\s+gestures\b", text, re.M) is not None,
-            re.search(r"^\s*string\s+agent_type\b", text, re.M) is not None,
-            re.search(r"^\s*float64\[\]\s+desired_velocity\b", text, re.M) is not None,
+        cache[schema.id] = _PedFields(
+            animation_state=re.search(r"^\s*uint8(\[\])?\s+animation_state\b", text, re.M) is not None,
+            interaction=re.search(r"^\s*int32(\[\])?\s+interaction_id\b", text, re.M) is not None and re.search(r"^\s*uint8(\[\])?\s+interaction_type\b", text, re.M) is not None,
+            gestures=re.search(r"^\s*Gesture\[\]\s+gestures\b", text, re.M) is not None,
+            agent_type=re.search(r"^\s*string\s+agent_type\b", text, re.M) is not None,
+            desired_velocity=re.search(r"^\s*float64\[\]\s+desired_velocity\b", text, re.M) is not None,
+            radius=re.search(r"^\s*float(32|64)(\[\])?\s+radius\b", text, re.M) is not None,
         )
     return cache[schema.id]
+
+
+class _MetaFields(typing.NamedTuple):
+    """Which optional fields a recorded AgentMeta schema carries."""
+
+    agent_type: bool
+    sources: bool
+
+
+def _meta_fields(schema: Schema, cache: dict[int, _MetaFields]) -> _MetaFields:
+    """The optional fields of a recorded AgentMeta schema, by schema id."""
+    if schema.id not in cache:
+        text = schema.data.decode()
+        cache[schema.id] = _MetaFields(
+            agent_type=re.search(r"^\s*string\[\]\s+agent_type\b", text, re.M) is not None,
+            sources=re.search(r"^\s*string\[\]\s+source_name\b", text, re.M) is not None and re.search(r"^\s*int32\[\]\s+source_seq\b", text, re.M) is not None,
+        )
+    return cache[schema.id]
+
+
+def _aligned[T](values: Sequence[T], n: int, default: T) -> list[T]:
+    """`values` when it holds one entry per agent, else `default` for each of the `n` agents."""
+    return list(values) if len(values) == n else [default] * n
 
 
 class _RecordedParam(typing.Protocol):
@@ -424,7 +460,8 @@ class MCAPReader:
                     phases_schema_cache: dict[int, bool] = {}
                     integrity_schema_cache: dict[int, bool] = {}
 
-                    schema_fields: dict[int, tuple[bool, bool, bool, bool, bool]] = {}
+                    schema_fields: dict[int, _PedFields] = {}
+                    meta_schema_fields: dict[int, _MetaFields] = {}
 
                     for schema, channel, message in reader.iter_messages(log_time_order=False):
                         if schema is None:
@@ -530,6 +567,7 @@ class MCAPReader:
                             agent_types: list[str] = []
                             desired_velocities: list[float] = []
                             rendered: list = []
+                            radii: list[float] = []
                             has_gestures = False
                             if schema.name == "arena_humansim_msgs/msg/AgentFrame":
                                 humans = np.frombuffer(ros_msg.kind, dtype=np.uint8) == 0
@@ -539,13 +577,15 @@ class MCAPReader:
                                 headings = np.asarray(ros_msg.theta, dtype=np.float64)[humans].tolist()
                                 twists = np.column_stack((np.asarray(ros_msg.vx, dtype=np.float64)[humans], np.asarray(ros_msg.vy, dtype=np.float64)[humans], zeros)).ravel().tolist()
                                 ids = np.asarray(ros_msg.agent_id, dtype=np.int64)[humans].tolist()
-                                has_anim, has_interaction, _, _, has_desired = _ped_fields(schema, schema_fields)
-                                if has_desired and len(ros_msg.desired_velocity) == len(humans):
+                                fields = _ped_fields(schema, schema_fields)
+                                if fields.desired_velocity and len(ros_msg.desired_velocity) == len(humans):
                                     desired_velocities = np.asarray(ros_msg.desired_velocity, dtype=np.float64)[humans].tolist()
-                                frame_anim = np.frombuffer(bytes(ros_msg.animation_state), dtype=np.uint8) if has_anim else np.zeros(0, dtype=np.uint8)
+                                if fields.radius and len(ros_msg.radius) == len(humans):
+                                    radii = np.asarray(ros_msg.radius, dtype=np.float64)[humans].tolist()
+                                frame_anim = np.frombuffer(bytes(ros_msg.animation_state), dtype=np.uint8) if fields.animation_state else np.zeros(0, dtype=np.uint8)
                                 anim_states = frame_anim[humans].tolist() if len(frame_anim) == len(humans) else [0] * len(ids)
-                                frame_iids = ros_msg.interaction_id if has_interaction else []
-                                if has_interaction and len(frame_iids) == len(humans):
+                                frame_iids = ros_msg.interaction_id if fields.interaction else []
+                                if fields.interaction and len(frame_iids) == len(humans):
                                     interaction_ids = np.asarray(frame_iids, dtype=np.int64)[humans].tolist()
                                     interaction_types = np.frombuffer(bytes(ros_msg.interaction_type), dtype=np.uint8)[humans].tolist()
                                 else:
@@ -566,11 +606,13 @@ class MCAPReader:
                                     # Twists: flattened list of linear velocities [vx1, vy1, vz1, vx2, vy2, vz2, ...]
                                     twists.extend([p.twist.linear.x, p.twist.linear.y, p.twist.linear.z])
                                 ids = [int(p.id) for p in rendered]
-                                has_anim, has_interaction, has_gestures, has_agent_type, _ = _ped_fields(schema, schema_fields)
-                                agent_types = [str(p.agent_type) for p in rendered] if has_agent_type else []
-                                anim_states = [int(p.animation_state) for p in rendered] if has_anim else [0] * len(ids)
-                                interaction_ids = [int(p.interaction_id) for p in rendered] if has_interaction else [-1] * len(ids)
-                                interaction_types = [int(p.interaction_type) for p in rendered] if has_interaction else [0] * len(ids)
+                                fields = _ped_fields(schema, schema_fields)
+                                has_gestures = fields.gestures
+                                agent_types = [str(p.agent_type) for p in rendered] if fields.agent_type else []
+                                radii = [float(p.radius) for p in rendered] if fields.radius else []
+                                anim_states = [int(p.animation_state) for p in rendered] if fields.animation_state else [0] * len(ids)
+                                interaction_ids = [int(p.interaction_id) for p in rendered] if fields.interaction else [-1] * len(ids)
+                                interaction_types = [int(p.interaction_type) for p in rendered] if fields.interaction else [0] * len(ids)
                             else:
                                 agents = [a for a in ros_msg.agents if a.kind == 0]
                                 names = [str(a.agent_id) for a in agents]
@@ -580,8 +622,9 @@ class MCAPReader:
                                     headings.append(p.pose.theta)
                                     twists.extend([p.velocity.x, p.velocity.y, p.velocity.z])
                                 ids = [int(p.agent_id) for p in agents]
-                                has_anim, _, _, _, _ = _ped_fields(schema, schema_fields)
-                                anim_states = [int(p.animation_state) for p in agents] if has_anim else [0] * len(ids)
+                                fields = _ped_fields(schema, schema_fields)
+                                radii = [float(p.radius) for p in agents] if fields.radius else []
+                                anim_states = [int(p.animation_state) for p in agents] if fields.animation_state else [0] * len(ids)
                                 interaction_ids = [-1] * len(agents)
                                 interaction_types = [0] * len(agents)
 
@@ -596,6 +639,7 @@ class MCAPReader:
                             target["peds_animation_states"].append(anim_states)
                             target["peds_interaction_ids"].append(interaction_ids)
                             target["peds_interaction_types"].append(interaction_types)
+                            target["peds_radii"].append(radii)
 
                             if has_gestures:
                                 gesture_envs.add(env_key)
@@ -621,12 +665,11 @@ class MCAPReader:
                             rows = env_data[env_key]["agent_meta"]
                             agent_ids = [int(i) for i in ros_msg.agent_id]
                             n = len(agent_ids)
-
-                            def column(field: str, default: object, n: int = n) -> list:
-                                values = list(getattr(ros_msg, field, None) or [])
-                                return values if len(values) == n else [default] * n
-
-                            for agent_id, name, agent_type, source_name, source_seq in zip(agent_ids, column("name", ""), column("agent_type", ""), column("source_name", ""), column("source_seq", 0), strict=True):
+                            meta = _meta_fields(schema, meta_schema_fields)
+                            meta_types = _aligned(ros_msg.agent_type, n, "") if meta.agent_type else [""] * n
+                            source_names = _aligned(ros_msg.source_name, n, "") if meta.sources else [""] * n
+                            source_seqs = _aligned(ros_msg.source_seq, n, 0) if meta.sources else [0] * n
+                            for agent_id, name, agent_type, source_name, source_seq in zip(agent_ids, _aligned(ros_msg.name, n, ""), meta_types, source_names, source_seqs, strict=True):
                                 rows["time_ns"].append(ts_ns)
                                 rows["stamp_ns"].append(stamp)
                                 rows["agent_id"].append(agent_id)

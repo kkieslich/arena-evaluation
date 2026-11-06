@@ -1,4 +1,4 @@
-"""FLOWEDIT flow measures on hand-made tracks: the grid, the divergence, and an edit against its base world."""
+"""Flow measures on hand-made tracks: the grid, the divergence, and an edit against its base world."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ np = pytest.importorskip("numpy")
 pytest.importorskip("shapely")
 
 from arena_evaluation.processing.flow import FlowGrid, jsd, occupancy, pooled
-from arena_evaluation.processing.flow.benchmark import add_flow_reference_metrics, base_world, parse_stage
+from arena_evaluation.processing.flow.benchmark import add_flow_reference_metrics, parse_stage
 from arena_evaluation.processing.metrics.flow.flow_episode import object_uses
 from arena_evaluation.processing.ped_track_store import TRACK_SCHEMA
 
@@ -20,10 +20,11 @@ ROOM = [(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (0.0, 2.0)]
 
 def _tracks(rows: list[tuple[str, float, float, float, float, float]]) -> pl.DataFrame:
     """(key, t, x, y, vx, vy) rows as a track table."""
-    data = {c: [] for c in TRACK_SCHEMA}
+    data: dict[str, list] = {c: [] for c in TRACK_SCHEMA}
     for key, t, x, y, vx, vy in rows:
-        for c, v in zip(("time_ns", "t", "agent_id", "key", "name", "source_name", "source_seq", "agent_type", "x", "y", "vx", "vy"), (int(t * 1e9), t, 1, key, key, "", 0, "adult", x, y, vx, vy), strict=True):
-            data[c].append(v)
+        row = {"episode_id": 0, "time_ns": int(t * 1e9), "t": t, "agent_id": 1, "key": key, "name": key, "source_name": "", "source_seq": 0, "agent_type": "adult", "x": x, "y": y, "vx": vx, "vy": vy, "radius": 0.25}
+        for c in TRACK_SCHEMA:
+            data[c].append(row[c])
     return pl.DataFrame(data, schema=TRACK_SCHEMA)
 
 
@@ -93,8 +94,7 @@ def test_pooling_averages_each_seed_as_a_share() -> None:
 def test_stage_names_parse_to_world_and_seed() -> None:
     assert parse_stage("hospital_1__move_fountain__6e1d6873__s12") == ("hospital_1__move_fountain__6e1d6873", 12)
     assert parse_stage("hospital_1__s1") == ("hospital_1", 1)
-    assert parse_stage("hospital_1") is None and parse_stage(None) is None
-    assert base_world("hospital_1__move_fountain__6e1d6873") == "hospital_1" and base_world("office_1") == "office_1"
+    assert parse_stage("hospital_1") is None and parse_stage("a planner stage") is None and parse_stage(None) is None
 
 
 # The fountain moves from (0.25, 0.25) to (3.75, 1.75). Seed 1: the drinkers all move with it. Seed 2: one of the two
@@ -108,20 +108,26 @@ EPISODES = {
 }
 
 
-def _rows() -> list[dict]:
-    rows = [{"episode": i, "stage": stage, "status": "evaluated", "is_reference": False} for i, stage in enumerate(EPISODES)]
-    rows.append({"episode": 99, "stage": "hospital_1__s1", "status": "evaluated", "is_reference": True})
-    rows.append({"episode": 98, "stage": "a planner stage", "status": "evaluated", "is_reference": False})
+def _rows(planner: str = "peds_only", first: int = 0) -> list[dict]:
+    rows = [{"episode": first + i, "planner": planner, "robot": "env_0_jackal", "stage": stage, "status": "evaluated", "is_reference": False} for i, stage in enumerate(EPISODES)]
+    rows.append({"episode": first + 99, "planner": planner, "robot": "env_0_jackal", "stage": "hospital_1__s1", "status": "evaluated", "is_reference": True})
+    rows.append({"episode": first + 98, "planner": planner, "robot": "env_0_jackal", "stage": "a planner stage", "status": "evaluated", "is_reference": False})
     return rows
 
 
-def _measure(rows: list[dict]) -> int:
+def _measure(rows: list[dict], recordings: dict[tuple[int, str], list[tuple]] | None = None, loaded: list[tuple[int, str]] | None = None) -> int:
+    """Flow outputs of `rows`, episode `i` (and `i + 100`) recording EPISODES' i-th stage unless `recordings` names its (episode, env)."""
     stages = list(EPISODES)
 
-    def tracks(directory: pathlib.Path) -> pl.DataFrame:
-        return _tracks(EPISODES[stages[int(directory.name)]])
+    def tracks(directory: pathlib.Path, env: str) -> pl.DataFrame:
+        episode = int(directory.name)
+        if loaded is not None:
+            loaded.append((episode, env))
+        if recordings is not None and (episode, env) in recordings:
+            return _tracks(recordings[(episode, env)])
+        return _tracks(EPISODES[stages[episode % 100]])
 
-    return add_flow_reference_metrics(rows, lambda row: pathlib.Path("/runs/r/episodes") / str(row["episode"]), tracks=tracks, grid=lambda world, run_dir: GRID)
+    return add_flow_reference_metrics(rows, lambda episode: pathlib.Path("/runs/r/episodes") / str(episode), tracks=tracks, grid=lambda world, run_dir: GRID)
 
 
 def test_each_edit_is_scored_against_its_base_world_at_the_same_seed() -> None:
@@ -150,6 +156,26 @@ def test_reference_planner_and_failed_rows_are_left_alone() -> None:
     assert "flow_jsd" not in rows[1] and "flow_jsd" not in rows[5] and "flow_jsd" not in rows[6]
     # the edit at seed 2 has no evaluated base run any more
     assert rows[3]["flow_reference_stage"] is None and rows[2]["flow_pooled_seeds"] == 1
+
+
+def test_each_contestant_is_scored_against_its_own_base_run() -> None:
+    # contestant b's base run at seed 1 already had the drinkers at the new spot, so its edit changes nothing
+    rows = _rows("a") + _rows("b", first=100)
+    _measure(rows, {(100, "env_0"): _stand("p#1", 3.75, 1.75) + _stand("p#2", 3.75, 1.75)})
+    a = {r["stage"]: r for r in rows[:5]}
+    b = {r["stage"]: r for r in rows[7:12]}
+    assert a["hospital_1__move_fountain__ab__s1"]["flow_jsd"] == pytest.approx(1.0)
+    assert b["hospital_1__move_fountain__ab__s1"]["flow_jsd"] == pytest.approx(0.0)
+    assert b["hospital_1__move_fountain__ab__s1"]["flow_reference_stage"] == "hospital_1__s1"
+    assert a["hospital_1__move_fountain__ab__s1"]["flow_jsd_pooled"] != pytest.approx(b["hospital_1__move_fountain__ab__s1"]["flow_jsd_pooled"])
+
+
+def test_each_env_of_an_episode_reads_its_own_tracks_once() -> None:
+    rows = [{"episode": 20, "planner": "peds_only", "robot": robot, "stage": "hospital_1__s1", "status": "evaluated", "is_reference": False} for robot in ("env_0_jackal", "env_0_burger", "env_1_jackal")]
+    loaded: list[tuple[int, str]] = []
+    _measure(rows, {(20, "env_0"): _stand("p#1", 0.25, 0.25), (20, "env_1"): _stand("p#1", 0.25, 0.25) + _stand("p#2", 3.75, 1.75)}, loaded)
+    assert [r["flow_room_ped_seconds"] for r in rows] == pytest.approx([2.5, 2.5, 5.0])
+    assert loaded == [(20, "env_0"), (20, "env_1")]
 
 
 def test_object_uses_count_held_interactions_and_the_longest_queue() -> None:

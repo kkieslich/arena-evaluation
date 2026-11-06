@@ -69,11 +69,25 @@ for m in reg.list_metrics():
 
 ## Flow measures (FLOWEDIT)
 
-How a layout edit changes where pedestrians walk, stand and head, from robot-free runs of a `flowedit suite` (Arena `generative/flowedit`). Every stage of such a suite is named `<world>__s<seed>` with one episode, and an edited world is `<base>__<edit id>`. An edit stage and its base stage at the same seed ran the same crowd.
+How a layout edit changes where pedestrians walk, stand and head, from robot-free runs of a `flowedit suite` (Arena `generative/flowedit`). Every stage of such a suite is named `<world>__s<seed>` with one episode, and an edited world is `<base>__<edit id>`; the stage names parse with flowedit's own `parse_stage_name` and `base_of`. An edit stage and its base stage at the same seed ran the same crowd, so each edit row is scored against the base run of its own contestant (`planner`) at its seed.
 
-**Tracks** (`processing/ped_track_store.py`): `track_table` gives one row per pedestrian per frame in the world frame, from the crowd engine's `agent_states` (else `arena_peds`), with names, types and sources from `agent_meta`. `key` pairs a pedestrian across runs: `<source_name>#<source_seq>` for one a source released, else its name without the `env_<n>/` prefix, else `id<agent_id>`. `pair(ref, run)` lists the keys two runs share. Other paired measures build on the same table.
+**Tracks** (`processing/ped_track_store.py`): one table per env of an episode, one row per pedestrian per frame in the world frame, from the crowd engine's `agent_states` (else `arena_peds`), with names, types and sources from `agent_meta` (the latest row at or before each frame, else the first later one). Robots of one env share its table. `pair(ref, run)` lists the keys two runs share. Other paired measures build on the same table.
 
-**Maps** (`processing/flow/`): 0.5 m cells over the base world's rooms (its zones, moved by their level origins). Each cell holds pedestrian-seconds in 8 heading bins of 45 degrees plus a standing bin (speed under 0.2 m/s). A frame lasts until the pedestrian's next one, at most 4 of its median steps. Velocities missing from the recording come from the positions. Time outside the rooms does not count.
+| Column | Definition |
+|---|---|
+| `episode_id` | the episode the tracks come from |
+| `time_ns`, `t` | recording time, and seconds from the episode start (else from the first frame) |
+| `agent_id` | the crowd engine's id in this run, not stable across runs |
+| `key` | the pairing key: `<source_name>#<source_seq>` for a pedestrian a source released (HumanSim draws it from its source and release index, so two runs with one seed agree on it), else its name without the `env_<n>/` prefix (`strip_env`), else `id<agent_id>` |
+| `name` | the name without the env prefix, empty when the engine names none |
+| `source_name`, `source_seq` | the releasing source and release index, empty and 0 for a pedestrian spawned directly |
+| `agent_type` | HumanSim's agent type, `adult` when empty |
+| `x`, `y`, `vx`, `vy` | position and velocity in the world frame, NaN velocities where the recording has none |
+| `radius` | collision radius in m (`peds_radii`), NaN where it is not recorded |
+
+The pipeline keeps each env's tracks while it processes the episode, under the topic cache (`topics/.derived/ped_tracks.v<n>/<env>.parquet`), and `tracks_for_episode(episode_dir, env)` reads them back or builds them on first use. Writing the topic cache again clears them. An episode with more than one env needs the env named.
+
+**Maps** (`processing/flow/`): 0.5 m cells over the base world's rooms (its zones, moved by their level origins), so a base and each of its edits are counted on the same cells. Each cell holds pedestrian-seconds in 8 heading bins of 45 degrees, bin `k` for headings in [-180 + 45 k, -180 + 45 (k + 1)) degrees, plus a standing bin (speed under 0.2 m/s). A frame lasts until the pedestrian's next one, at most 4 of its median steps. Velocities missing from the recording come from the positions. Time outside the rooms does not count.
 
 **Divergence:** Jensen-Shannon in bits between two maps, each normalized: 0 for the same flow, 1 for disjoint cells or headings. `*_occupancy` sums the headings first.
 
@@ -83,12 +97,12 @@ How a layout edit changes where pedestrians walk, stand and head, from robot-fre
 | `flow_object_uses` | per episode (`flow_episode`) | per anchor object of HumanSim's interactions: `uses` (interactions that reached holding) and `max_queue` |
 | `flow_world`, `flow_seed`, `flow_base` | cross-run | parsed from the stage name |
 | `flow_room_ped_seconds` | cross-run | pedestrian-seconds on the base world's grid |
-| `flow_reference_stage` | cross-run | `<base>__s<seed>`, None for a base stage or without an evaluated base run at that seed |
+| `flow_reference_stage` | cross-run | `<base>__s<seed>`, None for a base stage or without an evaluated base run of the same contestant at that seed |
 | `flow_jsd`, `flow_jsd_occupancy` | cross-run, paired | divergence from the base run at the same seed |
 | `flow_paired_peds`, `flow_unpaired_peds` | cross-run, paired | pedestrians both runs have by key, and those only one has |
-| `flow_jsd_pooled`, `flow_jsd_pooled_occupancy`, `flow_pooled_seeds` | cross-run, pooled | divergence of the seed-averaged maps over the seeds both worlds ran, the same on every row of the world |
+| `flow_jsd_pooled`, `flow_jsd_pooled_occupancy`, `flow_pooled_seeds` | cross-run, pooled | divergence of the seed-averaged maps over the seeds both worlds ran for the contestant, the same on every row of the world and contestant |
 
-The pooled divergence is the primary score: it measures the systematic flow change. The paired one also counts a crowd that ran differently after one pedestrian was turned another way, so an inert footprint can score clearly above 0 per seed while its pooled map barely moves. Two identical crowds scored 0.018 to 0.023 paired on the 120 s runs of the 6 Nov playground sweep, the sampling floor of the recording.
+The pooled divergence is the primary score: it measures the systematic flow change. The paired one also counts a crowd that ran differently after one pedestrian was turned another way, so an inert footprint can score clearly above 0 per seed while its pooled map barely moves.
 
 ## Mechanism metrics (mechanisms)
 

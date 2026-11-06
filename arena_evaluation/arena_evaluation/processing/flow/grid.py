@@ -1,10 +1,4 @@
-"""The flow grid: square cells over a world's rooms, each holding the pedestrian-seconds per walking direction.
-
-A cell's last bin holds the time pedestrians stood (speed under `standing`), bin `k < headings` the time they walked
-with a heading in [-180 + k * 360 / headings, -180 + (k + 1) * 360 / headings) degrees. Only time inside a room (a zone
-of the world, moved by its level's origin) counts. The grid is the base world's, so a base and each of its edits are
-counted on the same cells.
-"""
+"""The flow grid: square cells over a world's rooms, each holding the pedestrian-seconds per walking direction."""
 
 from __future__ import annotations
 
@@ -16,6 +10,10 @@ from collections.abc import Iterable, Sequence
 import numpy as np
 import polars as pl
 
+if typing.TYPE_CHECKING:
+    import shapely
+    from arena_simulation_setup.tree.World import WorldView
+
 CELL_M = 0.5
 HEADINGS = 8
 STANDING_MPS = 0.2
@@ -25,6 +23,8 @@ MAX_STEP_FACTOR = 4.0
 
 @dataclasses.dataclass(frozen=True)
 class FlowGrid:
+    """Square cells from (x0, y0), each with `headings` heading bins and a last bin for standing (speed under `standing`)."""
+
     x0: float
     y0: float
     nx: int
@@ -32,7 +32,7 @@ class FlowGrid:
     cell: float = CELL_M
     headings: int = HEADINGS
     standing: float = STANDING_MPS
-    rooms: typing.Any = dataclasses.field(default=None, compare=False, repr=False)
+    rooms: shapely.Geometry | None = dataclasses.field(default=None, compare=False, repr=False)
 
     @property
     def bins(self) -> int:
@@ -62,7 +62,7 @@ class FlowGrid:
         return cls(x0=float(x0), y0=float(y0), nx=max(1, math.ceil((x1 - x0) / cell)), ny=max(1, math.ceil((y1 - y0) / cell)), cell=cell, rooms=rooms)
 
     @classmethod
-    def from_world(cls, view: typing.Any, cell: float = CELL_M) -> FlowGrid | None:
+    def from_world(cls, view: WorldView, cell: float = CELL_M) -> FlowGrid | None:
         """The grid over every zone of a world (`arena_simulation_setup` WorldView), each moved by its level's origin."""
         try:
             world = view.load(validate=False)

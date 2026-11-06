@@ -1,12 +1,4 @@
-"""Per-episode inputs of the FLOWEDIT flow measures: who walked, and how often each object was used.
-
-The flow change itself compares two runs (an edit against its base world) and is computed across the benchmark, in
-`processing.flow.benchmark`; this calculator reports what one episode alone says:
-
-    flow_peds          pedestrians in the episode, counted by their pairing key (`ped_track_store`)
-    flow_object_uses   per object an interaction was anchored at: `uses`, the interactions that reached holding (a
-                       drink at a fountain, a seat taken), and `max_queue`, the longest queue it had
-"""
+"""Per-episode inputs of the flow measures: the pedestrians who walked and how often each object was used."""
 
 from __future__ import annotations
 
@@ -44,7 +36,7 @@ def object_uses(interactions: pl.DataFrame | None) -> list[dict[str, typing.Any]
 
 
 class FlowEpisodeCalculator(BaseMetricCalculator):
-    """Pedestrians and object uses of one episode, the per-episode side of the FLOWEDIT flow measures."""
+    """Pedestrians and object uses of one episode, the per-episode side of the flow measures."""
 
     NAME = "flow_episode"
     CATEGORY = "social"
