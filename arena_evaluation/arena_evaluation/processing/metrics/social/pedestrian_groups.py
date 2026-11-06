@@ -8,11 +8,8 @@ import polars as pl
 
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
 from arena_evaluation.processing.metrics.ecological.mechanism_common import RobotIdentity, ped_keys
-from arena_evaluation.processing.ped_track_store import strip_env
+from arena_evaluation.processing.ped_track_store import DEFAULT_AGENT_TYPE, strip_env
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle
-
-# arena_people_msgs/Pedestrian: an empty agent_type is an adult.
-DEFAULT_AGENT_TYPE = "adult"
 
 # Agent types scored together as one group, every other type is a group of its own.
 TYPE_GROUPS = {

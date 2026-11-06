@@ -17,6 +17,7 @@ from arena_evaluation.processing.metrics.ecological.compliance_metrics import (
     _reconstruct_events,
     _ZoneGeometry,
 )
+from arena_evaluation.processing.ped_track_store import strip_env
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
 if typing.TYPE_CHECKING:
@@ -25,18 +26,12 @@ if typing.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ENV_PREFIX = re.compile(r"^env_\d+/")
 _ROBOT_DIR_PREFIX = re.compile(r"^env_\d+_")
 _WORLD_OBJECT_PREFIX = "world_"
 
 _level_cache: dict[str, Level | None] = {}
 _world_cache: dict[str, list[_ZoneGeometry] | None] = {}
 _wall_cache: dict[str, WallGrid | None] = {}
-
-
-def _strip_env(name: str) -> str:
-    """Drop the leading `env_<n>/` segment, keeping the rest incl. any level suffix."""
-    return _ENV_PREFIX.sub("", name, count=1)
 
 
 def bare_robot_name(robot_dir: str) -> str:
@@ -54,7 +49,7 @@ def _entity_roster(snapshot: pl.DataFrame | None) -> dict[str, str]:
         return {}
     paths: dict[str, set[str]] = defaultdict(set)
     for entity in snapshot["entity"].unique().to_list():
-        paths[_strip_env(entity)].add(entity)
+        paths[strip_env(entity)].add(entity)
     unsuffixed: dict[str, set[str]] = defaultdict(set)
     for bare, recorded in paths.items():
         if "/" in bare:
@@ -67,7 +62,7 @@ def _entity_roster(snapshot: pl.DataFrame | None) -> dict[str, str]:
 
 def _ped_aliases(name: str) -> list[str]:
     """Names an atom may use for a recorded ped: env-stripped, plus without a level suffix on multi-level worlds."""
-    bare = _strip_env(name)
+    bare = strip_env(name)
     return [bare, bare.rsplit("/", 1)[0]] if "/" in bare else [bare]
 
 
@@ -178,7 +173,7 @@ def clips_on_axis(peds: pl.DataFrame | None, gestures: pl.DataFrame | None, time
     rows: list[dict[str, frozenset[str]]] = []
     for t, names, ids in zip(times.tolist(), peds["peds_names"].to_list(), peds["peds_ids"].to_list(), strict=True):
         at = playing.get(int(t), {})
-        rows.append({_strip_env(name): frozenset(at.get(int(ped_id), ())) for name, ped_id in zip(names or [], ids or [], strict=True)})
+        rows.append({strip_env(name): frozenset(at.get(int(ped_id), ())) for name, ped_id in zip(names or [], ids or [], strict=True)})
     idx = np.searchsorted(times, time_ns, side="right") - 1
     return [rows[i] if i >= 0 else {} for i in idx]
 

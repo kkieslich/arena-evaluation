@@ -17,7 +17,6 @@ from arena_evaluation.processing.metrics.ecological.condition_metrics import (
     _node_series,
     _operator_verdict,
     _ped_roster,
-    _strip_env,
     _value_at,
     _values_equal,
     _wall_cache,
@@ -26,6 +25,7 @@ from arena_evaluation.processing.metrics.ecological.condition_metrics import (
     load_wall_grid,
     load_zone_geometry,
 )
+from arena_evaluation.processing.ped_track_store import strip_env
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 from snapshot_rows import snapshot_frame
 
@@ -86,9 +86,9 @@ def _ctx(time_ns, pos_x=None, pos_y=None, snapshot=None, data=None, zones=None):
 
 
 def test_strip_env_removes_only_leading_env_segment():
-    assert _strip_env("env_0/ward_a_door") == "ward_a_door"
-    assert _strip_env("env_12/ward_a_door/0") == "ward_a_door/0"
-    assert _strip_env("blocker_1") == "blocker_1"
+    assert strip_env("env_0/ward_a_door") == "ward_a_door"
+    assert strip_env("env_12/ward_a_door/0") == "ward_a_door/0"
+    assert strip_env("blocker_1") == "blocker_1"
 
 
 def test_values_equal_float_tolerance_and_string():
