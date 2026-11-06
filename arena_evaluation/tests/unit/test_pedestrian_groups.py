@@ -4,7 +4,7 @@ import pytest
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
 from arena_evaluation.processing.metrics.ecological.mechanism_common import per_ped
 from arena_evaluation.processing.metrics.registry import MetricRegistry
-from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURES, PedestrianGroupsCalculator, agent_group, by_group, ped_agent_types, worst_group
+from arena_evaluation.processing.metrics.social.pedestrian_groups import FLEET_DTYPES, PED_MEASURES, PedestrianGroupsCalculator, add_fleet_contacts, agent_group, by_group, ped_agent_types, worst_group
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
 
@@ -142,3 +142,42 @@ def test_calculator_groups_types_together_and_keeps_the_raw_type():
 def test_calculator_without_agent_types_reports_nothing():
     result = _calc(pl.DataFrame({"peds_names": [["a"]]}), {"ped_mechanism_delay_seconds_per_ped": _records(a=1.0)})
     assert result == dict.fromkeys(PedestrianGroupsCalculator.output_keys())
+
+
+TYPES = [{"ped": "a", "agent_type": "adult"}, {"ped": "b", "agent_type": "wheelchair_manual"}, {"ped": "c", "agent_type": "wheelchair_electric"}]
+
+
+def _robot(name: str, **contacts: float) -> dict:
+    return {"robot": name, "ped_agent_types": TYPES, "ped_robot_contacts_per_ped": _records(**contacts)}
+
+
+def test_fleet_contacts_sum_each_pedestrian_over_the_robots_of_an_env():
+    rows = [_robot("env_0_jackal", a=1.0, b=0.0, c=0.0), _robot("env_0_burger", a=1.0, b=2.0, c=0.0)]
+    add_fleet_contacts(rows)
+
+    assert rows[0]["ped_fleet_contacts"] == 4
+    assert rows[0]["ped_fleet_contacts_per_ped"] == _records(a=2.0, b=2.0, c=0.0)
+    assert rows[0]["ped_fleet_contacts_by_group"] == [{"group": "adult", "value": 2.0, "peds": 1}, {"group": "wheelchair", "value": 1.0, "peds": 2}]
+    assert rows[0]["ped_fleet_contacts_worst_group"] == "adult"
+    assert rows[0]["ped_contact_free_rate"] == pytest.approx(1.0 / 3.0)
+    assert rows[0]["ped_contact_free_rate_by_group"] == [{"group": "adult", "value": 0.0, "peds": 1}, {"group": "wheelchair", "value": 0.5, "peds": 2}]
+    assert rows[0]["ped_contact_free_rate_worst_group"] == "adult"
+    assert {key: rows[1][key] for key in FLEET_DTYPES} == {key: rows[0][key] for key in FLEET_DTYPES}
+
+
+def test_fleet_contacts_keep_envs_apart():
+    rows = [_robot("env_0_jackal", a=1.0), _robot("env_1_jackal", a=0.0)]
+    add_fleet_contacts(rows)
+    assert [(row["ped_fleet_contacts"], row["ped_contact_free_rate"]) for row in rows] == [(1, 0.0), (0, 1.0)]
+
+
+def test_fleet_contacts_need_every_robots_contacts():
+    rows = [_robot("env_0_jackal", a=1.0), {"robot": "env_0_burger", "status": "no_trajectory"}]
+    add_fleet_contacts(rows)
+    assert all(row[key] is None for row in rows for key in FLEET_DTYPES)
+
+
+def test_fleet_without_pedestrians_has_no_contact_free_rate():
+    rows = [_robot("env_0_jackal")]
+    add_fleet_contacts(rows)
+    assert (rows[0]["ped_fleet_contacts"], rows[0]["ped_contact_free_rate"], rows[0]["ped_contact_free_rate_by_group"]) == (0, None, None)

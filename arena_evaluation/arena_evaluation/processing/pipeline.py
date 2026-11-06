@@ -308,7 +308,7 @@ def _collect_native_topics(bundle: TopicBundle) -> dict[str, pl.DataFrame]:
 from arena_evaluation.benchmark.profiler import PipelineProfiler
 from arena_evaluation.processing.mcap_reader import KEPT_EMPTY_TABLES, MCAPReader
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
-from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES
+from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
 from arena_evaluation.processing.pose_anchor import resolve_pose_source
 from arena_evaluation.processing.pose_segments import ride_arrival_times
@@ -768,6 +768,7 @@ class ProcessingPipeline:
                         ep_metrics["status_reason"] = None
                     all_results.append(ep_metrics)
 
+            add_fleet_contacts(all_results)
             return finish(all_results)
 
     def extract_benchmark(self, benchmark_id: str, force_extract: bool = False) -> None:

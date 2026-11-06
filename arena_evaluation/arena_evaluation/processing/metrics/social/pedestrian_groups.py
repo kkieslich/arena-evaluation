@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
-from arena_evaluation.processing.metrics.ecological.mechanism_common import ped_keys, strip_env
+from arena_evaluation.processing.metrics.ecological.mechanism_common import RobotIdentity, ped_keys, strip_env
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle
 
 # arena_people_msgs/Pedestrian: an empty agent_type is an adult.
@@ -33,12 +33,27 @@ PED_MEASURES = {
     "ped_robot_contacts": "lower",
 }
 
+_PER_PED = pl.List(pl.Struct({"ped": pl.String, "value": pl.Float64}))
+_BY_GROUP = pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64}))
+
+# Robot contacts of all robots of one env, joined across their rows of an episode by `add_fleet_contacts`.
+FLEET_DTYPES = {
+    "ped_fleet_contacts": pl.Int64,
+    "ped_fleet_contacts_per_ped": _PER_PED,
+    "ped_fleet_contacts_by_group": _BY_GROUP,
+    "ped_fleet_contacts_worst_group": pl.String,
+    "ped_contact_free_rate": pl.Float64,
+    "ped_contact_free_rate_by_group": _BY_GROUP,
+    "ped_contact_free_rate_worst_group": pl.String,
+}
+
 # Fixed column types, so an episode without a value writes the same schema as one with values.
 PED_MEASURE_DTYPES = {
     "ped_agent_types": pl.List(pl.Struct({"ped": pl.String, "agent_type": pl.String})),
-    **{f"{measure}_per_ped": pl.List(pl.Struct({"ped": pl.String, "value": pl.Float64})) for measure in PED_MEASURES},
-    **{f"{measure}_by_group": pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64})) for measure in PED_MEASURES},
+    **{f"{measure}_per_ped": _PER_PED for measure in PED_MEASURES},
+    **{f"{measure}_by_group": _BY_GROUP for measure in PED_MEASURES},
     **{f"{measure}_worst_group": pl.String for measure in PED_MEASURES},
+    **FLEET_DTYPES,
 }
 
 
@@ -82,6 +97,47 @@ def worst_group(groups: list[dict[str, typing.Any]] | None, direction: str) -> s
     worst = (max if direction == "lower" else min)(group["value"] for group in groups)
     named = [group["group"] for group in groups if group["value"] == worst]
     return named[0] if len(named) == 1 else None
+
+
+def fleet_contacts(rows: list[dict[str, typing.Any]]) -> dict[str, typing.Any]:
+    """Robot contacts of one env's robot rows summed per pedestrian, per group, and the share of pedestrians no robot touched.
+
+    All None unless every row reports its per-pedestrian contacts.
+    """
+    if not rows or any(row.get("ped_robot_contacts_per_ped") is None for row in rows):
+        return dict.fromkeys(FLEET_DTYPES)
+    totals: dict[str, float] = {}
+    types: dict[str, str] = {}
+    for row in rows:
+        for record in row["ped_robot_contacts_per_ped"]:
+            totals[record["ped"]] = totals.get(record["ped"], 0.0) + record["value"]
+        for record in row.get("ped_agent_types") or ():
+            types.setdefault(record["ped"], record["agent_type"])
+    groups = {ped: agent_group(agent_type) for ped, agent_type in types.items()}
+    contacts = [{"ped": ped, "value": total} for ped, total in totals.items()]
+    untouched = [{"ped": ped, "value": float(total == 0)} for ped, total in totals.items()]
+    fleet_groups = by_group(contacts, groups)
+    free_groups = by_group(untouched, groups)
+    return {
+        "ped_fleet_contacts": int(sum(totals.values())),
+        "ped_fleet_contacts_per_ped": contacts,
+        "ped_fleet_contacts_by_group": fleet_groups,
+        "ped_fleet_contacts_worst_group": worst_group(fleet_groups, "lower"),
+        "ped_contact_free_rate": float(np.mean([record["value"] for record in untouched])) if untouched else None,
+        "ped_contact_free_rate_by_group": free_groups,
+        "ped_contact_free_rate_worst_group": worst_group(free_groups, "higher"),
+    }
+
+
+def add_fleet_contacts(rows: list[dict[str, typing.Any]]) -> None:
+    """Give every row of an episode the fleet contacts of its robot's env."""
+    by_env: dict[str | None, list[dict[str, typing.Any]]] = {}
+    for row in rows:
+        by_env.setdefault(RobotIdentity(row.get("robot") or "").env, []).append(row)
+    for env_rows in by_env.values():
+        fleet = fleet_contacts(env_rows)
+        for row in env_rows:
+            row.update(fleet)
 
 
 class PedestrianGroupsCalculator(BaseMetricCalculator):
