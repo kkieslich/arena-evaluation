@@ -445,6 +445,18 @@ def _flat_triples(raw: typing.Iterable[float] | None) -> np.ndarray:
     return arr.reshape(-1, 3)
 
 
+def ped_keys(names: typing.Sequence[str] | None, count: int) -> list[str]:
+    """Keys of one sample's `count` pedestrians: their recorded names, the entry index `#j` without names or when the counts differ."""
+    if names is not None and len(names) == count:
+        return [_norm_path(n) for n in names]
+    return [f"#{j}" for j in range(count)]
+
+
+def per_ped(values: dict[str, float]) -> list[dict[str, typing.Any]]:
+    """Per-pedestrian values as `{ped, value}` records, the layout of every `*_per_ped` output."""
+    return [{"ped": key, "value": value} for key, value in values.items()]
+
+
 def ped_tracks(data: pl.DataFrame | None, time_ns: np.ndarray | None = None) -> PedTracks | None:
     """Pedestrian tracks from the aligned `peds_*` columns, None when no positions were recorded."""
     if data is None or "peds_positions" not in data.columns or len(data) == 0:
@@ -468,12 +480,9 @@ def ped_tracks(data: pl.DataFrame | None, time_ns: np.ndarray | None = None) -> 
         parsed = BaseMetricCalculator._parse_peds(positions[i], hints[i] if hints is not None else None)
         pos = parsed[:, :2] if parsed.ndim == 2 and parsed.shape[1] >= 2 else np.empty((0, 2))
         row_names = list(names[i]) if names is not None and names[i] is not None else None
-        if row_names is not None and len(row_names) == len(pos):
-            row_keys = [_norm_path(n) for n in row_names]
-        else:
-            row_keys = [f"#{j}" for j in range(len(pos))]
-            if row_names is not None and len(pos):
-                named = False
+        row_keys = ped_keys(row_names, len(pos))
+        if row_names is not None and len(pos) and len(row_names) != len(pos):
+            named = False
         tw = _flat_triples(twists[i])[:, :2] if twists is not None else np.empty((0, 2))
         if len(tw) != len(pos):
             tw = np.zeros((len(pos), 2))

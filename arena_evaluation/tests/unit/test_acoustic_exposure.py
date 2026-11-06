@@ -214,7 +214,7 @@ def _semantic(rows: list[tuple[int, str, bool]]) -> pl.DataFrame:
     )
 
 
-def _frames(robot: list[tuple[float | None, float | None]], peds: list[list[tuple[float, float]]], *, source: list[float | None] | None = None, times: list[int] | None = None) -> pl.DataFrame:
+def _frames(robot: list[tuple[float | None, float | None]], peds: list[list[tuple[float, float]]], *, source: list[float | None] | None = None, times: list[int] | None = None, names: list[list[str]] | None = None) -> pl.DataFrame:
     columns = {
         "time_ns": pl.Series(times if times is not None else [i * SECOND_NS for i in range(len(robot))], dtype=pl.Int64),
         "pos_x_gt": pl.Series([r[0] for r in robot], dtype=pl.Float64),
@@ -223,7 +223,13 @@ def _frames(robot: list[tuple[float | None, float | None]], peds: list[list[tupl
     }
     if source is not None:
         columns["total_level_af_dba"] = pl.Series(source, dtype=pl.Float64)
+    if names is not None:
+        columns["peds_names"] = pl.Series(names, dtype=pl.List(pl.Utf8))
     return pl.DataFrame(columns)
+
+
+def _per_ped(result: dict, key: str) -> dict[str, float]:
+    return {record["ped"]: record["value"] for record in result[f"{key}_per_ped"]}
 
 
 def _episode(data: pl.DataFrame | None, map_name: str | None, **kwargs) -> AlignedEpisodeBundle:
@@ -359,6 +365,27 @@ def test_exposure_tracks_robot_and_pedestrian_motion(calc, cached_map):
     assert worst["door_states"] == {}
 
 
+def test_exposure_per_pedestrian_follows_each_name(calc, cached_map):
+    robot = [(1.0, 1.0), (None, None), (None, None), (1.0, 2.0), (1.0, 2.0), (1.0, 2.0), (1.0, 2.0)]
+    peds = [[(4.0, 1.0)], [], [(4.0, 1.3)], [(4.0, 1.0)], [(4.0, 1.0), (1.0, 4.0)], [(4.0, 1.0), (1.0, 3.4)], [(4.0, 1.0), (1.0, 3.4)]]
+    names = [["/env_0/a"], [], ["/env_0/a"], ["/env_0/a"], ["/env_0/a", "/env_0/b"], ["/env_0/a", "/env_0/b"], ["/env_0/a", "/env_0/b"]]
+    source = [None, 60.0, None, 60.0, 60.0, 60.0, 60.0]
+    result = calc.calculate(_episode(_frames(robot, peds, source=source, names=names), cached_map()), {})
+
+    a3, a10, a2, a14 = _att(3.0), _att(math.sqrt(10.0)), _att(2.0), _att(1.4)
+    a = [42.0 - a3, 60.0 - a3, 60.0 - a10, 60.0 - a10, 60.0 - a10, 60.0 - a10]
+    b = [60.0 - a2, 60.0 - a14, 60.0 - a14]
+    assert _per_ped(result, "ped_max_exposure_dba") == {"env_0/a": pytest.approx(60.0 - a3, abs=1e-3), "env_0/b": pytest.approx(60.0 - a14, abs=1e-3)}
+    assert _per_ped(result, "ped_leq_exposure_dba") == {"env_0/a": pytest.approx(_leq(a), abs=1e-3), "env_0/b": pytest.approx(_leq(b), abs=1e-3)}
+    assert _per_ped(result, "ped_max_startle_factor") == {"env_0/a": pytest.approx(0.0, abs=1e-3), "env_0/b": pytest.approx(a2 - a14, abs=1e-3)}
+    assert result["ped_max_exposure_dba"] == pytest.approx(max(_per_ped(result, "ped_max_exposure_dba").values()), abs=1e-9)
+
+
+def test_unreachable_pedestrian_gets_no_per_ped_exposure(calc, cached_map):
+    data = _frames([(1.0, 1.0)], [[(4.0, 1.0), (9.0, 9.0)]])
+    assert _per_ped(calc.calculate(_episode(data, cached_map()), {}), "ped_max_exposure_dba") == {"#0": pytest.approx(42.0 - _att(3.0), abs=1e-3)}
+
+
 def test_leading_null_pose_and_empty_first_frame_solve_from_origin(calc, cached_map):
     robot = [(None, None), (None, None), (None, None)]
     peds = [[], [(3.0, 4.0)], [(3.0, 4.0)]]
@@ -397,6 +424,9 @@ def test_robot_off_map_yields_only_empty_timeseries(calc, cached_map):
         "ped_max_exposure_dba": None,
         "ped_leq_exposure_dba": None,
         "ped_max_startle_factor": None,
+        "ped_max_exposure_dba_per_ped": None,
+        "ped_leq_exposure_dba_per_ped": None,
+        "ped_max_startle_factor_per_ped": None,
         "timeseries_acoustic_exposure_dba": [[], []],
         "timeseries_acoustic_attenuation_db": [[], []],
         "worst_case_acoustic_frame": None,

@@ -5,6 +5,7 @@ import typing
 import numpy as np
 
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
+from arena_evaluation.processing.metrics.ecological.mechanism_common import per_ped, ped_keys
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle
 
 
@@ -21,6 +22,9 @@ class PedestrianDisturbanceCalculator(BaseMetricCalculator):
         "ped_path_deflection_m": "m",
         "ped_velocity_delay_ratio": "",
         "ped_round_trips_completed": "",
+        "ped_path_deflection_m_per_ped": "m",
+        "ped_velocity_delay_ratio_per_ped": "",
+        "ped_round_trips_completed_per_ped": "",
     }
 
     PRIMARY_OUTPUTS = ["ped_path_deflection_m"]
@@ -33,7 +37,17 @@ class PedestrianDisturbanceCalculator(BaseMetricCalculator):
             "ped_path_deflection_m",
             "ped_velocity_delay_ratio",
             "ped_round_trips_completed",
+            "ped_path_deflection_m_per_ped",
+            "ped_velocity_delay_ratio_per_ped",
+            "ped_round_trips_completed_per_ped",
         ]
+
+    DESIRED_SPEED = 1.2  # Nominal pedsim desired speed
+
+    @classmethod
+    def _velocity_delay(cls, speed: float) -> float:
+        """Shortfall of a mean speed against the desired speed, 0 for no or an unusable speed."""
+        return max(0.0, float(1.0 - speed / cls.DESIRED_SPEED)) if speed > 0 and np.isfinite(speed) else 0.0
 
     @staticmethod
     def _compute_trajectory_deflection(actual_coords: np.ndarray, reference_coords: np.ndarray) -> float:
@@ -90,27 +104,37 @@ class PedestrianDisturbanceCalculator(BaseMetricCalculator):
         if not peds_pos or len(peds_pos) == 0:
             return {k: None for k in self.output_keys()}
 
-        # Extract pedestrian positions per agent
-        agent_paths: dict[int, list[tuple[float, float]]] = {}
-        for row in peds_pos:
+        # Extract pedestrian positions per agent, keyed by recorded name so a pedestrian keeps its track when others leave
+        names = episode.data["peds_names"].to_list() if "peds_names" in episode.data.columns else [None] * len(peds_pos)
+        time_ns = episode.data["time_ns"].to_numpy() if "time_ns" in episode.data.columns else None
+        agent_paths: dict[str, list[tuple[float, float]]] = {}
+        agent_times: dict[str, list[int]] = {}
+        for i, row in enumerate(peds_pos):
             arr = self._parse_peds(row)
-            for agent_idx, item in enumerate(arr):
+            for key, item in zip(ped_keys(names[i], len(arr)), arr, strict=True):
                 if not (np.isfinite(item[0]) and np.isfinite(item[1]) and abs(item[0]) < 1e6 and abs(item[1]) < 1e6):
                     continue
-                agent_paths.setdefault(agent_idx, []).append((float(item[0]), float(item[1])))
+                agent_paths.setdefault(key, []).append((float(item[0]), float(item[1])))
+                if time_ns is not None:
+                    agent_times.setdefault(key, []).append(int(time_ns[i]))
 
         if not agent_paths:
             return {
                 "ped_path_deflection_m": 0.0,
                 "ped_velocity_delay_ratio": 0.0,
                 "ped_round_trips_completed": 0,
+                "ped_path_deflection_m_per_ped": [],
+                "ped_velocity_delay_ratio_per_ped": [],
+                "ped_round_trips_completed_per_ped": [],
             }
 
         round_trips = 0
         total_deflection = 0.0
         num_agents = len(agent_paths)
+        deflections: dict[str, float] = {}
+        trips: dict[str, float] = {}
 
-        for coords in agent_paths.values():
+        for key, coords in agent_paths.items():
             arr = np.array(coords)
             if len(arr) < 5:
                 continue
@@ -119,39 +143,45 @@ class PedestrianDisturbanceCalculator(BaseMetricCalculator):
             dists_from_start = np.hypot(diffs[:, 0], diffs[:, 1])
             max_disp = float(np.max(dists_from_start))
 
-            if max_disp > 0.5:
-                round_trips += self._count_round_trips(dists_from_start, max_disp)
+            agent_trips = self._count_round_trips(dists_from_start, max_disp) if max_disp > 0.5 else 0
+            round_trips += agent_trips
+            trips[key] = float(agent_trips)
 
             # Standalone geometric lateral deflection against straight-line start-to-end vector
             p_start, p_end = arr[0], arr[-1]
             seg_vec = p_end - p_start
             seg_len = float(np.hypot(seg_vec[0], seg_vec[1]))
+            agent_deflection = 0.0
             if np.isfinite(seg_len) and seg_len > 0.5:
                 u_vec = seg_vec / seg_len
                 # Cross-product magnitude gives perpendicular distance in 2D
                 rel_pos = arr - p_start
                 lateral_dists = np.abs(rel_pos[:, 0] * u_vec[1] - rel_pos[:, 1] * u_vec[0])
                 finite_lat = lateral_dists[np.isfinite(lateral_dists)]
-                total_deflection += float(np.mean(finite_lat))
+                agent_deflection = float(np.mean(finite_lat))
+                total_deflection += agent_deflection
+            deflections[key] = round(agent_deflection, 3)
 
-        # Velocity delay: compare actual mean speed to baseline desired speed (~1.2 m/s)
-        time_ns = episode.data["time_ns"].to_numpy() if "time_ns" in episode.data.columns else None
+        # Velocity delay: compare actual mean speed to baseline desired speed, each pedestrian over the time it was recorded
         avg_speed = 0.0
+        delays: dict[str, float] = {}
         if time_ns is not None and len(time_ns) > 1:
             dt_s = (time_ns[-1] - time_ns[0]) / 1e9
             if dt_s > 0:
                 all_dists = []
-                for pts in agent_paths.values():
+                for key, pts in agent_paths.items():
                     if len(pts) > 1:
                         p_arr = np.array(pts)
                         step_dists = np.hypot(np.diff(p_arr[:, 0]), np.diff(p_arr[:, 1]))
                         finite_d = step_dists[np.isfinite(step_dists)]
                         all_dists.append(float(np.sum(finite_d)))
+                        span_s = (agent_times[key][-1] - agent_times[key][0]) / 1e9
+                        if span_s > 0:
+                            delays[key] = round(self._velocity_delay(all_dists[-1] / span_s), 3)
                 if all_dists:
                     avg_speed = float(np.mean(all_dists)) / dt_s
 
-        desired_speed = 1.2  # Nominal pedsim desired speed
-        velocity_delay_ratio = max(0.0, float(1.0 - (avg_speed / desired_speed))) if avg_speed > 0 and np.isfinite(avg_speed) else 0.0
+        velocity_delay_ratio = self._velocity_delay(avg_speed)
 
         deflection_val = round(total_deflection / num_agents, 3) if num_agents > 0 and np.isfinite(total_deflection) else 0.0
         delay_val = round(velocity_delay_ratio, 3) if np.isfinite(velocity_delay_ratio) else 0.0
@@ -161,4 +191,7 @@ class PedestrianDisturbanceCalculator(BaseMetricCalculator):
             "ped_path_deflection_m": deflection_val,
             "ped_velocity_delay_ratio": delay_val,
             "ped_round_trips_completed": trips_val,
+            "ped_path_deflection_m_per_ped": per_ped(deflections),
+            "ped_velocity_delay_ratio_per_ped": per_ped(delays),
+            "ped_round_trips_completed_per_ped": per_ped(trips),
         }

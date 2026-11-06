@@ -8,20 +8,33 @@ from arena_evaluation.processing.metrics.social.pedestrian_disturbance import Pe
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
 S = 1_000_000_000
-ALL_NONE = {"ped_path_deflection_m": None, "ped_velocity_delay_ratio": None, "ped_round_trips_completed": None}
+POOLED = ("ped_path_deflection_m", "ped_velocity_delay_ratio", "ped_round_trips_completed")
+ALL_NONE = dict.fromkeys(POOLED)
 deflection = PedestrianDisturbanceCalculator._compute_trajectory_deflection
 
 
-def _frame(rows: list, seconds: list[float] | None = None) -> pl.DataFrame:
+def _frame(rows: list, seconds: list[float] | None = None, names: list[list[str]] | None = None) -> pl.DataFrame:
     columns: dict = {"peds_positions": pl.Series(rows, dtype=pl.List(pl.Float64))}
     if seconds is not None:
         columns["time_ns"] = pl.Series([int(s * S) for s in seconds], dtype=pl.Int64)
+    if names is not None:
+        columns["peds_names"] = pl.Series(names, dtype=pl.List(pl.Utf8))
     return pl.DataFrame(columns)
 
 
-def _calc(data: pl.DataFrame | None) -> dict:
+def _result(data: pl.DataFrame | None) -> dict:
     episode = AlignedEpisodeBundle(episode_id=1, data=data, start_pos=[], goal_pos=[])
     return PedestrianDisturbanceCalculator(RobotParams()).calculate(episode, {})
+
+
+def _calc(data: pl.DataFrame | None) -> dict:
+    """The pooled episode values."""
+    result = _result(data)
+    return {key: result[key] for key in POOLED}
+
+
+def _per_ped(data: pl.DataFrame, key: str) -> dict[str, float]:
+    return {record["ped"]: record["value"] for record in _result(data)[f"{key}_per_ped"]}
 
 
 def _walk(*points: tuple[float, float]) -> list[list[float]]:
@@ -30,7 +43,7 @@ def _walk(*points: tuple[float, float]) -> list[list[float]]:
 
 
 def test_output_keys():
-    assert PedestrianDisturbanceCalculator.output_keys() == ["ped_path_deflection_m", "ped_velocity_delay_ratio", "ped_round_trips_completed"]
+    assert PedestrianDisturbanceCalculator.output_keys() == [*POOLED, *(f"{key}_per_ped" for key in POOLED)]
 
 
 def test_deflection_of_empty_input_is_zero():
@@ -159,3 +172,43 @@ def test_return_short_of_start_completes_no_round_trip():
 def test_round_trip_counts_return_near_start_after_reaching_far_end():
     rows = _walk((0.0, 0.0), (1.0, 0.0), (4.0, 0.0), (3.9, 0.0), (0.9, 0.0), (0.5, 0.0), (4.0, 0.0))
     assert _calc(_frame(rows, [0, 1, 2, 3, 4, 5, 6]))["ped_round_trips_completed"] == 1.0
+
+
+def test_missing_frame_yields_no_per_ped_values():
+    assert _result(None) == dict.fromkeys(PedestrianDisturbanceCalculator.output_keys())
+
+
+def test_rows_without_valid_points_yield_no_pedestrians():
+    result = _result(_frame([None, [], [math.nan, 0.0, 0.0]], [0, 1, 2]))
+    assert [result[f"{key}_per_ped"] for key in POOLED] == [[], [], []]
+
+
+def test_unnamed_pedestrians_are_keyed_by_entry_index():
+    rows = [[x, 0.0, 0.0, x, 2.0, 0.0] for x in (0.0, 1.0, 2.0, 3.0, 4.0)]
+    assert _per_ped(_frame(rows, [0, 1, 2, 3, 4]), "ped_round_trips_completed") == {"#0": 0.0, "#1": 0.0}
+
+
+def test_named_pedestrian_keeps_its_track_when_another_leaves():
+    """Ped B moves to entry 0 once A has left; keyed by index the two tracks would mix into one detour."""
+    a = [(0.0, 0.0), (1.0, 0.0)]
+    b = [(0.0, 5.0), (1.0, 6.0), (2.0, 6.0), (3.0, 6.0), (4.0, 5.0)]
+    rows = [[*a[0], 0.0, *b[0], 0.0], [*a[1], 0.0, *b[1], 0.0], [*b[2], 0.0], [*b[3], 0.0], [*b[4], 0.0]]
+    names = [["/env_0/A", "/env_0/B"], ["/env_0/A", "/env_0/B"], ["/env_0/B"], ["/env_0/B"], ["/env_0/B"]]
+    data = _frame(rows, [0, 1, 2, 3, 4], names)
+
+    assert _per_ped(data, "ped_path_deflection_m") == {"env_0/B": 0.6}
+    assert _per_ped(data, "ped_round_trips_completed") == {"env_0/B": 0.0}
+    assert _calc(data)["ped_path_deflection_m"] == 0.3
+
+
+def test_per_ped_velocity_delay_counts_only_the_time_a_pedestrian_was_recorded():
+    rows = [[0.0, 9.0, 0.0], [0.0, 9.0, 0.0], [0.0, 9.0, 0.0, 0.0, 0.0, 0.0], [0.0, 9.0, 0.0, 0.6, 0.0, 0.0]]
+    names = [["visitor"], ["visitor"], ["visitor", "walker"], ["visitor", "walker"]]
+    data = _frame(rows, [0, 1, 2, 3], names)
+    assert _per_ped(data, "ped_velocity_delay_ratio") == {"visitor": 0.0, "walker": 0.5}
+    assert _calc(data)["ped_velocity_delay_ratio"] == round(1.0 - (0.6 / 2.0 / 3.0) / 1.2, 3)
+
+
+def test_single_sample_pedestrian_has_no_velocity_delay():
+    rows = [[0.0, 0.0, 0.0, 5.0, 5.0, 0.0], [1.2, 0.0, 0.0]]
+    assert _per_ped(_frame(rows, [0, 1], [["walker", "passer"], ["walker"]]), "ped_velocity_delay_ratio") == {"walker": 0.0}
