@@ -139,14 +139,23 @@ def track_table(topics: typing.Mapping[str, pl.DataFrame | None], start_ns: int 
     return out.select([pl.col(c).cast(dtype) for c, dtype in TRACK_SCHEMA.items()]).sort("time_ns", "key")
 
 
-def tracks_for_episode(episode_dir: pathlib.Path, start_ns: int | None = None, end_ns: int | None = None) -> pl.DataFrame:
-    """The tracks of a processed episode, read from its extracted topics (`<episode_dir>/topics`), empty without them."""
+def tracks_for_episode(episode_dir: pathlib.Path, start_ns: int | None = None, end_ns: int | None = None, *, window: bool = False) -> pl.DataFrame:
+    """The tracks of a processed episode, read from its extracted topics (`<episode_dir>/topics`), empty without them.
+
+    `window` cuts them to the episode record's RUNNING..terminal stamps, as the metrics see the episode; explicit
+    `start_ns` and `end_ns` win over it."""
     from .parquet_store import TopicParquetStore
 
     bundles = TopicParquetStore.read(pathlib.Path(episode_dir) / "topics")
     if not bundles:
         return empty_tracks()
     bundle = next(iter(bundles.values()))
+    if window:
+        from .pipeline import _episode_window
+
+        record_start, record_end = _episode_window(bundle.episode_record)
+        start_ns = record_start if start_ns is None else start_ns
+        end_ns = record_end if end_ns is None else end_ns
     topics: dict[str, pl.DataFrame | None] = {}
     for name in ("peds_physics", "peds", "agent_meta"):
         df = getattr(bundle, name, None)

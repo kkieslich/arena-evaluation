@@ -308,6 +308,8 @@ def _collect_native_topics(bundle: TopicBundle) -> dict[str, pl.DataFrame]:
 from arena_evaluation.benchmark.profiler import PipelineProfiler
 from arena_evaluation.processing.mcap_reader import KEPT_EMPTY_TABLES, MCAPReader
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
+from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES
+from arena_evaluation.processing.metrics.flow.flow_episode import FLOW_EPISODE_DTYPES
 from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
 from arena_evaluation.processing.pose_anchor import resolve_pose_source
@@ -343,6 +345,8 @@ _METRIC_DTYPES = {
     "start": pl.List(pl.Float64),
     "goal": pl.List(pl.Float64),
     **PED_MEASURE_DTYPES,
+    **FLOW_EPISODE_DTYPES,
+    **FLOW_REFERENCE_DTYPES,
 }
 
 from .metrics.registry import MetricRegistry
@@ -902,6 +906,19 @@ class ProcessingPipeline:
                 ref_ped_row=ref_ped_row,
             )
             row.update(reconciled)
+
+        def episode_dir_of(row: dict) -> pathlib.Path | None:
+            """The directory of a metrics row's episode, None for a row without one."""
+            episode = row.get("episode")
+            return None if episode is None else self.folder_manager.episode_dir(benchmark_id, int(episode))
+
+        # INFRA: paired pedestrian measures against the stage's robot-free reference
+
+        # FLOWEDIT: each edit stage against its base world at the same seed, seed by seed and pooled
+        from .flow.benchmark import add_flow_reference_metrics
+
+        if flowed := add_flow_reference_metrics(all_metrics, episode_dir_of, evaluated=_STATUS_EVALUATED):
+            print(f"Phase 2 Post-Processing: flow change of {flowed} FLOWEDIT episodes against their base worlds", flush=True)
 
         combined_path = self.folder_manager.combined_metrics_path(benchmark_id)
         ParquetStore.write_rows(all_metrics, combined_path, schema_overrides=_METRIC_DTYPES)
