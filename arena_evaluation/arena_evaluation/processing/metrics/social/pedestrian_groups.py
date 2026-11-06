@@ -6,7 +6,7 @@ import numpy as np
 import polars as pl
 
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
-from arena_evaluation.processing.metrics.ecological.mechanism_common import ped_keys
+from arena_evaluation.processing.metrics.ecological.mechanism_common import ped_keys, strip_env
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle
 
 # arena_people_msgs/Pedestrian: an empty agent_type is an adult.
@@ -33,7 +33,7 @@ PED_MEASURE_DTYPES = {
 
 
 def ped_agent_types(data: pl.DataFrame | None) -> dict[str, str]:
-    """Agent type by pedestrian key, from the `peds_agent_types` recorded beside `peds_names`, {} without them.
+    """Agent type by pedestrian key without the env prefix, from the `peds_agent_types` recorded beside `peds_names`, {} without them.
 
     A pedestrian takes the first non-empty type recorded for it, `adult` when every one is empty: its first
     frames on `arena_peds` can precede its type.
@@ -43,7 +43,7 @@ def ped_agent_types(data: pl.DataFrame | None) -> dict[str, str]:
     rows = data.select("peds_names", "peds_agent_types").filter(pl.col("peds_names").list.len() == pl.col("peds_agent_types").list.len()).unique(maintain_order=True)
     types: dict[str, str] = {}
     for names, agent_types in rows.iter_rows():
-        for key, agent_type in zip(ped_keys(names, len(agent_types)), agent_types, strict=True):
+        for key, agent_type in zip(map(strip_env, ped_keys(names, len(agent_types))), agent_types, strict=True):
             if not types.get(key):
                 types[key] = agent_type
     return {key: agent_type or DEFAULT_AGENT_TYPE for key, agent_type in types.items()}

@@ -452,9 +452,14 @@ def ped_keys(names: typing.Sequence[str] | None, count: int) -> list[str]:
     return [f"#{j}" for j in range(count)]
 
 
+def strip_env(key: str) -> str:
+    """A pedestrian key without its `env_<n>/` prefix: env ids count up per spawn, so the same pedestrian is prefixed differently in another env."""
+    return _ENV_PREFIX.sub("", key, count=1)
+
+
 def per_ped(values: dict[str, float]) -> list[dict[str, typing.Any]]:
-    """Per-pedestrian values as `{ped, value}` records, the layout of every `*_per_ped` output."""
-    return [{"ped": key, "value": value} for key, value in values.items()]
+    """Per-pedestrian values as `{ped, value}` records keyed without the env prefix, the layout of every `*_per_ped` output."""
+    return [{"ped": strip_env(key), "value": value} for key, value in values.items()]
 
 
 def ped_tracks(data: pl.DataFrame | None, time_ns: np.ndarray | None = None) -> PedTracks | None:

@@ -375,9 +375,9 @@ def test_exposure_per_pedestrian_follows_each_name(calc, cached_map):
     a3, a10, a2, a14 = _att(3.0), _att(math.sqrt(10.0)), _att(2.0), _att(1.4)
     a = [42.0 - a3, 60.0 - a3, 60.0 - a10, 60.0 - a10, 60.0 - a10, 60.0 - a10]
     b = [60.0 - a2, 60.0 - a14, 60.0 - a14]
-    assert _per_ped(result, "ped_max_exposure_dba") == {"env_0/a": pytest.approx(60.0 - a3, abs=1e-3), "env_0/b": pytest.approx(60.0 - a14, abs=1e-3)}
-    assert _per_ped(result, "ped_leq_exposure_dba") == {"env_0/a": pytest.approx(_leq(a), abs=1e-3), "env_0/b": pytest.approx(_leq(b), abs=1e-3)}
-    assert _per_ped(result, "ped_max_startle_factor") == {"env_0/a": pytest.approx(0.0, abs=1e-3), "env_0/b": pytest.approx(a2 - a14, abs=1e-3)}
+    assert _per_ped(result, "ped_max_exposure_dba") == {"a": pytest.approx(60.0 - a3, abs=1e-3), "b": pytest.approx(60.0 - a14, abs=1e-3)}
+    assert _per_ped(result, "ped_leq_exposure_dba") == {"a": pytest.approx(_leq(a), abs=1e-3), "b": pytest.approx(_leq(b), abs=1e-3)}
+    assert _per_ped(result, "ped_max_startle_factor") == {"a": pytest.approx(0.0, abs=1e-3), "b": pytest.approx(a2 - a14, abs=1e-3)}
     assert result["ped_max_exposure_dba"] == pytest.approx(max(_per_ped(result, "ped_max_exposure_dba").values()), abs=1e-9)
 
 

@@ -2,6 +2,7 @@ import polars as pl
 import pytest
 
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
+from arena_evaluation.processing.metrics.ecological.mechanism_common import per_ped
 from arena_evaluation.processing.metrics.registry import MetricRegistry
 from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURES, PedestrianGroupsCalculator, by_group, ped_agent_types, worst_group
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
@@ -38,7 +39,13 @@ def test_pedestrian_takes_its_first_non_empty_type_and_is_an_adult_without_one()
         (["/env_0/a", "/env_0/c"], ["elder", "blind_white_cane"]),
         (["/env_0/a", "/env_0/c"], ["adult", "blind_white_cane"]),
     )
-    assert ped_agent_types(data) == {"env_0/a": "elder", "env_0/b": "wheelchair_manual", "env_0/d": "adult", "env_0/c": "blind_white_cane"}
+    assert ped_agent_types(data) == {"a": "elder", "b": "wheelchair_manual", "d": "adult", "c": "blind_white_cane"}
+
+
+def test_pedestrians_are_keyed_without_their_env_prefix():
+    data = _types((["/env_1/flow_3", "env_12/lobby/visitor", "kiosk_user"], ["elder", "adult", "adult"]))
+    assert ped_agent_types(data) == {"flow_3": "elder", "lobby/visitor": "adult", "kiosk_user": "adult"}
+    assert per_ped({"env_2/flow_3": 1.0, "flow_4": 2.0}) == [{"ped": "flow_3", "value": 1.0}, {"ped": "flow_4", "value": 2.0}]
 
 
 def test_rows_whose_types_do_not_match_their_names_are_skipped():
@@ -90,13 +97,13 @@ def test_worst_group_is_none_without_groups():
 def test_calculator_reports_each_measure_per_agent_type():
     data = _types((["/env_0/a", "/env_0/b", "/env_0/c"], ["adult", "wheelchair_manual", "adult"]))
     prior = {
-        "ped_mechanism_delay_seconds_per_ped": _records(**{"env_0/a": 0.0, "env_0/b": 6.0, "env_0/c": 2.0}),
-        "ped_round_trips_completed_per_ped": _records(**{"env_0/a": 2.0, "env_0/b": 1.0, "env_0/c": 2.0}),
+        "ped_mechanism_delay_seconds_per_ped": _records(a=0.0, b=6.0, c=2.0),
+        "ped_round_trips_completed_per_ped": _records(a=2.0, b=1.0, c=2.0),
         "ped_max_exposure_dba_per_ped": None,
     }
     result = _calc(data, prior)
 
-    assert result["ped_agent_types"] == [{"ped": "env_0/a", "agent_type": "adult"}, {"ped": "env_0/b", "agent_type": "wheelchair_manual"}, {"ped": "env_0/c", "agent_type": "adult"}]
+    assert result["ped_agent_types"] == [{"ped": "a", "agent_type": "adult"}, {"ped": "b", "agent_type": "wheelchair_manual"}, {"ped": "c", "agent_type": "adult"}]
     assert result["ped_mechanism_delay_seconds_by_group"] == [{"group": "adult", "value": 1.0, "peds": 2}, {"group": "wheelchair_manual", "value": 6.0, "peds": 1}]
     assert result["ped_mechanism_delay_seconds_worst_group"] == "wheelchair_manual"
     assert result["ped_round_trips_completed_worst_group"] == "wheelchair_manual"

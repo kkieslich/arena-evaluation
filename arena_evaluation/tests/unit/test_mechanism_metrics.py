@@ -598,7 +598,7 @@ def test_ped_mechanism_delay_per_pedestrian():
     walking = ("env_0/Pedestrian_2", 2.0, 1.0, 1.0, 0.0)
     data = _data([(10, 10)] * 4, **_peds([[waiting, walking]] * 4))
     results = _calc(world).calculate(_episode(data, closed), {})
-    assert results["ped_mechanism_delay_seconds_per_ped"] == [{"ped": PED, "value": pytest.approx(3.0)}, {"ped": "env_0/Pedestrian_2", "value": 0.0}]
+    assert results["ped_mechanism_delay_seconds_per_ped"] == [{"ped": "Pedestrian_1", "value": pytest.approx(3.0)}, {"ped": "Pedestrian_2", "value": 0.0}]
     assert results["ped_mechanism_delay_seconds"] == pytest.approx(3.0)
 
 

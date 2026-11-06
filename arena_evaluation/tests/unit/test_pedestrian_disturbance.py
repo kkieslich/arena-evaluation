@@ -196,8 +196,8 @@ def test_named_pedestrian_keeps_its_track_when_another_leaves():
     names = [["/env_0/A", "/env_0/B"], ["/env_0/A", "/env_0/B"], ["/env_0/B"], ["/env_0/B"], ["/env_0/B"]]
     data = _frame(rows, [0, 1, 2, 3, 4], names)
 
-    assert _per_ped(data, "ped_path_deflection_m") == {"env_0/B": 0.6}
-    assert _per_ped(data, "ped_round_trips_completed") == {"env_0/B": 0.0}
+    assert _per_ped(data, "ped_path_deflection_m") == {"B": 0.6}
+    assert _per_ped(data, "ped_round_trips_completed") == {"B": 0.0}
     assert _calc(data)["ped_path_deflection_m"] == 0.3
 
 
