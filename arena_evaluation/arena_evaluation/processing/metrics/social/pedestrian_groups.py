@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import typing
 
 import numpy as np
@@ -11,6 +12,14 @@ from arena_evaluation.storage.schemas import AlignedEpisodeBundle
 
 # arena_people_msgs/Pedestrian: an empty agent_type is an adult.
 DEFAULT_AGENT_TYPE = "adult"
+
+# Agent types scored together as one group, every other type is a group of its own.
+TYPE_GROUPS = {
+    "wheelchair_manual": "wheelchair",
+    "wheelchair_electric": "wheelchair",
+    "blind_white_cane": "long_cane",
+    "blind_rolling_cane": "long_cane",
+}
 
 # Measures with a `<measure>_per_ped` output and the direction that is better, the other end names the worst-served group.
 PED_MEASURES = {
@@ -49,11 +58,17 @@ def ped_agent_types(data: pl.DataFrame | None) -> dict[str, str]:
     return {key: agent_type or DEFAULT_AGENT_TYPE for key, agent_type in types.items()}
 
 
-def by_group(records: list[dict[str, typing.Any]] | None, agent_types: dict[str, str]) -> list[dict[str, typing.Any]] | None:
-    """Mean per-pedestrian value of each agent type as `{group, value, peds}` records by group name, None without a typed value."""
+def agent_group(agent_type: str) -> str:
+    """The group an agent type is scored in, a type recorded as a yaml path by its file stem."""
+    name = pathlib.PurePosixPath(agent_type).stem if "/" in agent_type or agent_type.endswith(".yaml") else agent_type
+    return TYPE_GROUPS.get(name, name)
+
+
+def by_group(records: list[dict[str, typing.Any]] | None, groups: dict[str, str]) -> list[dict[str, typing.Any]] | None:
+    """Mean per-pedestrian value of each group as `{group, value, peds}` records by group name, None without a grouped value."""
     values: dict[str, list[float]] = {}
     for record in records or ():
-        group = agent_types.get(record["ped"])
+        group = groups.get(record["ped"])
         if group is not None and record["value"] is not None:
             values.setdefault(group, []).append(float(record["value"]))
     return [{"group": group, "value": float(np.mean(v)), "peds": len(v)} for group, v in sorted(values.items())] or None
@@ -69,7 +84,7 @@ def worst_group(groups: list[dict[str, typing.Any]] | None, direction: str) -> s
 
 
 class PedestrianGroupsCalculator(BaseMetricCalculator):
-    """Every pedestrian measure per group, a group being the pedestrians of one agent type, with the worst-served group."""
+    """Every pedestrian measure per group of agent types, with the worst-served group."""
 
     NAME = "pedestrian_groups"
     CATEGORY = "social"
@@ -84,8 +99,9 @@ class PedestrianGroupsCalculator(BaseMetricCalculator):
     def calculate(self, episode: AlignedEpisodeBundle, prior_results: dict[str, typing.Any]) -> dict[str, typing.Any]:
         agent_types = ped_agent_types(episode.data)
         results: dict[str, typing.Any] = {"ped_agent_types": [{"ped": key, "agent_type": agent_type} for key, agent_type in agent_types.items()] or None}
+        ped_groups = {key: agent_group(agent_type) for key, agent_type in agent_types.items()}
         for measure, direction in PED_MEASURES.items():
-            groups = by_group(prior_results.get(f"{measure}_per_ped"), agent_types)
+            groups = by_group(prior_results.get(f"{measure}_per_ped"), ped_groups)
             results[f"{measure}_by_group"] = groups
             results[f"{measure}_worst_group"] = worst_group(groups, direction)
         return results

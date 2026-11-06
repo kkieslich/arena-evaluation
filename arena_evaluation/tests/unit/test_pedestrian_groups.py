@@ -4,7 +4,7 @@ import pytest
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
 from arena_evaluation.processing.metrics.ecological.mechanism_common import per_ped
 from arena_evaluation.processing.metrics.registry import MetricRegistry
-from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURES, PedestrianGroupsCalculator, by_group, ped_agent_types, worst_group
+from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURES, PedestrianGroupsCalculator, agent_group, by_group, ped_agent_types, worst_group
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
 
@@ -65,8 +65,8 @@ def test_recordings_without_types_type_nobody(data: pl.DataFrame | None):
 
 def test_group_value_is_the_mean_over_its_pedestrians():
     records = _records(a=1.0, b=3.0, c=4.0, d=None, stranger=9.0)
-    types = {"a": "adult", "b": "adult", "c": "wheelchair_manual", "d": "wheelchair_manual"}
-    assert by_group(records, types) == [{"group": "adult", "value": 2.0, "peds": 2}, {"group": "wheelchair_manual", "value": 4.0, "peds": 1}]
+    groups = {"a": "adult", "b": "adult", "c": "wheelchair", "d": "wheelchair"}
+    assert by_group(records, groups) == [{"group": "adult", "value": 2.0, "peds": 2}, {"group": "wheelchair", "value": 4.0, "peds": 1}]
 
 
 @pytest.mark.parametrize(("records", "types"), [(None, {"a": "adult"}), ([], {"a": "adult"}), (_records(a=1.0), {}), (_records(a=None), {"a": "adult"})], ids=["no measure", "no pedestrians", "untyped", "no values"])
@@ -75,15 +75,15 @@ def test_group_breakdown_is_none_without_typed_values(records: list | None, type
 
 
 def test_worst_group_is_the_far_end_of_the_better_direction():
-    groups = [{"group": "adult", "value": 1.0, "peds": 3}, {"group": "elder", "value": 2.0, "peds": 1}, {"group": "wheelchair_manual", "value": 0.5, "peds": 1}]
+    groups = [{"group": "adult", "value": 1.0, "peds": 3}, {"group": "elder", "value": 2.0, "peds": 1}, {"group": "wheelchair", "value": 0.5, "peds": 1}]
     assert worst_group(groups, "lower") == "elder"
-    assert worst_group(groups, "higher") == "wheelchair_manual"
+    assert worst_group(groups, "higher") == "wheelchair"
 
 
 def test_a_tie_for_worst_names_no_group():
-    groups = [{"group": "adult", "value": 1.0, "peds": 3}, {"group": "elder", "value": 1.0, "peds": 1}, {"group": "wheelchair_manual", "value": 0.5, "peds": 1}]
+    groups = [{"group": "adult", "value": 1.0, "peds": 3}, {"group": "elder", "value": 1.0, "peds": 1}, {"group": "wheelchair", "value": 0.5, "peds": 1}]
     assert worst_group(groups, "lower") is None
-    assert worst_group(groups, "higher") == "wheelchair_manual"
+    assert worst_group(groups, "higher") == "wheelchair"
 
 
 def test_a_single_group_is_the_worst_served():
@@ -94,7 +94,7 @@ def test_worst_group_is_none_without_groups():
     assert worst_group(None, "lower") is None
 
 
-def test_calculator_reports_each_measure_per_agent_type():
+def test_calculator_reports_each_measure_per_group():
     data = _types((["/env_0/a", "/env_0/b", "/env_0/c"], ["adult", "wheelchair_manual", "adult"]))
     prior = {
         "ped_mechanism_delay_seconds_per_ped": _records(a=0.0, b=6.0, c=2.0),
@@ -104,12 +104,39 @@ def test_calculator_reports_each_measure_per_agent_type():
     result = _calc(data, prior)
 
     assert result["ped_agent_types"] == [{"ped": "a", "agent_type": "adult"}, {"ped": "b", "agent_type": "wheelchair_manual"}, {"ped": "c", "agent_type": "adult"}]
-    assert result["ped_mechanism_delay_seconds_by_group"] == [{"group": "adult", "value": 1.0, "peds": 2}, {"group": "wheelchair_manual", "value": 6.0, "peds": 1}]
-    assert result["ped_mechanism_delay_seconds_worst_group"] == "wheelchair_manual"
-    assert result["ped_round_trips_completed_worst_group"] == "wheelchair_manual"
+    assert result["ped_mechanism_delay_seconds_by_group"] == [{"group": "adult", "value": 1.0, "peds": 2}, {"group": "wheelchair", "value": 6.0, "peds": 1}]
+    assert result["ped_mechanism_delay_seconds_worst_group"] == "wheelchair"
+    assert result["ped_round_trips_completed_worst_group"] == "wheelchair"
     assert result["ped_max_exposure_dba_by_group"] is None
     assert result["ped_max_exposure_dba_worst_group"] is None
     assert result["ped_path_deflection_m_by_group"] is None
+
+
+@pytest.mark.parametrize(
+    ("agent_type", "group"),
+    [
+        ("wheelchair_manual", "wheelchair"),
+        ("wheelchair_electric", "wheelchair"),
+        ("blind_white_cane", "long_cane"),
+        ("blind_rolling_cane", "long_cane"),
+        ("blind", "blind"),
+        ("elder", "elder"),
+        ("/opt/arena_ws/scenarios/caller.yaml", "caller"),
+        ("agent_types/wheelchair_manual.yaml", "wheelchair"),
+        ("visitor.yaml", "visitor"),
+    ],
+)
+def test_agent_types_fall_into_their_study_group(agent_type: str, group: str):
+    assert agent_group(agent_type) == group
+
+
+def test_calculator_groups_types_together_and_keeps_the_raw_type():
+    data = _types((["a", "b", "c"], ["wheelchair_manual", "wheelchair_electric", "blind_white_cane"]))
+    result = _calc(data, {"ped_mechanism_delay_seconds_per_ped": _records(a=2.0, b=4.0, c=1.0)})
+
+    assert result["ped_agent_types"] == [{"ped": "a", "agent_type": "wheelchair_manual"}, {"ped": "b", "agent_type": "wheelchair_electric"}, {"ped": "c", "agent_type": "blind_white_cane"}]
+    assert result["ped_mechanism_delay_seconds_by_group"] == [{"group": "long_cane", "value": 1.0, "peds": 1}, {"group": "wheelchair", "value": 3.0, "peds": 2}]
+    assert result["ped_mechanism_delay_seconds_worst_group"] == "wheelchair"
 
 
 def test_calculator_without_agent_types_reports_nothing():
