@@ -33,8 +33,11 @@ _BUNDLE_FIELDS = frozenset(f.name for f in dataclasses.fields(TopicBundle))
 INTERACTION_EVENT_NAMES = {0: "ACTIVATED", 1: "HOLD_ONSET", 2: "RELEASED", 3: "INTERRUPTED", 4: "CANCELED"}
 MEMBER_ROLE_PARTICIPANT = 0
 MEMBER_ROLE_QUEUED = 1
-ENV_STATE_TABLES = ("peds_physics", "ped_gestures", "interactions", "interaction_events", "animation_states")
+ENV_STATE_TABLES = ("peds_physics", "ped_gestures", "interactions", "interaction_events", "animation_states", "agent_meta")
 KEPT_EMPTY_TABLES = ("ped_gestures",)
+# Beside an env's peds.parquet when it is a copy of the crowd engine's agent_states (no arena_peds recorded): those
+# positions are in the world frame already and take no env offset.
+ENGINE_PEDS_MARKER = "peds.from_agent_states"
 
 Anchor = tuple[int, float, float]
 
@@ -155,6 +158,18 @@ _TOPIC_SCHEMAS: dict[str, pa.Schema] = {
             ("event", pa.int64()),
             ("event_name", pa.string()),
             ("participants", pa.list_(pa.int64())),
+        ]
+    ),
+    # One row per agent per agent_meta message: the name, type and releasing source of every engine agent.
+    "agent_meta": pa.schema(
+        [
+            ("time_ns", pa.int64()),
+            ("stamp_ns", pa.int64()),
+            ("agent_id", pa.int64()),
+            ("name", pa.string()),
+            ("agent_type", pa.string()),
+            ("source_name", pa.string()),
+            ("source_seq", pa.int64()),
         ]
     ),
     "animation_states": pa.schema(
@@ -593,6 +608,27 @@ class MCAPReader:
 
                             appended = True
 
+                        # Engine agent attributes (humansim): pair a released pedestrian across runs by (source_name, source_seq)
+                        elif topic.endswith("/agent_meta") and schema.name == "arena_humansim_msgs/msg/AgentMeta":
+                            stamp = self._stamp_ns(ros_msg.header)
+                            rows = env_data[env_key]["agent_meta"]
+                            agent_ids = [int(i) for i in ros_msg.agent_id]
+                            n = len(agent_ids)
+
+                            def column(field: str, default: object, n: int = n) -> list:
+                                values = list(getattr(ros_msg, field, None) or [])
+                                return values if len(values) == n else [default] * n
+
+                            for agent_id, name, agent_type, source_name, source_seq in zip(agent_ids, column("name", ""), column("agent_type", ""), column("source_name", ""), column("source_seq", 0), strict=True):
+                                rows["time_ns"].append(ts_ns)
+                                rows["stamp_ns"].append(stamp)
+                                rows["agent_id"].append(agent_id)
+                                rows["name"].append(str(name))
+                                rows["agent_type"].append(str(agent_type))
+                                rows["source_name"].append(str(source_name))
+                                rows["source_seq"].append(int(source_seq))
+                            appended = True
+
                         # Interaction lifecycle (humansim)
                         elif topic.endswith("/interactions") and schema.name == "arena_humansim_msgs/msg/InteractionFrame":
                             stamp = self._stamp_ns(ros_msg.header)
@@ -884,6 +920,7 @@ class MCAPReader:
                 arena_peds = env_dir / "peds.parquet"
                 if engine_peds.exists() and not arena_peds.exists():
                     shutil.copyfile(engine_peds, arena_peds)
+                    (env_dir / ENGINE_PEDS_MARKER).touch()
 
         return self.load_bundles(out_dir, run_dir, map_name_fallback=map_name_fallback)
 
@@ -1085,7 +1122,10 @@ class MCAPReader:
                     logging.getLogger(__name__).warning(f"Failed to offset episode_record coordinates: {e}")
                     pass
 
-            for table in ("peds", "peds_physics") if shifted else ():
+            # The crowd engine runs in the world frame and its adapter adds the env offset for arena_peds only: agent_states
+            # (peds_physics, and peds when it is a copy of them) are in the world frame already and stay as recorded.
+            engine_only = (env_dir / ENGINE_PEDS_MARKER).exists()
+            for table in ("peds",) if shifted and not engine_only else ():
                 peds = getattr(rb, table)
                 if peds is None:
                     continue
