@@ -50,8 +50,9 @@ def test_efficiency_adversarial_zero_length():
 
 def test_pedestrian_disturbance_adversarial_chaotic():
     # Infinite velocities, massive jumps, and NaNs
-    df = pl.DataFrame({"time_ns": [0, 1, 2, 3, 4, 5, 6], "peds_positions": [[(0.0, 0.0)], [(1.0, 1.0)], [(float('inf'), float('inf'))], [(-float('inf'), 1e300)], [(float('nan'), float('nan'))], [(1.0, 1.0)], [(2.0, 2.0)]]})
-    episode = AlignedEpisodeBundle(episode_id=1, data=df, start_pos=[], goal_pos=[])
+    df = pl.DataFrame({"time_ns": [0, 1, 2, 3, 4, 5, 6], "peds_positions": [[(0.0, 0.0)], [(1.0, 1.0)], [(float('inf'), float('inf'))], [(-float('inf'), 1e300)], [(float('nan'), float('nan'))], [(1.0, 1.0)], [(2.0, 2.0)]], "peds_ids": [[0]] * 7})
+    physics = pl.DataFrame({"peds_ids": [[0]], "peds_desired_velocities": [[1.2]]})
+    episode = AlignedEpisodeBundle(episode_id=1, data=df, start_pos=[], goal_pos=[], topics={"peds_physics": physics})
     params = RobotParams(0.2, 0.0, 10.0)
     calc = PedestrianDisturbanceCalculator(params)
     prior = {}
