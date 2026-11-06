@@ -279,6 +279,7 @@ from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES, ad
 from arena_evaluation.processing.mcap_reader import MCAPReader
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
 from arena_evaluation.processing.metrics.flow.flow_episode import FLOW_EPISODE_DTYPES
+from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_DTYPES
 from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
 from arena_evaluation.processing.ped_track_store import write_tracks
@@ -317,6 +318,7 @@ _METRIC_DTYPES = {
     **PED_MEASURE_DTYPES,
     **FLOW_EPISODE_DTYPES,
     **FLOW_REFERENCE_DTYPES,
+    **PAIRED_DTYPES,
 }
 
 from .metrics.registry import MetricRegistry
