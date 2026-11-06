@@ -276,11 +276,11 @@ def _fleet_poses(robots: dict[str, TopicBundle], window: tuple[int | None, int |
 from arena_evaluation.benchmark.profiler import PipelineProfiler
 from arena_evaluation.processing.episode_topics import RECORD_RUNNING, episode_window, native_topics
 from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES, add_flow_reference_metrics
-from arena_evaluation.processing.mcap_reader import MCAPReader
+from arena_evaluation.processing.mcap_reader import MCAPReader, bundle_env
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
 from arena_evaluation.processing.metrics.flow.flow_episode import FLOW_EPISODE_DTYPES
 from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_DTYPES
-from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts
+from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts, record_keys, rekey_records
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
 from arena_evaluation.processing.ped_track_store import write_tracks
 from arena_evaluation.processing.pose_anchor import resolve_pose_source
@@ -579,8 +579,9 @@ class ProcessingPipeline:
         if bundles is None or len(bundles) == 0:
             return finish([_status_row(ep, metadata, _metadata_robot(metadata), "no_recording", "no MCAP or empty extraction")])
 
+        tracks_by_env: dict[str, pl.DataFrame] = {}
         try:
-            write_tracks(episode_dir, bundles)
+            tracks_by_env = write_tracks(episode_dir, bundles)
         except Exception as e:
             _log.warning(f"episode_{ep.episode_id:03d}: pedestrian tracks not kept, they are built again on use: {e!r}")
 
@@ -716,6 +717,7 @@ class ProcessingPipeline:
                         available_topics=available_topics,
                         progress_callback=on_calc_progress,
                     )
+                    rekey_records(ep_metrics, record_keys(peds_df, tracks_by_env.get(bundle_env(robot_name))))
                     ep_metrics["episode"] = ep.episode_id
                     ep_metrics["planner"] = ep.planner
                     if metadata is not None and metadata.local_planner:
