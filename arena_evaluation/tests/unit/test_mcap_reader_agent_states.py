@@ -15,11 +15,11 @@ from arena_evaluation.processing.mcap_reader import _PEDS_SCHEMA, MCAPReader
 
 _TOPIC = "/arena/env_0/arena_env_node/agent_states"
 
-# (agent_id, kind, x, y, theta, vx, vy)
+# (agent_id, kind, x, y, theta, vx, vy, radius)
 _AGENTS = [
-    (3, AgentState.KIND_HUMAN, 1.5, -2.0, 0.75, 0.3, 0.4),
-    (99, AgentState.KIND_ROBOT, 4.0, 4.0, 0.0, 1.0, 0.0),
-    (7, AgentState.KIND_HUMAN, -0.5, 3.25, -1.5, -0.2, 0.1),
+    (3, AgentState.KIND_HUMAN, 1.5, -2.0, 0.75, 0.3, 0.4, 0.25),
+    (99, AgentState.KIND_ROBOT, 4.0, 4.0, 0.0, 1.0, 0.0, 0.3),
+    (7, AgentState.KIND_HUMAN, -0.5, 3.25, -1.5, -0.2, 0.1, 0.325),
 ]
 
 
@@ -27,8 +27,8 @@ def _nested() -> AgentStates:
     msg = AgentStates()
     msg.header.frame_id = "map"
     msg.header.stamp.sec = 2
-    for agent_id, kind, x, y, theta, vx, vy in _AGENTS:
-        agent = AgentState(agent_id=agent_id, kind=kind)
+    for agent_id, kind, x, y, theta, vx, vy, radius in _AGENTS:
+        agent = AgentState(agent_id=agent_id, kind=kind, radius=radius)
         agent.pose.x, agent.pose.y, agent.pose.theta = x, y, theta
         agent.velocity.x, agent.velocity.y = vx, vy
         msg.agents.append(agent)
@@ -39,7 +39,7 @@ def _flat() -> AgentFrame:
     msg = AgentFrame()
     msg.header.frame_id = "map"
     msg.header.stamp.sec = 2
-    msg.agent_id, msg.kind, msg.x, msg.y, msg.theta, msg.vx, msg.vy = (list(column) for column in zip(*_AGENTS, strict=True))
+    msg.agent_id, msg.kind, msg.x, msg.y, msg.theta, msg.vx, msg.vy, msg.radius = (list(column) for column in zip(*_AGENTS, strict=True))
     return msg
 
 
@@ -75,6 +75,7 @@ def test_agent_states_nested_and_flat_layouts_read_into_identical_peds(tmp_path:
             "peds_animation_states": [0, 0],
             "peds_interaction_ids": [-1, -1],
             "peds_interaction_types": [0, 0],
+            "peds_radii": [0.25, 0.325],
         }
     ]
 
@@ -129,6 +130,7 @@ def test_agent_frames_without_humans_before_the_first_flush_keep_the_peds_schema
             "peds_animation_states": [0, 0],
             "peds_interaction_ids": [-1, -1],
             "peds_interaction_types": [0, 0],
+            "peds_radii": [0.25, 0.325],
         }
     ]
 

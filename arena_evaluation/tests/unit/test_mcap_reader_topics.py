@@ -250,6 +250,7 @@ def test_arena_peds_win_over_engine_agent_states(every_topic: tuple[pathlib.Path
             "peds_animation_states": [0],
             "peds_interaction_ids": [-1],
             "peds_interaction_types": [0],
+            "peds_radii": [],
         }
     ]
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 
 import polars as pl
 
-from arena_evaluation.processing.mcap_reader import ENV_STATE_TABLES, KEPT_EMPTY_TABLES
+from arena_evaluation.processing.mcap_reader import ENV_STATE_TABLES, KEPT_EMPTY_TABLES, bundle_env
 from arena_evaluation.storage.exceptions import SchemaViolationError
 from arena_evaluation.storage.schemas import RunMetadata, TopicBundle
 
@@ -108,8 +109,15 @@ class ParquetStore:
 class TopicParquetStore:
     """Reads and writes TopicBundle DataFrames to per-topic Parquet files."""
 
-    VERSION = 4
+    VERSION = 6
     VERSION_FILE = ".cache_version"
+    # Tables built from the cache live here: every write clears them, and reading the topics skips them.
+    DERIVED_DIR = ".derived"
+
+    @staticmethod
+    def derived_dir(source_dir: pathlib.Path) -> pathlib.Path:
+        """Where tables built from the cache in source_dir are kept."""
+        return source_dir / TopicParquetStore.DERIVED_DIR
 
     @staticmethod
     def is_current(source_dir: pathlib.Path) -> bool:
@@ -124,22 +132,27 @@ class TopicParquetStore:
     def write(bundles: dict[str, TopicBundle], dest_dir: pathlib.Path, overwrite: bool = False) -> None:
         """Write TopicBundle DataFrames to Parquet files using zstd compression."""
         dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(TopicParquetStore.derived_dir(dest_dir), ignore_errors=True)
         import dataclasses
 
-        # Determine global fields that are shared among all robots to save space
-        global_fields = {"peds", "episode_record", "tf", "tf_static", "semantic_snapshot", *ENV_STATE_TABLES}
+        # Shared by every robot, written once to the root dir
+        global_fields = {"tf", "tf_static", "semantic_snapshot"}
+        # Shared by the robots of one env: the first env's go to the root dir, another env's into each of its robot dirs, which read() lets override the root
+        env_fields = {"peds", "episode_record", *ENV_STATE_TABLES}
         global_written = set()
+        root_env: dict[str, str] = {}
         complete = True
 
         for robot_name, bundle in bundles.items():
             robot_dir = dest_dir / robot_name
             robot_dir.mkdir(parents=True, exist_ok=True)
+            env = bundle_env(robot_name)
 
             for field in dataclasses.fields(bundle):
                 df = getattr(bundle, field.name)
                 if df is not None:
-                    # Write globals to the root dir
-                    if field.name in global_fields:
+                    at_root = field.name in global_fields or (field.name in env_fields and root_env.setdefault(field.name, env) == env)
+                    if at_root:
                         if field.name in global_written:
                             continue
                         final_path = dest_dir / f"{field.name}.parquet"
@@ -197,9 +210,7 @@ class TopicParquetStore:
             global_bundle.peds = load_parquet(source_dir / "peds_fallback.parquet")
 
         # Load robot specific topics
-        robot_dirs = [d for d in source_dir.iterdir() if d.is_dir()]
-
-        robot_dirs = [d for d in source_dir.iterdir() if d.is_dir()]
+        robot_dirs = [d for d in source_dir.iterdir() if d.is_dir() and d.name != TopicParquetStore.DERIVED_DIR]
 
         for robot_dir in robot_dirs:
             robot_name = robot_dir.name

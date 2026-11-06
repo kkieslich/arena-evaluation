@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import logging
 import multiprocessing
 import os
@@ -27,9 +28,6 @@ from arena_evaluation.storage.schemas import (
 )
 
 _log = logging.getLogger(__name__)
-
-# Frames shared across robots or scoped to the whole episode, never per-robot sample data.
-_SHARED_FRAMES = frozenset({"tf", "tf_static", "semantic_snapshot", "episode_record"})
 
 
 def _worker_init():
@@ -180,25 +178,7 @@ def _metric_world(metadata: RunMetadata | None, ep: EpisodeDescriptor) -> str | 
     return None
 
 
-_RECORD_RUNNING = 1  # arena_runtime_msgs/msg/EpisodeRecord.RUNNING
 _RECORD_SUCCESS = 2  # arena_runtime_msgs/msg/EpisodeRecord.SUCCESS
-
-
-def _episode_window(record: pl.DataFrame | pl.LazyFrame | None) -> tuple[int | None, int | None]:
-    """[RUNNING stamp, terminal stamp] of the episode record, a bound is None when its row is missing."""
-    if record is None:
-        return None, None
-    df = record.collect() if isinstance(record, pl.LazyFrame) else record
-    if len(df) == 0 or "time_ns" not in df.columns:
-        return None, None
-    df = df.sort("time_ns")
-    if "outcome_state" not in df.columns:
-        return int(df["time_ns"][0]), int(df["time_ns"][-1])
-    states = df["outcome_state"].to_list()
-    stamps = df["time_ns"].to_list()
-    start = next((int(t) for t, s in zip(stamps, states, strict=True) if s == _RECORD_RUNNING), None)
-    end = None if states[-1] == _RECORD_RUNNING else int(stamps[-1])
-    return start, end
 
 
 _ALIGN_TOLERANCE_NS = 100_000_000
@@ -293,23 +273,15 @@ def _fleet_poses(robots: dict[str, TopicBundle], window: tuple[int | None, int |
     return fleet
 
 
-def _collect_native_topics(bundle: TopicBundle) -> dict[str, pl.DataFrame]:
-    """Raw native-rate topic frames keyed by topic name (collected)."""
-    topics: dict[str, pl.DataFrame] = {}
-    for name in sorted(bundle.available() - _SHARED_FRAMES):
-        df = getattr(bundle, name)
-        if isinstance(df, pl.LazyFrame):
-            df = df.collect()
-        if len(df) > 0 or name in KEPT_EMPTY_TABLES:
-            topics[name] = df
-    return topics
-
-
 from arena_evaluation.benchmark.profiler import PipelineProfiler
-from arena_evaluation.processing.mcap_reader import KEPT_EMPTY_TABLES, MCAPReader
+from arena_evaluation.processing.episode_topics import RECORD_RUNNING, episode_window, native_topics
+from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES, add_flow_reference_metrics
+from arena_evaluation.processing.mcap_reader import MCAPReader
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
+from arena_evaluation.processing.metrics.flow.flow_episode import FLOW_EPISODE_DTYPES
 from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
+from arena_evaluation.processing.ped_track_store import write_tracks
 from arena_evaluation.processing.pose_anchor import resolve_pose_source
 from arena_evaluation.processing.pose_segments import ride_arrival_times
 from arena_evaluation.processing.topic_aligner import TopicAligner
@@ -343,6 +315,8 @@ _METRIC_DTYPES = {
     "start": pl.List(pl.Float64),
     "goal": pl.List(pl.Float64),
     **PED_MEASURE_DTYPES,
+    **FLOW_EPISODE_DTYPES,
+    **FLOW_REFERENCE_DTYPES,
 }
 
 from .metrics.registry import MetricRegistry
@@ -364,7 +338,7 @@ def _episode_rows(record: pl.DataFrame) -> pl.DataFrame:
     if "outcome_state" not in df.columns:
         return df
     states = df["outcome_state"].to_list()
-    started = next((i for i, state in enumerate(states) if state == _RECORD_RUNNING), None)
+    started = next((i for i, state in enumerate(states) if state == RECORD_RUNNING), None)
     if started is None:
         return df
     end = next((i for i in range(started, len(states)) if states[i] is not None and states[i] >= _RECORD_SUCCESS), None)
@@ -394,9 +368,9 @@ def _record_outcome(record: pl.DataFrame | pl.LazyFrame | None, metadata: RunMet
     if rows:
         assert df is not None
         df = _episode_rows(df)
-        running = df.filter(pl.col("outcome_state") == _RECORD_RUNNING)
+        running = df.filter(pl.col("outcome_state") == RECORD_RUNNING)
         after = df.filter(pl.col("time_ns") > running["time_ns"][0]) if len(running) else df
-        terminal = after.filter(pl.col("outcome_state") != _RECORD_RUNNING)
+        terminal = after.filter(pl.col("outcome_state") != RECORD_RUNNING)
         if len(terminal):
             last = terminal.row(-1, named=True)
             return int(last["outcome_state"]), last.get("outcome_info")
@@ -603,6 +577,11 @@ class ProcessingPipeline:
         if bundles is None or len(bundles) == 0:
             return finish([_status_row(ep, metadata, _metadata_robot(metadata), "no_recording", "no MCAP or empty extraction")])
 
+        try:
+            write_tracks(episode_dir, bundles)
+        except Exception as e:
+            _log.warning(f"episode_{ep.episode_id:03d}: pedestrian tracks not kept, they are built again on use: {e!r}")
+
         _ctx = self.profiler.phase("process") if self.profiler else contextlib.nullcontext()
         with _ctx:
             robot_model = "turtlebot3_burger"
@@ -620,7 +599,7 @@ class ProcessingPipeline:
                 any_record = next((b.episode_record for b in bundles.values() if b.episode_record is not None), None)
                 return finish([_status_row(ep, metadata, _metadata_robot(metadata, bundles), "no_trajectory", "no odom rows", any_record)])
             for robot_name, bundle in robots.items():
-                window = _episode_window(bundle.episode_record)
+                window = episode_window(bundle.episode_record)
                 tf_gt, pose_source = resolve_pose_source(bundle, window)
                 bundle.tf_gt = tf_gt
 
@@ -654,7 +633,7 @@ class ProcessingPipeline:
                     all_results.append(_status_row(ep, metadata, robot_name, "no_trajectory", reason, bundle.episode_record))
                     continue
 
-                topics = _collect_native_topics(bundle)
+                topics = native_topics(bundle)
                 if len(aligned_df) > 0:
                     t0 = int(aligned_df["time_ns"][0])
                     t1 = int(aligned_df["time_ns"][-1])
@@ -902,6 +881,11 @@ class ProcessingPipeline:
                 ref_ped_row=ref_ped_row,
             )
             row.update(reconciled)
+
+        episode_dir_of = functools.partial(self.folder_manager.episode_dir, benchmark_id)
+        run_dir = self.folder_manager.episodes_dir(benchmark_id).parent
+        if flowed := add_flow_reference_metrics(all_metrics, episode_dir_of, run_dir=run_dir, evaluated=_STATUS_EVALUATED):
+            print(f"Phase 2 Post-Processing: flow change of {flowed} flowedit suite rows against their base worlds", flush=True)
 
         combined_path = self.folder_manager.combined_metrics_path(benchmark_id)
         ParquetStore.write_rows(all_metrics, combined_path, schema_overrides=_METRIC_DTYPES)
