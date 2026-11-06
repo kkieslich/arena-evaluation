@@ -241,6 +241,7 @@ def test_arena_peds_win_over_engine_agent_states(every_topic: tuple[pathlib.Path
             "peds_frame_id": "map",
             "num_pedestrians": 1,
             "peds_names": ["alice"],
+            "peds_agent_types": [],
             "peds_positions": [3.0, 4.0, 0.0],
             "peds_headings": [pytest.approx(math.pi / 2)],
             "peds_twists": [pytest.approx(0.3), pytest.approx(-0.1), 0.0],

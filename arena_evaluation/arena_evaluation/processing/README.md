@@ -52,7 +52,7 @@ Positions in the shared `map` frame (`tf_gt`, `plan`, `initialpose`, `peds`, epi
 | energy | `time_ns`, `total_energy_consumed_wh`, `battery_soc_percent` |
 | acoustics | `time_ns`, `total_level_af_dba`, `total_level_zf_db`, `baseline_level_dba`, `drivetrain_level_dba`, `uncertainty_1sigma_dba`, `validity_flags` |
 | characterization_phase | `time_ns`, `label` |
-| peds | `time_ns`, `peds_frame_id`, `num_pedestrians`, `peds_names`, `peds_ids`, `peds_positions`, `peds_headings`, `peds_twists`, `peds_animation_states`, `peds_interaction_ids`, `peds_interaction_types` (per-ped lists in `peds_ids` order) |
+| peds | `time_ns`, `peds_frame_id`, `num_pedestrians`, `peds_names`, `peds_agent_types`, `peds_ids`, `peds_positions`, `peds_headings`, `peds_twists`, `peds_animation_states`, `peds_interaction_ids`, `peds_interaction_types` (per-ped lists in `peds_ids` order); `peds_agent_types` is each pedestrian's `agent_type` from `arena_peds` (a builtin name or a yaml path, empty = adult), empty when the recorded message has no such field |
 | peds_physics | same as peds, from the crowd engine's `agent_states` in the engine frame |
 | ped_gestures | `time_ns`, `ped_id`, `slot`, `clip`, `hand`, `at_x`, `at_y`, `at_z`, `render_pose_override`, one row per playing gesture, present (possibly empty) whenever the recorded `Pedestrians` schema carries `gestures` |
 | interactions | one row per interaction per `InteractionFrame`: `time_ns`, `stamp_ns`, `interaction_id`, `interaction_type`, `outcome`, `object_id`, `participants`, `queue`, `arrived`, `holding`, `duration`; an empty frame adds no row. Kept as its own frame, not aligned onto odom |
