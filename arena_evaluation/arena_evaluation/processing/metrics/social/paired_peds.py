@@ -6,14 +6,16 @@ first frame and leaves before its last, so a table cut at the end of a warm-up c
 
 from __future__ import annotations
 
+import pathlib
 import typing
 
 import numpy as np
 import polars as pl
 
+from arena_evaluation.processing.mcap_reader import bundle_env
 from arena_evaluation.processing.metrics.social.pedestrian_disturbance import PedestrianDisturbanceCalculator
 from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group, by_group, worst_group
-from arena_evaluation.processing.ped_track_store import Pairing, pair
+from arena_evaluation.processing.ped_track_store import Pairing, empty_tracks, pair, tracks_for_episode
 
 _PER_PED = pl.List(pl.Struct({"ped": pl.String, "value": pl.Float64}))
 _BY_GROUP = pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64}))
@@ -120,24 +122,36 @@ def paired_ped_measures(ref_tracks: pl.DataFrame, run_tracks: pl.DataFrame) -> d
     }
 
 
-def add_paired_ped_measures(rows: list[dict[str, typing.Any]], ref_rows_by_stage: typing.Mapping[str | None, list[dict[str, typing.Any]]], tracks_of: typing.Callable[[dict[str, typing.Any]], pl.DataFrame]) -> None:
-    """Give every run row its paired measures against the first evaluated reference row of its stage.
+def _run(row: dict[str, typing.Any]) -> tuple[int, str] | None:
+    """The (episode id, env) whose tracks a row scores, None for a row without an episode."""
+    episode = row.get("episode")
+    return None if episode is None else (int(episode), bundle_env(str(row.get("robot") or "")))
 
-    `tracks_of(row)` reads a row's episode tracks; each stage's reference and each episode's tracks are read once.
+
+def add_paired_ped_measures(
+    rows: list[dict[str, typing.Any]],
+    ref_rows_by_stage: typing.Mapping[str | None, list[dict[str, typing.Any]]],
+    episode_dir: typing.Callable[[int], pathlib.Path],
+    *,
+    evaluated: str,
+    tracks: typing.Callable[[pathlib.Path, str], pl.DataFrame] = tracks_for_episode,
+) -> None:
+    """Give every run row its paired measures against the first `evaluated` reference row of its stage.
+
+    Each row is scored on the tracks of its own env, the reference on those of the reference row's env; each stage's
+    reference and each (episode, env) are read once.
     """
-    by_stage: dict[str | None, list[dict[str, typing.Any]]] = {}
+    by_stage: dict[str | None, dict[tuple[int, str] | None, list[dict[str, typing.Any]]]] = {}
     for row in rows:
         if not row.get("is_reference"):
-            by_stage.setdefault(row.get("stage"), []).append(row)
-    for stage, stage_rows in by_stage.items():
-        ref_row = next((r for r in ref_rows_by_stage.get(stage, []) if r.get("status") == "evaluated"), None)
-        if ref_row is None:
+            by_stage.setdefault(row.get("stage"), {}).setdefault(_run(row), []).append(row)
+    for stage, runs in by_stage.items():
+        ref_row = next((r for r in ref_rows_by_stage.get(stage, []) if r.get("status") == evaluated), None)
+        ref = None if ref_row is None else _run(ref_row)
+        if ref is None:
             continue
-        ref_tracks = tracks_of(ref_row)
-        by_episode: dict[typing.Any, list[dict[str, typing.Any]]] = {}
-        for row in stage_rows:
-            by_episode.setdefault(row.get("episode"), []).append(row)
-        for episode_rows in by_episode.values():
-            measures = paired_ped_measures(ref_tracks, tracks_of(episode_rows[0]))
-            for row in episode_rows:
+        ref_tracks = tracks(episode_dir(ref[0]), ref[1])
+        for run, run_rows in runs.items():
+            measures = paired_ped_measures(ref_tracks, empty_tracks() if run is None else tracks(episode_dir(run[0]), run[1]))
+            for row in run_rows:
                 row.update(measures)

@@ -1,3 +1,5 @@
+import pathlib
+
 import pytest
 
 pl = pytest.importorskip("polars")
@@ -75,21 +77,23 @@ def test_measures_are_none_without_both_tracks(missing: str):
     assert result == dict.fromkeys(PAIRED_DTYPES)
 
 
-def test_rows_get_the_measures_of_their_stage_reference_reading_each_episode_once():
-    tracks = {1: RUN, 9: REF}
-    reads: list[int] = []
+def test_rows_get_the_measures_of_their_stage_reference_reading_each_env_once():
+    tracks = {(pathlib.Path("episode_001"), "env_0"): RUN, (pathlib.Path("episode_001"), "env_1"): REF, (pathlib.Path("episode_009"), "env_3"): REF}
+    reads: list[tuple[pathlib.Path, str]] = []
 
-    def tracks_of(row: dict) -> pl.DataFrame:
-        reads.append(row["episode"])
-        return tracks[row["episode"]]
+    def tracks_of(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        reads.append((episode_dir, env))
+        return tracks[episode_dir, env]
 
     jackal = {"episode": 1, "stage": "s", "robot": "env_0_jackal"}
     burger = {"episode": 1, "stage": "s", "robot": "env_0_burger"}
+    other_env = {"episode": 1, "stage": "s", "robot": "env_1_jackal"}
     unreferenced = {"episode": 2, "stage": "t", "robot": "env_0_jackal"}
-    reference = {"episode": 9, "stage": "s", "is_reference": True, "status": "evaluated"}
-    rows = [jackal, burger, unreferenced, reference]
-    add_paired_ped_measures(rows, {"s": [reference]}, tracks_of)
+    reference = {"episode": 9, "stage": "s", "robot": "env_3_jackal", "is_reference": True, "status": "evaluated"}
+    rows = [jackal, burger, other_env, unreferenced, reference]
+    add_paired_ped_measures(rows, {"s": [reference]}, lambda episode: pathlib.Path(f"episode_{episode:03d}"), evaluated="evaluated", tracks=tracks_of)
 
-    assert sorted(reads) == [1, 9]
+    assert sorted(reads) == [(pathlib.Path("episode_001"), "env_0"), (pathlib.Path("episode_001"), "env_1"), (pathlib.Path("episode_009"), "env_3")]
     assert jackal["ped_paired_delay_s"] == burger["ped_paired_delay_s"] == 2.0
+    assert other_env["ped_paired_delay_s"] == 0.0
     assert "ped_paired_delay_s" not in unreferenced and "ped_paired_delay_s" not in reference

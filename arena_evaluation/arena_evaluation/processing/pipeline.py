@@ -279,7 +279,7 @@ from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES, ad
 from arena_evaluation.processing.mcap_reader import MCAPReader, bundle_env
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
 from arena_evaluation.processing.metrics.flow.flow_episode import FLOW_EPISODE_DTYPES
-from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_DTYPES
+from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_DTYPES, add_paired_ped_measures
 from arena_evaluation.processing.metrics.social.pedestrian_groups import PED_MEASURE_DTYPES, add_fleet_contacts, record_keys, rekey_records
 from arena_evaluation.processing.parquet_store import ParquetStore, TopicParquetStore
 from arena_evaluation.processing.ped_track_store import write_tracks
@@ -890,6 +890,7 @@ class ProcessingPipeline:
         run_dir = self.folder_manager.episodes_dir(benchmark_id).parent
         if flowed := add_flow_reference_metrics(all_metrics, episode_dir_of, run_dir=run_dir, evaluated=_STATUS_EVALUATED):
             print(f"Phase 2 Post-Processing: flow change of {flowed} flowedit suite rows against their base worlds", flush=True)
+        add_paired_ped_measures(all_metrics, ref_ped_by_stage, episode_dir_of, evaluated=_STATUS_EVALUATED)
 
         combined_path = self.folder_manager.combined_metrics_path(benchmark_id)
         ParquetStore.write_rows(all_metrics, combined_path, schema_overrides=_METRIC_DTYPES)
