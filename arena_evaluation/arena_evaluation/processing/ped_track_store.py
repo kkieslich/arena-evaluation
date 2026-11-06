@@ -27,6 +27,8 @@ import typing
 
 import polars as pl
 
+from arena_evaluation.processing.episode_topics import episode_window, native_topics
+
 DEFAULT_AGENT_TYPE = "adult"
 TRACKS_FILE = "ped_tracks.parquet"
 _ENV_PREFIX = re.compile(r"^/?env_\d+/")
@@ -123,13 +125,7 @@ def track_table(topics: typing.Mapping[str, pl.DataFrame | None], start_ns: int 
     recorded = pl.when(pl.col("recorded") == pl.col("agent_id").cast(pl.String)).then(pl.lit("")).otherwise(pl.col("recorded"))
     name = pl.when(pl.col("meta_name") != "").then(pl.col("meta_name")).otherwise(recorded).str.replace(_ENV_PREFIX.pattern, "")
     frames = frames.with_columns(name.alias("name"))
-    key = (
-        pl.when(pl.col("source_name") != "")
-        .then(pl.col("source_name") + "#" + pl.col("source_seq").cast(pl.String))
-        .when(pl.col("name") != "")
-        .then(pl.col("name"))
-        .otherwise(pl.lit("id") + pl.col("agent_id").cast(pl.String))
-    )
+    key = pl.when(pl.col("source_name") != "").then(pl.col("source_name") + "#" + pl.col("source_seq").cast(pl.String)).when(pl.col("name") != "").then(pl.col("name")).otherwise(pl.lit("id") + pl.col("agent_id").cast(pl.String))
     t0 = start_ns if start_ns is not None else int(frames["time_ns"].min())
     out = frames.with_columns(
         key.alias("key"),
@@ -151,16 +147,10 @@ def tracks_for_episode(episode_dir: pathlib.Path, start_ns: int | None = None, e
         return empty_tracks()
     bundle = next(iter(bundles.values()))
     if window:
-        from .pipeline import _episode_window
-
-        record_start, record_end = _episode_window(bundle.episode_record)
+        record_start, record_end = episode_window(bundle.episode_record)
         start_ns = record_start if start_ns is None else start_ns
         end_ns = record_end if end_ns is None else end_ns
-    topics: dict[str, pl.DataFrame | None] = {}
-    for name in ("peds_physics", "peds", "agent_meta"):
-        df = getattr(bundle, name, None)
-        topics[name] = df.collect() if isinstance(df, pl.LazyFrame) else df
-    return track_table(topics, start_ns, end_ns)
+    return track_table(native_topics(bundle, ("peds_physics", "peds", "agent_meta")), start_ns, end_ns)
 
 
 @dataclasses.dataclass(frozen=True)

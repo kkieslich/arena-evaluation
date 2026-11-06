@@ -3,7 +3,8 @@ import pytest
 
 pl = pytest.importorskip("polars")
 
-from arena_evaluation.processing.pipeline import _episode_endpoints, _episode_window
+from arena_evaluation.processing.episode_topics import episode_window
+from arena_evaluation.processing.pipeline import _episode_endpoints
 from arena_evaluation.processing.pose_anchor import resolve_pose_source
 from arena_evaluation.processing.topic_aligner import TopicAligner
 from arena_evaluation.storage.schemas import TopicBundle
@@ -79,21 +80,21 @@ def test_phases_without_a_goto_leave_the_goal_to_the_plan():
 def test_episode_window_spans_running_to_terminal_record():
     # A latched terminal record from the previous episode can precede this episode's RUNNING row.
     record = pl.DataFrame({"time_ns": [50, 100, 900], "outcome_state": [2, 1, 4]})
-    assert _episode_window(record.lazy()) == (100, 900)
-    assert _episode_window(None) == (None, None)
-    assert _episode_window(pl.DataFrame({"time_ns": []})) == (None, None)
+    assert episode_window(record.lazy()) == (100, 900)
+    assert episode_window(None) == (None, None)
+    assert episode_window(pl.DataFrame({"time_ns": []})) == (None, None)
 
 
 def test_episode_window_stays_open_when_the_terminal_record_was_not_captured():
     record = pl.DataFrame({"time_ns": [50, 100], "outcome_state": [3, 1]})
-    assert _episode_window(record) == (100, None)
-    assert _episode_window(pl.DataFrame({"time_ns": [100], "outcome_state": [1]})) == (100, None)
+    assert episode_window(record) == (100, None)
+    assert episode_window(pl.DataFrame({"time_ns": [100], "outcome_state": [1]})) == (100, None)
 
 
 def test_episode_window_stays_open_without_a_terminal_or_running_record():
-    assert _episode_window(pl.DataFrame({"time_ns": [50, 100], "outcome_state": [2, 1]})) == (100, None)
-    assert _episode_window(pl.DataFrame({"time_ns": [700], "outcome_state": [3]})) == (None, 700)
-    assert _episode_window(pl.DataFrame({"time_ns": [5, 9]})) == (5, 9)
+    assert episode_window(pl.DataFrame({"time_ns": [50, 100], "outcome_state": [2, 1]})) == (100, None)
+    assert episode_window(pl.DataFrame({"time_ns": [700], "outcome_state": [3]})) == (None, 700)
+    assert episode_window(pl.DataFrame({"time_ns": [5, 9]})) == (5, 9)
 
 
 def test_start_is_the_anchored_pose_not_the_odom_origin():
@@ -113,4 +114,4 @@ def test_start_is_the_anchored_pose_not_the_odom_origin():
 
 
 def test_episode_window_without_outcome_states_spans_the_whole_record():
-    assert _episode_window(pl.DataFrame({"time_ns": [300, 100, 900]})) == (100, 900)
+    assert episode_window(pl.DataFrame({"time_ns": [300, 100, 900]})) == (100, 900)
