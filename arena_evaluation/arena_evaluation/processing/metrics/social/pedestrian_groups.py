@@ -30,6 +30,7 @@ PED_MEASURES = {
     "ped_max_exposure_dba": "lower",
     "ped_leq_exposure_dba": "lower",
     "ped_max_startle_factor": "lower",
+    "ped_robot_contacts": "lower",
 }
 
 # Fixed column types, so an episode without a value writes the same schema as one with values.
@@ -89,7 +90,7 @@ class PedestrianGroupsCalculator(BaseMetricCalculator):
     NAME = "pedestrian_groups"
     CATEGORY = "social"
     REQUIRES_PEDSIM = True
-    DEPENDS_ON = ["pedestrian_disturbance", "mechanism_metrics", "acoustic_exposure"]
+    DEPENDS_ON = ["pedestrian_disturbance", "mechanism_metrics", "acoustic_exposure", "collision_metrics"]
     REQUIRED_TOPICS = ["peds"]
 
     @classmethod
