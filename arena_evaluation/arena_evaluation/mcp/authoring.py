@@ -169,7 +169,7 @@ def check_suite(data: object) -> dict[str, Any]:
         unknown = [entry for entry in split_robot_arg(stage.robot) if entry.partition("[")[0].strip() not in robots]
         if raw.get("robot") != "auto" and unknown:
             warnings.append(f"{where}: robot {', '.join(unknown)} not in the robot catalog (robots_catalog)")
-    return {"valid": not problems, "n_stages": len(suite.stages), "stages": [stage.name for stage in suite.stages], "references": suite.references, "launch": suite.launch_args, "problems": problems, "warnings": warnings}
+    return {"valid": not problems, "n_stages": len(suite.stages), "stages": [stage.name for stage in suite.stages], "references": suite.references, "reference_types": list(suite.reference_types) if suite.references else [], "launch": suite.launch_args, "problems": problems, "warnings": warnings}
 
 
 def _contest_drivers(args: dict[str, Any], cap: str) -> str | None:
