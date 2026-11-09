@@ -148,7 +148,7 @@ arena evaluation run --benchmark-dir <run_id> --report-manifest characterization
 
 ### Report manifests
 
-Report layouts are declarative YAML files in `configs/benchmark/manifests/`. Built-in manifests: `standard`, `ecological`, `social`, `safety`, `characterization`.
+Report layouts are declarative YAML files in `configs/benchmark/manifests/`. Built-in manifests: `standard`, `ecological`, `social`, `safety`, `characterization`, `groups` (on the `ped_groups.parquet` of `arena evaluation groups`).
 
 ```bash
 arena evaluation run --list-manifests
@@ -170,6 +170,7 @@ Commands:
   run       Full pipeline: extract -> process -> report + plots
   report    Generate report.html from existing metrics.parquet
   plot      Generate static PNG plots only
+  groups    Print each pedestrian measure per group (mean over seeds), write ped_groups.parquet
   acoustic  Acoustic analysis subcommands (list, animate, snapshot)
 ```
 
@@ -184,6 +185,8 @@ Commands:
 | `--list-manifests` | List available named report manifests |
 
 `process` and `run` exit 1 when a benchmark or episode directory produced no metrics.
+
+`groups --benchmark-dir DIR... | --run-dir DIR...` reads each directory's `combined_metrics.parquet` (else `metrics.parquet`), prints every pedestrian measure per group of agent types for each contestant and stage as the mean over seeds, the worst group marked `*`, and writes the per-seed rows and the means to `ped_groups.parquet` next to it (see [Per-group table](arena_evaluation/processing/metrics/README.md)); it exits 1 for a directory without metrics. `--report-manifest groups` reports that file.
 
 ---
 

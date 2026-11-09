@@ -1,0 +1,42 @@
+# Pedestrian groups: every pedestrian measure per group of agent types, from the ped_groups.parquet `arena evaluation groups` writes.
+manifest_version: "1.0"
+name: groups
+title: Pedestrian Groups Report
+description: Every pedestrian measure per group of agent types (wheelchair, long_cane, and every other type by name), per contestant and stage. A seed's value is the mean of the group's pedestrians over the seed's runs, the mean over seeds weights every seed equally. Worst is 1 for the group with the worst value (the highest, the lowest for round trips and the contact-free rate), 0 for the others and for every group when groups tie. Run `arena evaluation groups` first.
+data_source: ped_groups.parquet
+groups:
+  - {id: mean, title: Mean over Seeds}
+  - {id: per_seed, title: Per Seed}
+units:
+  value: ""
+  peds: ""
+  seeds: ""
+  runs: ""
+plots:
+  - id: ped_groups_mean
+    type: table
+    title: Each measure per group, mean over seeds
+    data_key: "*"
+    layout_group: mean
+    filter: {level: mean}
+    options:
+      group_by: [planner, stage, measure, group]
+      columns:
+        - {metric: value, label: Mean over seeds, format: "{:.3f}"}
+        - {metric: worst, label: Worst, format: "{:.0f}"}
+        - {metric: peds, label: Peds, format: "{:.0f}"}
+        - {metric: seeds, label: Seeds, format: "{:.0f}"}
+        - {metric: runs, label: Runs, format: "{:.0f}"}
+  - id: ped_groups_per_seed
+    type: table
+    title: Each measure per group and seed
+    data_key: "*"
+    layout_group: per_seed
+    filter: {level: seed}
+    options:
+      group_by: [planner, stage, seed, measure, group]
+      columns:
+        - {metric: value, label: Value, format: "{:.3f}"}
+        - {metric: worst, label: Worst, format: "{:.0f}"}
+        - {metric: peds, label: Peds, format: "{:.0f}"}
+        - {metric: runs, label: Runs, format: "{:.0f}"}

@@ -87,6 +87,9 @@ Examples:
   # Generate report from multiple already-processed benchmarks:
   evaluation report --benchmark-dir /opt/arena_ws/data/bench1 /opt/arena_ws/data/bench2 --output-dir ./merged_report
 
+  # Print each pedestrian measure per group (mean over seeds) and write ped_groups.parquet:
+  evaluation groups --benchmark-dir /opt/arena_ws/data/my_benchmark
+
   # With no input dir, operate on the most recent benchmark under $ARENA_DATA_DIR/benchmarks:
   evaluation run
 """,
@@ -176,6 +179,13 @@ Examples:
         parents=[run_parent],
         help="Layer 5: Generate static PNG plots only (no HTML report).",
     )
+    groups_parser = subparsers.add_parser(
+        "groups",
+        help="Each pedestrian measure per group of agent types: print the mean over seeds, write ped_groups.parquet next to the metrics.",
+    )
+    groups_input = groups_parser.add_mutually_exclusive_group(required=False)
+    groups_input.add_argument("--benchmark-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Benchmark directories with a combined_metrics.parquet")
+    groups_input.add_argument("--run-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Episode directories with a metrics.parquet")
 
     from arena_evaluation.cli_acoustic import setup_acoustic_subparsers
 
@@ -217,6 +227,11 @@ Examples:
         if not d.exists() or not d.is_dir():
             print(f"Error: directory does not exist: {d}")
             sys.exit(1)
+
+    if args.command == "groups":
+        from arena_evaluation.processing.ped_groups import groups_command
+
+        return groups_command(target_dirs)
 
     profiler = None
     if args.profile:
