@@ -18,6 +18,7 @@ from arena_evaluation.processing.acoustics.impedance_grid import compute_attenua
 from arena_evaluation.processing.map_registry import MapRegistry
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
 from arena_evaluation.processing.metrics.ecological.characterization import _ACOUSTIC_DEFAULTS
+from arena_evaluation.processing.metrics.ecological.mechanism_common import per_ped, ped_keys
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ class AcousticExposureCalculator(BaseMetricCalculator):
     UNITS = {
         "ped_max_exposure_dba": "dBA",
         "ped_leq_exposure_dba": "dBA",
+        "ped_max_exposure_dba_per_ped": "dBA",
+        "ped_leq_exposure_dba_per_ped": "dBA",
         "timeseries_acoustic_exposure_dba": "dBA",
         "timeseries_acoustic_attenuation_db": "dB",
     }
@@ -49,15 +52,18 @@ class AcousticExposureCalculator(BaseMetricCalculator):
             "ped_max_exposure_dba",
             "ped_leq_exposure_dba",
             "ped_max_startle_factor",
+            "ped_max_exposure_dba_per_ped",
+            "ped_leq_exposure_dba_per_ped",
+            "ped_max_startle_factor_per_ped",
             "timeseries_acoustic_exposure_dba",
             "timeseries_acoustic_attenuation_db",
             "worst_case_acoustic_frame",
         ]
 
     @staticmethod
-    def _parse_pedestrian_positions(row: object) -> list[tuple[float, float]]:
-        """Parse a single frame's pedestrian positions (flat or nested schema)."""
-        pts: list[tuple[float, float]] = []
+    def _pedestrian_entries(row: object) -> list[tuple[float, float] | None]:
+        """A single frame's pedestrian entries (flat or nested schema), None where an entry has no usable position."""
+        entries: list[tuple[float, float] | None] = []
         if isinstance(row, str):
             import json
 
@@ -66,21 +72,39 @@ class AcousticExposureCalculator(BaseMetricCalculator):
             except Exception:
                 row = []
         if not isinstance(row, (list, tuple, np.ndarray)) or len(row) == 0:
-            return pts
+            return entries
         if isinstance(row[0], dict):
             for item in row:
-                if isinstance(item, dict) and "x" in item and "y" in item:
-                    pts.append((float(item["x"]), float(item["y"])))
+                entries.append((float(item["x"]), float(item["y"])) if isinstance(item, dict) and "x" in item and "y" in item else None)
         elif isinstance(row[0], (list, tuple, np.ndarray)):
             for item in row:
-                if len(item) >= 2 and not np.isnan(item[0]) and not np.isnan(item[1]):
-                    pts.append((float(item[0]), float(item[1])))
+                entries.append((float(item[0]), float(item[1])) if len(item) >= 2 and not np.isnan(item[0]) and not np.isnan(item[1]) else None)
         else:
             for j in range(0, len(row), 3):
-                if j + 1 < len(row):
-                    if not np.isnan(row[j]) and not np.isnan(row[j + 1]):
-                        pts.append((float(row[j]), float(row[j + 1])))
-        return pts
+                entries.append((float(row[j]), float(row[j + 1])) if j + 1 < len(row) and not np.isnan(row[j]) and not np.isnan(row[j + 1]) else None)
+        return entries
+
+    @classmethod
+    def _parse_pedestrian_positions(cls, row: object) -> list[tuple[float, float]]:
+        """Parse a single frame's pedestrian positions (flat or nested schema)."""
+        return [p for p in cls._pedestrian_entries(row) if p is not None]
+
+    @staticmethod
+    def _per_ped_exposure(samples: dict[str, list[tuple[int, float]]], time_s: np.ndarray) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        """Max level, Leq and startle factor of each pedestrian's (frame, dBA) exposure samples, the startle factor between consecutive frames."""
+        max_exp: dict[str, float] = {}
+        leq_exp: dict[str, float] = {}
+        startle: dict[str, float] = {}
+        for key, rows in samples.items():
+            frames = np.array([i for i, _ in rows])
+            levels = np.array([level for _, level in rows])
+            max_exp[key] = float(np.max(levels))
+            leq_exp[key] = float(10 * np.log10(np.mean(10 ** (levels / 10.0))))
+            dt = np.diff(time_s[frames])
+            consecutive = (np.diff(frames) == 1) & (dt > 0)
+            rates = np.diff(levels)[consecutive] / dt[consecutive]
+            startle[key] = float(np.max(rates)) if len(rates) else 0.0
+        return max_exp, leq_exp, startle
 
     def _get_map_occupancy(self, map_name: str, run_dir: pathlib.Path | None = None) -> tuple[np.ndarray, float, tuple[float, float, float]] | None:
         """Load the map PNG as a binary occupancy grid, flipped so row 0 = bottom (y = origin_y)."""
@@ -170,9 +194,11 @@ class AcousticExposureCalculator(BaseMetricCalculator):
             return nulls
 
         peds_pos = df["peds_positions"].to_list()
+        names = df["peds_names"].to_list() if "peds_names" in df.columns else [None] * len(peds_pos)
 
         ts_exposure: list[list[float]] = []
         ts_attenuation: list[list[float]] = []
+        ped_exposure: dict[str, list[tuple[int, float]]] = {}
 
         last_eval_rx = None
         last_eval_ry = None
@@ -189,7 +215,9 @@ class AcousticExposureCalculator(BaseMetricCalculator):
         last_attenuations: np.ndarray | None = None
 
         for i in range(total_frames):
-            pts = self._parse_pedestrian_positions(peds_pos[i])
+            entries = self._pedestrian_entries(peds_pos[i])
+            keys = [key for key, p in zip(ped_keys(names[i], len(entries)), entries, strict=True) if p is not None]
+            pts = [p for p in entries if p is not None]
 
             if not pts:
                 ts_exposure.append([])
@@ -269,6 +297,8 @@ class AcousticExposureCalculator(BaseMetricCalculator):
 
             ts_attenuation.append(att_valid.tolist())
             ts_exposure.append(exp_valid.tolist())
+            for key, level in zip([k for k, ok in zip(keys, valid, strict=True) if ok], exp_valid.tolist(), strict=True):
+                ped_exposure.setdefault(key, []).append((i, level))
 
             scored_frames += 1
             if scored_frames % 50 == 0:
@@ -297,6 +327,9 @@ class AcousticExposureCalculator(BaseMetricCalculator):
                 "ped_max_exposure_dba": None,
                 "ped_leq_exposure_dba": None,
                 "ped_max_startle_factor": None,
+                "ped_max_exposure_dba_per_ped": None,
+                "ped_leq_exposure_dba_per_ped": None,
+                "ped_max_startle_factor_per_ped": None,
                 "timeseries_acoustic_exposure_dba": ts_exposure,
                 "timeseries_acoustic_attenuation_db": ts_attenuation,
                 "worst_case_acoustic_frame": None,
@@ -324,6 +357,7 @@ class AcousticExposureCalculator(BaseMetricCalculator):
                 startle_rates.extend(rates.tolist())
 
         max_startle = float(np.max(startle_rates)) if startle_rates else 0.0
+        ped_max, ped_leq, ped_startle = self._per_ped_exposure(ped_exposure, time_s)
 
         # Find worst-case frame (highest pedestrian exposure)
         max_idx = 0
@@ -357,6 +391,9 @@ class AcousticExposureCalculator(BaseMetricCalculator):
             "ped_max_exposure_dba": max_exp,
             "ped_leq_exposure_dba": leq_exp,
             "ped_max_startle_factor": max_startle,
+            "ped_max_exposure_dba_per_ped": per_ped(ped_max),
+            "ped_leq_exposure_dba_per_ped": per_ped(ped_leq),
+            "ped_max_startle_factor_per_ped": per_ped(ped_startle),
             "timeseries_acoustic_exposure_dba": ts_exposure,
             "timeseries_acoustic_attenuation_db": ts_attenuation,
             "worst_case_acoustic_frame": worst_frame,

@@ -749,8 +749,8 @@ class AcousticFieldRenderer(BasePlotRenderer):
             return None
         robot_dir = robot_dirs[0]
 
+        from ...processing.episode_topics import episode_window
         from ...processing.parquet_store import TopicParquetStore
-        from ...processing.pipeline import _episode_window
         from ...processing.pose_anchor import resolve_pose_source
 
         if not TopicParquetStore.is_current(topics_root):
@@ -762,7 +762,7 @@ class AcousticFieldRenderer(BasePlotRenderer):
         bundles = TopicParquetStore.read(topics_root)
         assert bundles is not None
         bundle = bundles[robot_dir.name]
-        tf_gt, _ = resolve_pose_source(bundle, _episode_window(bundle.episode_record))
+        tf_gt, _ = resolve_pose_source(bundle, episode_window(bundle.episode_record))
         if tf_gt is not None:
             frames.append(tf_gt.lazy().select(["time_ns", "pos_x_gt", "pos_y_gt"]))
         else:

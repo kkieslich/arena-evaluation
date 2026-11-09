@@ -6,6 +6,7 @@ import numpy as np
 import polars as pl
 
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
+from arena_evaluation.processing.metrics.ecological.mechanism_common import per_ped, ped_keys
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle
 
 # arena_runtime_msgs/msg/EpisodeRecord outcome_state values.
@@ -33,10 +34,12 @@ class CollisionMetricsCalculator(BaseMetricCalculator):
         "result": "",
         "success": "",
         "spl": "",
+        "ped_robot_contacts": "",
+        "ped_robot_contacts_per_ped": "",
     }
 
     PRIMARY_OUTPUTS = ["success", "collision_amount", "spl"]
-    OUTPUT_DIRECTIONS = {"success": "higher", "spl": "higher", "collision_amount": "lower"}
+    OUTPUT_DIRECTIONS = {"success": "higher", "spl": "higher", "collision_amount": "lower", "ped_robot_contacts": "lower"}
 
     TIMEOUT_THRESHOLD_S = 180.0
     MAX_COLLISIONS = 3
@@ -53,6 +56,8 @@ class CollisionMetricsCalculator(BaseMetricCalculator):
             "result",
             "success",
             "spl",
+            "ped_robot_contacts",
+            "ped_robot_contacts_per_ped",
         ]
 
     @staticmethod
@@ -93,6 +98,27 @@ class CollisionMetricsCalculator(BaseMetricCalculator):
                 hit.update(i for i in ids if i)
         return sorted(hit)
 
+    @classmethod
+    def _pedestrian_contacts(cls, episode: AlignedEpisodeBundle) -> dict[str, float] | None:
+        """Contacts by pedestrian key, each start of a pedestrian touching the footprint one, 0 for every recorded pedestrian it never touched.
+
+        None when the recording names no touched pedestrians (a schema without event kinds) or no pedestrians.
+        """
+        frame = cls._collision_frame(episode)
+        if frame is None or "collision_pedestrian_ids" not in frame.columns or episode.data is None or "peds_names" not in episode.data.columns:
+            return None
+        touched = frame["collision_pedestrian_ids"].to_list()
+        if all(ids is None for ids in touched):
+            return None
+        contacts = dict.fromkeys((key for names in episode.data["peds_names"].unique(maintain_order=True).to_list() if names is not None for key in ped_keys(names, len(names))), 0.0)
+        touching: set[str] = set()
+        for ids in touched:
+            now = set(ped_keys(ids, len(ids))) if ids is not None else set()
+            for key in now - touching:
+                contacts[key] = contacts.get(key, 0.0) + 1.0
+            touching = now
+        return contacts
+
     def calculate(self, episode: AlignedEpisodeBundle, prior_results: dict[str, typing.Any]) -> dict[str, typing.Any]:
 
         collisions = []
@@ -104,6 +130,7 @@ class CollisionMetricsCalculator(BaseMetricCalculator):
         collision_amount_static = self._column_rising_edges(episode, "collision_static")
         collision_amount_pedestrian = self._column_rising_edges(episode, "collision_pedestrian")
         collision_obstacles = self._hit_obstacles(episode)
+        contacts = self._pedestrian_contacts(episode)
 
         time_to_goal = prior_results.get("time_to_goal")
 
@@ -161,4 +188,6 @@ class CollisionMetricsCalculator(BaseMetricCalculator):
             "result": result,
             "success": success,
             "spl": float(spl),
+            "ped_robot_contacts": int(sum(contacts.values())) if contacts is not None else None,
+            "ped_robot_contacts_per_ped": per_ped(contacts) if contacts is not None else None,
         }

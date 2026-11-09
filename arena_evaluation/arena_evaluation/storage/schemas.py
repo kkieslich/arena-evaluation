@@ -178,6 +178,7 @@ class TopicBundle:
     interactions: pl.DataFrame | pl.LazyFrame | None = None
     interaction_events: pl.DataFrame | pl.LazyFrame | None = None
     animation_states: pl.DataFrame | pl.LazyFrame | None = None
+    agent_meta: pl.DataFrame | pl.LazyFrame | None = None
     episode_record: pl.DataFrame | pl.LazyFrame | None = None
     collision_events: pl.DataFrame | pl.LazyFrame | None = None
     collision_monitor_state: pl.DataFrame | pl.LazyFrame | None = None

@@ -223,3 +223,30 @@ def test_max_collisions_default_unchanged() -> None:
     assert results["collision_amount"] == 2
     assert results["result"] == "GOAL_REACHED"
     assert results["success"] is True
+
+
+def _contacts(touched: list, names: list | None = None) -> dict:
+    """Collision rows naming the pedestrians in contact, beside the aligned pedestrian names."""
+    data = {"collision_event": [len(ids or ()) for ids in touched], "collision_pedestrian_ids": pl.Series(touched, dtype=pl.List(pl.Utf8))}
+    if names is not None:
+        data["peds_names"] = pl.Series(names, dtype=pl.List(pl.Utf8))
+    episode = AlignedEpisodeBundle(episode_id=1, data=pl.DataFrame(data), start_pos=[], goal_pos=[])
+    return CollisionMetricsCalculator(RobotParams(0.2, 0.0, 10.0)).calculate(episode, {"time_to_goal": 10.0})
+
+
+def test_pedestrian_contacts_count_each_touch_per_pedestrian():
+    touched = [[], ["env_0/a"], ["env_0/a", "env_0/b"], ["env_0/b"], [], ["env_0/a"]]
+    names = [["env_0/a", "env_0/b", "env_0/c"]] * 6
+    results = _contacts(touched, names)
+    assert results["ped_robot_contacts_per_ped"] == [{"ped": "a", "value": 2.0}, {"ped": "b", "value": 1.0}, {"ped": "c", "value": 0.0}]
+    assert results["ped_robot_contacts"] == 3
+
+
+def test_pedestrian_contacts_count_a_touched_pedestrian_missing_from_the_names():
+    results = _contacts([["env_0/gone"]], [["env_0/a"]])
+    assert results["ped_robot_contacts_per_ped"] == [{"ped": "a", "value": 0.0}, {"ped": "gone", "value": 1.0}]
+
+
+def test_pedestrian_contacts_are_none_without_contact_names_or_pedestrian_names():
+    assert _contacts([None, None], [["a"], ["a"]])["ped_robot_contacts_per_ped"] is None
+    assert _contacts([["a"]])["ped_robot_contacts"] is None

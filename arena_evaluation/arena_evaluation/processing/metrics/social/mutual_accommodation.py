@@ -164,6 +164,8 @@ class MutualAccommodationCalculator(BaseMetricCalculator):
 
                     deflect = PedestrianDisturbanceCalculator._compute_trajectory_deflection(actual_pts, ref_pts)
                     results["ped_path_deflection_m"] = round(float(deflect), 3)
+                    # The per-pedestrian and per-group values describe the standalone deflection replaced here.
+                    results.update(dict.fromkeys(("ped_path_deflection_m_per_ped", "ped_path_deflection_m_by_group", "ped_path_deflection_m_worst_group")))
             except Exception:
                 pass
 

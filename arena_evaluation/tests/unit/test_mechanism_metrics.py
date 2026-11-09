@@ -591,6 +591,17 @@ def test_ped_mechanism_delay_seconds():
     assert _calc(world).calculate(_episode(walking, closed), {})["ped_mechanism_delay_seconds"] == 0.0
 
 
+def test_ped_mechanism_delay_per_pedestrian():
+    world = MechanismWorld(doors=[_door()])
+    closed = _snap([(0, DOOR, "door", "state", "discrete", "closed")])
+    waiting = (PED, 1.0, 1.0, 0.0, 0.0)
+    walking = ("env_0/Pedestrian_2", 2.0, 1.0, 1.0, 0.0)
+    data = _data([(10, 10)] * 4, **_peds([[waiting, walking]] * 4))
+    results = _calc(world).calculate(_episode(data, closed), {})
+    assert results["ped_mechanism_delay_seconds_per_ped"] == [{"ped": "Pedestrian_1", "value": pytest.approx(3.0)}, {"ped": "Pedestrian_2", "value": 0.0}]
+    assert results["ped_mechanism_delay_seconds"] == pytest.approx(3.0)
+
+
 def test_ped_mechanism_delay_at_closed_elevator():
     world = MechanismWorld(elevators=[_elevator()])
     snap = _snap([(0, ELEV, "elevator", "cabin_door", "discrete", "closed"), (2, ELEV, "elevator", "cabin_door", "discrete", "open")])

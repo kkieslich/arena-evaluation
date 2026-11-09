@@ -17,6 +17,7 @@ from arena_evaluation.processing.metrics.ecological.mechanism_common import (
     in_polygon,
     load_mechanism_world,
     parse_members,
+    per_ped,
     ped_tracks,
     robot_identity,
     robot_track,
@@ -437,8 +438,8 @@ def _door_yield_violations(ctx: _Ctx) -> int | None:
     return violations
 
 
-def _ped_mechanism_delay_seconds(ctx: _Ctx) -> float | None:
-    """Pedestrian-seconds spent waiting (slower than `PED_WAIT_SPEED`) at a closed mechanism."""
+def _ped_mechanism_delay_seconds(ctx: _Ctx) -> dict[str, float] | None:
+    """Seconds each pedestrian spent waiting (slower than `PED_WAIT_SPEED`) at a closed mechanism, by pedestrian key."""
     if ctx.world is None or ctx.peds is None:
         return None
     doors: list[tuple[DoorGeom, list[str]]] = []
@@ -456,7 +457,7 @@ def _ped_mechanism_delay_seconds(ctx: _Ctx) -> float | None:
     if not doors and not elevators:
         return None
 
-    total = 0.0
+    delays: dict[str, float] = {}
     for i in range(min(len(ctx.track), len(ctx.peds.xy))):
         xy = ctx.peds.xy[i]
         if len(xy) == 0 or ctx.track.dt[i] <= 0.0:
@@ -471,8 +472,9 @@ def _ped_mechanism_delay_seconds(ctx: _Ctx) -> float | None:
         for geom, state in elevators:
             if state[i] != "open":
                 delayed |= in_call_area(xy[:, 0], xy[:, 1], geom)
-        total += float(np.count_nonzero(delayed & waiting)) * float(ctx.track.dt[i])
-    return total
+        for key, waited in zip(ctx.peds.keys[i], delayed & waiting, strict=True):
+            delays[key] = delays.get(key, 0.0) + (float(ctx.track.dt[i]) if waited else 0.0)
+    return delays
 
 
 def _alarm_egress_blocking_s(ctx: _Ctx) -> float | None:
@@ -513,9 +515,10 @@ class MechanismMetricsCalculator(BaseMetricCalculator):
         "alarm_egress_blocking_s": "s",
         "door_freeze_s": "s",
         "door_oscillations": "",
+        "ped_mechanism_delay_seconds_per_ped": "s",
     }
 
-    OUTPUT_DIRECTIONS = dict.fromkeys(UNITS, "lower")
+    OUTPUT_DIRECTIONS = {key: "lower" for key in UNITS if not key.endswith("_per_ped")}
 
     world: str | None = None
 
@@ -560,7 +563,10 @@ class MechanismMetricsCalculator(BaseMetricCalculator):
             results["door_yield_violations"] = _door_yield_violations(ctx)
 
         if view.has_kind("door") or view.has_kind("elevator"):
-            results["ped_mechanism_delay_seconds"] = _ped_mechanism_delay_seconds(ctx)
+            delays = _ped_mechanism_delay_seconds(ctx)
+            if delays is not None:
+                results["ped_mechanism_delay_seconds"] = float(sum(delays.values()))
+                results["ped_mechanism_delay_seconds_per_ped"] = per_ped(delays)
 
         if view.has_kind("elevator"):
             masks = _cabin_masks(ctx)
