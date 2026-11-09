@@ -48,12 +48,33 @@ def test_process_benchmark_pairs_each_run_with_its_robot_free_reference(tmp_path
     (reference / "episode_001.yaml").write_text(yaml.safe_dump({**meta, "episode_id": 1, "is_reference": True, "reference_type": "unhindered_peds"}))
     tracks = {("episode_000", "env_0"): _walker(7.0), ("episode_001", "env_0"): _walker(4.0)}
     monkeypatch.setattr(pipeline, "add_paired_ped_measures", functools.partial(paired_peds.add_paired_ped_measures, tracks=lambda episode_dir, env: tracks[episode_dir.name, env]))
-    # workers in threads: forking a second pool in one pytest process can deadlock on the polars threads of the first
-    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", concurrent.futures.ThreadPoolExecutor)
-    monkeypatch.setattr(pipeline, "_worker_init", lambda: None)
 
     written = ProcessingPipeline(FolderManager(data_root=tmp_path), workers=1).process_benchmark("sample_benchmark")
 
     run = pl.read_parquet(written).filter(~pl.col("is_reference")).row(0, named=True)
     assert run["ped_paired_delay_s_per_ped"] == [{"ped": "door#1", "value": 3.0}]
     assert run["ped_paired_relative_delay_by_group"] == [{"group": "elder", "value": 0.75, "peds": 1}]
+
+
+def test_process_benchmark_spawns_its_workers_after_the_parent_ran_polars(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+    """A forked worker copies the parent's polars thread pool with its locks held by threads it does not have, and hangs."""
+    shutil.copytree(FIXTURE, tmp_path / "sample_benchmark")
+    pl.DataFrame({"a": list(range(10_000))}).group_by(pl.col("a") % 7).len()
+    contexts = []
+    pool = concurrent.futures.ProcessPoolExecutor
+
+    def recording(*args, **kwargs):
+        contexts.append(kwargs.get("mp_context"))
+        return pool(*args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", recording)
+
+    written = ProcessingPipeline(FolderManager(data_root=tmp_path), workers=2).process_benchmark("sample_benchmark")
+
+    assert pl.read_parquet(written).height == 1
+    assert [c.get_start_method() for c in contexts] == ["spawn", "spawn"]
+
+
+def test_spawned_workers_run_polars_on_one_thread():
+    with concurrent.futures.ProcessPoolExecutor(1, initializer=pipeline._worker_init, mp_context=pipeline._spawn()) as pool:
+        assert pool.submit(pl.thread_pool_size).result(timeout=120) == 1
