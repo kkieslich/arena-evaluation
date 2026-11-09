@@ -31,6 +31,12 @@ PED_MEASURES = {
     "ped_robot_contacts": "lower",
 }
 
+# The fleet measures `add_fleet_contacts` breaks down by group, with the direction that is better.
+FLEET_MEASURES = {
+    "ped_fleet_contacts": "lower",
+    "ped_contact_free_rate": "higher",
+}
+
 _PER_PED = pl.List(pl.Struct({"ped": pl.String, "value": pl.Float64}))
 _BY_GROUP = pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64}))
 
@@ -136,10 +142,10 @@ def fleet_contacts(rows: list[dict[str, typing.Any]]) -> dict[str, typing.Any]:
         "ped_fleet_contacts": int(sum(totals.values())),
         "ped_fleet_contacts_per_ped": contacts,
         "ped_fleet_contacts_by_group": fleet_groups,
-        "ped_fleet_contacts_worst_group": worst_group(fleet_groups, "lower"),
+        "ped_fleet_contacts_worst_group": worst_group(fleet_groups, FLEET_MEASURES["ped_fleet_contacts"]),
         "ped_contact_free_rate": float(np.mean([record["value"] for record in untouched])) if untouched else None,
         "ped_contact_free_rate_by_group": free_groups,
-        "ped_contact_free_rate_worst_group": worst_group(free_groups, "higher"),
+        "ped_contact_free_rate_worst_group": worst_group(free_groups, FLEET_MEASURES["ped_contact_free_rate"]),
     }
 
 

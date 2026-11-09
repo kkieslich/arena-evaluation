@@ -20,6 +20,14 @@ from arena_evaluation.processing.ped_track_store import Pairing, empty_tracks, p
 _PER_PED = pl.List(pl.Struct({"ped": pl.String, "value": pl.Float64}))
 _BY_GROUP = pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64}))
 
+# The paired measures with a worst group, with the direction that is better. `ped_paired_dropped` counts pedestrians
+# per group and names none.
+PAIRED_MEASURES = {
+    "ped_paired_deflection_m": "lower",
+    "ped_paired_delay_s": "lower",
+    "ped_paired_relative_delay": "lower",
+}
+
 PAIRED_DTYPES = {
     "ped_paired_deflection_m": pl.Float64,
     "ped_paired_deflection_m_per_ped": _PER_PED,
@@ -109,14 +117,14 @@ def paired_ped_measures(ref_tracks: pl.DataFrame, run_tracks: pl.DataFrame) -> d
         "ped_paired_deflection_m": round(float(np.mean([r["value"] for r in deflection])), 3) if deflection else None,
         "ped_paired_deflection_m_per_ped": deflection,
         "ped_paired_deflection_m_by_group": deflection_groups,
-        "ped_paired_deflection_m_worst_group": worst_group(deflection_groups, "lower"),
+        "ped_paired_deflection_m_worst_group": worst_group(deflection_groups, PAIRED_MEASURES["ped_paired_deflection_m"]),
         "ped_paired_delay_s": float(done["delay_s"].mean()) if len(done) else None,
         "ped_paired_delay_s_per_ped": delay,
         "ped_paired_delay_s_by_group": delay_groups,
-        "ped_paired_delay_s_worst_group": worst_group(delay_groups, "lower"),
+        "ped_paired_delay_s_worst_group": worst_group(delay_groups, PAIRED_MEASURES["ped_paired_delay_s"]),
         "ped_paired_relative_delay": float(done["delay_s"].sum()) / ref_total if ref_total > 0 else None,
         "ped_paired_relative_delay_by_group": relative,
-        "ped_paired_relative_delay_worst_group": worst_group(relative, "lower"),
+        "ped_paired_relative_delay_worst_group": worst_group(relative, PAIRED_MEASURES["ped_paired_relative_delay"]),
         "ped_paired_dropped": len(pairing.keys) - len(finished),
         "ped_paired_dropped_by_group": [{"group": group, "value": float(sum(flags)), "peds": len(flags)} for group, flags in sorted(dropped.items())] or None,
     }
