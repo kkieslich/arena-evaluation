@@ -7,6 +7,7 @@ import math
 import pathlib
 import re
 import shutil
+import struct
 import typing
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
@@ -293,6 +294,182 @@ class _DecodedRecord(typing.Protocol):
     tm_modules: list[str]
 
 
+_TF_TOPICS = ("/tf", "tf")
+_TF_STATIC_TOPICS = ("/tf_static", "tf_static")
+_TF_SCHEMA = "tf2_msgs/msg/TFMessage"
+_ENV_MAP_BYTES = re.compile(rb"^env_\d+/map$")
+_U32 = struct.Struct("<I")
+_STAMP = struct.Struct("<iI")
+_TRANSFORM = struct.Struct("<7d")
+
+
+class _Stamp(typing.NamedTuple):
+    sec: int
+    nanosec: int
+
+
+class _Header(typing.NamedTuple):
+    stamp: _Stamp
+    frame_id: str
+
+
+class _Vector3(typing.NamedTuple):
+    x: float
+    y: float
+    z: float
+
+
+class _Quaternion(typing.NamedTuple):
+    x: float
+    y: float
+    z: float
+    w: float
+
+
+class _Transform(typing.NamedTuple):
+    translation: _Vector3
+    rotation: _Quaternion
+
+
+class _TransformStamped(typing.NamedTuple):
+    header: _Header
+    child_frame_id: str
+    transform: _Transform
+
+
+class _TFMessage(typing.NamedTuple):
+    transforms: list[_TransformStamped]
+
+
+def tf_transforms(data: bytes | memoryview, keep: typing.Callable[[bytes, bytes], bool] | None = None) -> list[_TransformStamped] | None:
+    """The transforms of a serialized tf2_msgs/TFMessage that `keep(frame_id, child_frame_id)` accepts (all without `keep`),
+    shaped as mcap_ros2 decodes them; None unless the payload is little-endian plain CDR, the encoding ROS 2 records.
+
+    It walks the CDR layout directly: a /tf message carries every pedestrian's skeleton, and the generic decoder spends
+    most of an episode's extraction building those transforms.
+    """
+    if len(data) < 8 or data[0] != 0 or data[1] != 1:
+        return None
+    o = 4
+    (n,) = _U32.unpack_from(data, o)
+    o += 4
+    out: list[_TransformStamped] = []
+    for _ in range(n):
+        o = 4 + ((o - 1) & ~3)  # align 4 counted from the payload start: 4 + ceil4(o - 4)
+        sec, nanosec = _STAMP.unpack_from(data, o)
+        (k,) = _U32.unpack_from(data, o + 8)
+        o += 12
+        frame = bytes(data[o : o + k - 1])
+        o = 4 + ((o + k - 1) & ~3)
+        (k,) = _U32.unpack_from(data, o)
+        o += 4
+        child = bytes(data[o : o + k - 1])
+        o = 4 + ((o + k + 3) & ~7)  # align 8: 4 + ceil8(o + k - 4)
+        if keep is None or keep(frame, child):
+            v = _TRANSFORM.unpack_from(data, o)
+            out.append(_TransformStamped(_Header(_Stamp(sec, nanosec), frame.decode()), child.decode(), _Transform(_Vector3(v[0], v[1], v[2]), _Quaternion(v[3], v[4], v[5], v[6]))))
+        o += 56
+    return out
+
+
+def _robot_or_anchor(frame: bytes, child: bytes) -> bool:
+    """A transform read() takes a robot pose (tf_gt) or an env anchor (env_N/map) from."""
+    del frame
+    c = child.lower()
+    return b"base_link" in c or b"base_footprint" in c or _ENV_MAP_BYTES.match(c.strip(b"/")) is not None
+
+
+def _tf_decoder(generic: typing.Callable[[bytes], typing.Any], keep: typing.Callable[[bytes, bytes], bool] | None) -> typing.Callable[[bytes], typing.Any]:
+    def decode(data: bytes) -> typing.Any:  # noqa: ANN401 - a decoded TFMessage
+        transforms = tf_transforms(data, keep)
+        return generic(data) if transforms is None else _TFMessage(transforms)
+
+    return decode
+
+
+_ENV_MAP = re.compile(r"^env_\d+/map$")
+
+
+def _append_transform(target: dict[str, list], ts_ns: int, t: typing.Any) -> None:  # noqa: ANN401 - a decoded TransformStamped
+    target["time_ns"].append(ts_ns)
+    target["frame_id"].append(t.header.frame_id)
+    target["child_frame_id"].append(t.child_frame_id)
+    target["trans_x"].append(t.transform.translation.x)
+    target["trans_y"].append(t.transform.translation.y)
+    target["trans_z"].append(t.transform.translation.z)
+    target["rot_x"].append(t.transform.rotation.x)
+    target["rot_y"].append(t.transform.rotation.y)
+    target["rot_z"].append(t.transform.rotation.z)
+    target["rot_w"].append(t.transform.rotation.w)
+
+
+def channel_tables(topic: str, schema_name: str = "") -> frozenset[str]:
+    """The TopicBundle tables MCAPReader.read() fills from a channel's messages, as its topic dispatch picks them; empty when it reads none."""
+    parts = [p for p in topic.strip("/").split("/") if p]
+    controller = len(parts) >= 2 and parts[-2].endswith("_controller")
+    suffixes = (
+        ("/odom", "odom_controller" if controller else "odom"),
+        ("/scan", "scan"),
+        ("/lidar", "scan"),
+        ("/cmd_vel", "cmd_vel_controller" if controller else "cmd_vel"),
+        ("/joint_states", "joint_states"),
+    )
+    for suffix, table in suffixes:
+        if topic.endswith(suffix):
+            return frozenset({table})
+    if topic.endswith("/agent_states"):
+        return frozenset({"peds_physics", "ped_gestures"})
+    if topic.endswith("/arena_peds") or topic.endswith("/peds"):
+        return frozenset({"peds", "ped_gestures"})
+    if topic.endswith("/agent_meta") and schema_name == "arena_humansim_msgs/msg/AgentMeta":
+        return frozenset({"agent_meta"})
+    if topic.endswith("/interactions") and schema_name == "arena_humansim_msgs/msg/InteractionFrame":
+        return frozenset({"interactions", "interaction_events"})
+    if topic.endswith("/animation_states") and schema_name == "arena_people_msgs/msg/AnimationStates":
+        return frozenset({"animation_states"})
+    suffixes = (
+        ("/acoustics", "acoustics"),
+        ("/characterization_phase", "characterization_phase"),
+        ("/characterization_schedule", "characterization_schedule"),
+        ("/state/episode", "episode_record"),
+        ("/state/semantics", "semantic_snapshot"),
+        ("/collision_events", "collision_events"),
+        ("/collision_monitor_state", "collision_monitor_state"),
+        ("/power_publisher/power", "power"),
+        ("/power_publisher/energy", "energy"),
+        ("/plan", "plan"),
+        ("/global_plan", "plan"),
+        ("/task_pose", "task_pose"),
+        ("/initialpose", "initialpose"),
+    )
+    for suffix, table in suffixes:
+        if topic.endswith(suffix):
+            return frozenset({table})
+    if topic in _TF_TOPICS:
+        return frozenset({"tf", "tf_gt"})
+    if topic in _TF_STATIC_TOPICS:
+        return frozenset({"tf_static"})
+    return frozenset()
+
+
+def recorded_tables(path: pathlib.Path) -> frozenset[str] | None:
+    """The tables an MCAP's channels can fill (channel_tables), from its summary; None when it has no readable summary (a cut recording)."""
+    from mcap.reader import make_reader
+
+    try:
+        with open(path, "rb") as f:
+            summary = make_reader(f).get_summary()
+    except Exception:
+        return None
+    if summary is None:
+        return None
+    found: set[str] = set()
+    for channel in summary.channels.values():
+        schema = summary.schemas.get(channel.schema_id)
+        found |= channel_tables(channel.topic, schema.name if schema is not None else "")
+    return frozenset(found)
+
+
 class MCAPReader:
     """Reads an MCAP file and produces a TopicBundle of raw DataFrames."""
 
@@ -344,8 +521,16 @@ class MCAPReader:
             return list(val.string_array_value)
         return str(val)
 
-    def read(self, out_dir: pathlib.Path, map_name_fallback: str | None = None) -> dict[str, TopicBundle]:
-        """Stream the MCAP into per-topic parquet under out_dir and return lazy TopicBundles over it."""
+    def read(self, out_dir: pathlib.Path, map_name_fallback: str | None = None, tables: Iterable[str] | None = None) -> dict[str, TopicBundle]:
+        """Stream the MCAP into per-topic parquet under out_dir and return lazy TopicBundles over it.
+
+        `tables` (TopicBundle field names) limits the extraction to them: a message is decoded only when its channel fills
+        one of them (channel_tables). Without "tf", only the robot poses (tf_gt) and the env anchors of /tf are read, and
+        tf.parquet keeps only the anchor rows. None extracts everything.
+        """
+        wanted = None if tables is None else frozenset(tables)
+        keep_tf = wanted is None or "tf" in wanted
+        skipped: dict[int, bool] = {}
         if self.data_path.is_dir():
             mcap_files = sorted(list(self.data_path.glob("*.mcap")))
             if not mcap_files:
@@ -466,12 +651,20 @@ class MCAPReader:
                     for schema, channel, message in reader.iter_messages(log_time_order=False):
                         if schema is None:
                             continue
+                        if wanted is not None:
+                            skip = skipped.get(message.channel_id)
+                            if skip is None:
+                                skip = skipped[message.channel_id] = not (channel_tables(channel.topic, schema.name) & wanted)
+                            if skip:
+                                continue
                         try:
                             decoder = decoders.get(message.channel_id)
                             if decoder is None:
                                 for factory in reader._decoder_factories:
                                     decoder = factory.decoder_for(channel.message_encoding, schema)
                                     if decoder is not None:
+                                        if schema.name == _TF_SCHEMA and channel.message_encoding == "cdr":
+                                            decoder = _tf_decoder(decoder, None if keep_tf or channel.topic in _TF_STATIC_TOPICS else _robot_or_anchor)
                                         decoders[message.channel_id] = decoder
                                         break
                             if decoder is None:
@@ -911,18 +1104,11 @@ class MCAPReader:
                         # TF processing
                         elif topic in ("/tf", "tf", "/tf_static", "tf_static"):
                             target_dict = global_data["tf_static"] if "static" in topic else global_data["tf"]
+                            whole = keep_tf or "static" in topic
                             for t in ros_msg.transforms:
-                                target_dict["time_ns"].append(ts_ns)
-                                target_dict["frame_id"].append(t.header.frame_id)
-                                target_dict["child_frame_id"].append(t.child_frame_id)
-                                target_dict["trans_x"].append(t.transform.translation.x)
-                                target_dict["trans_y"].append(t.transform.translation.y)
-                                target_dict["trans_z"].append(t.transform.translation.z)
-                                target_dict["rot_x"].append(t.transform.rotation.x)
-                                target_dict["rot_y"].append(t.transform.rotation.y)
-                                target_dict["rot_z"].append(t.transform.rotation.z)
-                                target_dict["rot_w"].append(t.transform.rotation.w)
-                                appended = True
+                                if whole or _ENV_MAP.match(t.child_frame_id.strip("/").lower()):
+                                    _append_transform(target_dict, ts_ns, t)
+                                    appended = True
 
                                 # Detect ground-truth map/world/odom -> base_link transform if available
                                 parent = t.header.frame_id.strip('/')

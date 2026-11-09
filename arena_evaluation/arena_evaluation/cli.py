@@ -95,7 +95,7 @@ Examples:
 """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    parser.set_defaults(run_dir=None, list_manifests=False)
+    parser.set_defaults(run_dir=None, list_manifests=False, measures=None)
 
     run_parent = argparse.ArgumentParser(add_help=False)
     run_group = run_parent.add_mutually_exclusive_group(required=False)
@@ -146,6 +146,13 @@ Examples:
         "--list-manifests",
         action="store_true",
         help="List the available named report manifests and exit.",
+    )
+    run_parent.add_argument(
+        "--measures",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help="Compute only these measures: calculator names, categories or tags (`flow` for the flow measures), with the calculators they depend on. Extraction then decodes only the topics they and the pipeline read, and the cross-run flow and paired pedestrian measures still run. Default: every calculator. Used by extract/run/process.",
     )
     run_parent.set_defaults(force_extract=False)
 
@@ -242,6 +249,13 @@ Examples:
 
     failed: list[pathlib.Path] = []
     if args.command in ("extract", "run", "process"):
+        if args.measures is not None:
+            from arena_evaluation.processing.metrics.registry import select_calculators
+
+            try:
+                print(f"Measures {' '.join(args.measures)}: calculators {', '.join(sorted(select_calculators(args.measures)))}")
+            except ValueError as e:
+                parser.error(str(e))
         force_extract = args.force_extract
         if args.command == "run":
             force_extract = True
@@ -249,7 +263,7 @@ Examples:
         if args.run_dir:
             for run_dir in args.run_dir:
                 fm = FolderManager(data_root=run_dir.parent)
-                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers)
+                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers, measures=args.measures)
 
                 if args.command == "extract":
                     print(f"Extracting single run: {run_dir}")
@@ -266,7 +280,7 @@ Examples:
         else:
             for benchmark_dir in target_dirs:
                 fm = FolderManager(data_root=benchmark_dir.parent)
-                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers)
+                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers, measures=args.measures)
 
                 if args.command == "extract":
                     print(f"Extracting benchmark: {benchmark_dir.name}")

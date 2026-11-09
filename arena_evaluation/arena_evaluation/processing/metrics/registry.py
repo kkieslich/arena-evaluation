@@ -15,13 +15,17 @@ from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 class MetricRegistry:
     """Discovers, validates, and executes metric calculators in topological order."""
 
-    def __init__(self, robot_params: RobotParams, world: str | None = None, metrics_config: dict[str, typing.Any] | None = None):
+    def __init__(self, robot_params: RobotParams, world: str | None = None, metrics_config: dict[str, typing.Any] | None = None, measures: typing.Iterable[str] | None = None):
+        """`measures` keeps only the calculators they name (select_calculators), with the ones those depend on; None keeps every one."""
         self.robot_params = robot_params
         self.world = world
         self.metrics_config = dict(metrics_config or {})
         self.calculators: dict[str, BaseMetricCalculator] = {}
         self.discover_calculators_cls()
         self._register_calculators()
+        if measures is not None:
+            keep = select_calculators(measures)
+            self.calculators = {name: calc for name, calc in self.calculators.items() if name in keep}
         self.execution_stages = self._compute_execution_order()
 
     @classmethod
@@ -193,3 +197,38 @@ class MetricRegistry:
                         results[key] = None
 
         return results
+
+
+def _calculator_classes() -> dict[str, type[BaseMetricCalculator]]:
+    MetricRegistry.discover_calculators_cls()
+    return {c.NAME: c for c in BaseMetricCalculator.__subclasses__() if not inspect.isabstract(c) and c.NAME}
+
+
+def select_calculators(measures: typing.Iterable[str]) -> frozenset[str]:
+    """The calculator names that `measures` select, each a calculator's NAME, CATEGORY or one of its TAGS, closed over DEPENDS_ON; ValueError for a name that selects none."""
+    classes = _calculator_classes()
+    chosen: set[str] = set()
+    for measure in measures:
+        found = {name for name, c in classes.items() if measure == name or measure == c.CATEGORY or measure in c.TAGS}
+        if not found:
+            known = sorted({*classes, *(c.CATEGORY for c in classes.values()), *(t for c in classes.values() for t in c.TAGS)})
+            raise ValueError(f"measure {measure!r} selects no calculator; names, categories and tags: {', '.join(known)}")
+        chosen |= found
+    todo = list(chosen)
+    while todo:
+        for dep in classes[todo.pop()].DEPENDS_ON:
+            if dep not in chosen:
+                chosen.add(dep)
+                todo.append(dep)
+    return frozenset(chosen)
+
+
+def calculator_tables(names: typing.Iterable[str]) -> list[str | tuple[str, ...]]:
+    """The tables the calculators `names` read: each REQUIRED_TOPICS entry (a tuple for alternatives) and each OPTIONAL_TOPICS table."""
+    classes = _calculator_classes()
+    out: list[str | tuple[str, ...]] = []
+    for name in sorted(names):
+        c = classes[name]
+        out.extend(req if isinstance(req, str) else tuple(req) for req in c.REQUIRED_TOPICS)
+        out.extend(c.OPTIONAL_TOPICS)
+    return out
