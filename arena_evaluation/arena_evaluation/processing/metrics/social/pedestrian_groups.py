@@ -97,6 +97,22 @@ def worst_group(groups: list[dict[str, typing.Any]] | None, direction: str) -> s
     return named[0] if len(named) == 1 else None
 
 
+def record_keys(peds: pl.DataFrame | None, tracks: pl.DataFrame | None) -> dict[str, str]:
+    """Track key (`ped_track_store`) by per-pedestrian record key, through the agent ids `peds` records beside the names."""
+    if peds is None or tracks is None or len(tracks) == 0 or not {"peds_names", "peds_ids"} <= set(peds.columns):
+        return {}
+    by_id = dict(tracks.select("agent_id", "key").unique().iter_rows())
+    named = peds.select("peds_names", "peds_ids").filter(pl.col("peds_names").list.len() == pl.col("peds_ids").list.len()).explode("peds_names", "peds_ids").drop_nulls().unique()
+    return {strip_env(ped_keys([name], 1)[0]): by_id[agent_id] for name, agent_id in named.iter_rows() if agent_id in by_id}
+
+
+def rekey_records(row: dict[str, typing.Any], keys: dict[str, str]) -> None:
+    """Move a row's per-pedestrian records and agent types onto their track keys, a record without one keeps its key."""
+    for name in [n for n in row if n.endswith("_per_ped") or n == "ped_agent_types"]:
+        if row[name]:
+            row[name] = [{**record, "ped": keys.get(record["ped"], record["ped"])} for record in row[name]]
+
+
 def fleet_contacts(rows: list[dict[str, typing.Any]]) -> dict[str, typing.Any]:
     """Robot contacts of one env's robot rows summed per pedestrian, per group, and the share of pedestrians no robot touched.
 

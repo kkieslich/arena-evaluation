@@ -4,7 +4,7 @@ import pytest
 from arena_evaluation.processing.metrics.base import BaseMetricCalculator
 from arena_evaluation.processing.metrics.ecological.mechanism_common import per_ped
 from arena_evaluation.processing.metrics.registry import MetricRegistry
-from arena_evaluation.processing.metrics.social.pedestrian_groups import FLEET_DTYPES, PED_MEASURES, PedestrianGroupsCalculator, add_fleet_contacts, agent_group, by_group, ped_agent_types, worst_group
+from arena_evaluation.processing.metrics.social.pedestrian_groups import FLEET_DTYPES, PED_MEASURES, PedestrianGroupsCalculator, add_fleet_contacts, agent_group, by_group, ped_agent_types, record_keys, rekey_records, worst_group
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
 
@@ -181,3 +181,41 @@ def test_fleet_without_pedestrians_has_no_contact_free_rate():
     rows = [_robot("env_0_jackal")]
     add_fleet_contacts(rows)
     assert (rows[0]["ped_fleet_contacts"], rows[0]["ped_contact_free_rate"], rows[0]["ped_contact_free_rate_by_group"]) == (0, None, None)
+
+
+def _peds(names: list[list[str]], ids: list[list[int]]) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "time_ns": [10 * i for i in range(len(ids))],
+            "peds_ids": ids,
+            "peds_positions": [[0.0] * (3 * len(row)) for row in ids],
+            "peds_names": names,
+        },
+        schema={"time_ns": pl.Int64, "peds_ids": pl.List(pl.Int64), "peds_positions": pl.List(pl.Float64), "peds_names": pl.List(pl.String)},
+    )
+
+
+def test_record_keys_follow_the_agent_id_to_its_track_key():
+    peds = _peds([["/env_0/17", "env_0/Pedestrian_1", "env_0/stranger"]], [[17, 1, 5]])
+    tracks = pl.DataFrame({"agent_id": [17, 17, 1], "key": ["north#3", "north#3", "Pedestrian_1"]})
+    assert record_keys(peds, tracks) == {"17": "north#3", "Pedestrian_1": "Pedestrian_1"}
+
+
+def test_records_without_tracks_keep_their_keys():
+    assert record_keys(_peds([["env_0/17"]], [[17]]), None) == {}
+
+
+def test_rekey_moves_records_and_types_onto_track_keys():
+    row = {
+        "ped_robot_contacts_per_ped": _records(**{"17": 1.0, "unknown": 2.0}),
+        "ped_agent_types": [{"ped": "17", "agent_type": "elder"}],
+        "ped_mechanism_delay_seconds_per_ped": None,
+        "ped_robot_contacts": 3,
+    }
+    rekey_records(row, {"17": "north#3"})
+    assert row == {
+        "ped_robot_contacts_per_ped": _records(**{"north#3": 1.0, "unknown": 2.0}),
+        "ped_agent_types": [{"ped": "north#3", "agent_type": "elder"}],
+        "ped_mechanism_delay_seconds_per_ped": None,
+        "ped_robot_contacts": 3,
+    }
