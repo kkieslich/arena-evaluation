@@ -18,6 +18,8 @@ class SeabornRenderer:
             AcousticFieldRenderer,
             BarRenderer,
             BoxRenderer,
+            FlowJsdRenderer,
+            FlowMapRenderer,
             HeatmapRenderer,
             HistogramRenderer,
             LineRenderer,
@@ -39,6 +41,8 @@ class SeabornRenderer:
             "line": LineRenderer,
             "acoustic_field": AcousticFieldRenderer,
             "acoustic_field_animation": AcousticFieldAnimationRenderer,
+            "flow_map": FlowMapRenderer,
+            "flow_jsd": FlowJsdRenderer,
         }
 
         from .color_utils import set_global_color_palette

@@ -19,6 +19,24 @@ HEADINGS = 8
 STANDING_MPS = 0.2
 # a frame lasts until the pedestrian's next one, at most this many of its median steps (a gap in the recording)
 MAX_STEP_FACTOR = 4.0
+# a map as rows: cell centre (world frame), cell size, heading bin centre (null for standing) and the time in it
+CELL_SCHEMA = {"x": pl.Float64, "y": pl.Float64, "cell_m": pl.Float64, "heading_rad": pl.Float64, "ped_seconds": pl.Float64}
+# every evaluated run's map of a benchmark, written next to its combined metrics
+FLOW_CELLS_FILE = "flow_cells.parquet"
+
+
+def zone_polygons(view: WorldView) -> list[list[tuple[float, float]]] | None:
+    """Every zone outline of a world (`arena_simulation_setup` WorldView) in the world frame, each moved by its level's origin; None when the world does not load."""
+    try:
+        world = view.load(validate=False)
+    except (FileNotFoundError, ValueError):
+        return None
+    origins = view.level_origins() or {}
+    polygons = []
+    for level_id, level in world.levels.items():
+        ox, oy = origins.get(level_id, (0.0, 0.0))
+        polygons.extend([(c.x + ox, c.y + oy) for c in zone.polygon] for zone in level.zones)
+    return polygons
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,17 +81,9 @@ class FlowGrid:
 
     @classmethod
     def from_world(cls, view: WorldView, cell: float = CELL_M) -> FlowGrid | None:
-        """The grid over every zone of a world (`arena_simulation_setup` WorldView), each moved by its level's origin."""
-        try:
-            world = view.load(validate=False)
-        except (FileNotFoundError, ValueError):
-            return None
-        origins = view.level_origins() or {}
-        polygons = []
-        for level_id, level in world.levels.items():
-            ox, oy = origins.get(level_id, (0.0, 0.0))
-            polygons.extend([(c.x + ox, c.y + oy) for c in zone.polygon] for zone in level.zones)
-        return cls.from_polygons(polygons, cell)
+        """The grid over every zone of a world (`arena_simulation_setup` WorldView)."""
+        polygons = zone_polygons(view)
+        return None if polygons is None else cls.from_polygons(polygons, cell)
 
     def counts(self, tracks: pl.DataFrame) -> np.ndarray:
         """Pedestrian-seconds per cell and bin of `tracks` (`ped_track_store.track_table`), inside the rooms only."""
@@ -107,5 +117,12 @@ class FlowGrid:
         np.add.at(h, (i[keep], j[keep], b[keep]), w[keep])
         return h
 
+    def cells(self, counts: np.ndarray) -> pl.DataFrame:
+        """The bins of a map of this grid that hold time, as rows of CELL_SCHEMA."""
+        i, j, b = np.nonzero(counts)
+        centre = -math.pi + (b + 0.5) * 2 * math.pi / self.headings
+        rows = pl.DataFrame({"x": self.x0 + (j + 0.5) * self.cell, "y": self.y0 + (i + 0.5) * self.cell, "cell_m": np.full(len(b), self.cell), "heading_rad": centre, "ped_seconds": counts[i, j, b]}, schema=CELL_SCHEMA)
+        return rows.with_columns(pl.when(pl.Series(b < self.headings)).then(pl.col("heading_rad")).alias("heading_rad"))
 
-__all__ = ["CELL_M", "HEADINGS", "STANDING_MPS", "FlowGrid"]
+
+__all__ = ["CELL_M", "CELL_SCHEMA", "FLOW_CELLS_FILE", "HEADINGS", "STANDING_MPS", "FlowGrid", "zone_polygons"]

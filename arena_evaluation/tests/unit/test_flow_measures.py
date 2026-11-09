@@ -11,7 +11,7 @@ np = pytest.importorskip("numpy")
 pytest.importorskip("shapely")
 
 from arena_evaluation.processing.flow import FlowGrid, jsd, occupancy, pooled
-from arena_evaluation.processing.flow.benchmark import add_flow_reference_metrics, parse_stage
+from arena_evaluation.processing.flow.benchmark import FLOW_CELL_SCHEMA, FlowOutput, add_flow_reference_metrics, parse_stage
 from arena_evaluation.processing.metrics.flow.flow_episode import object_uses
 from arena_evaluation.processing.ped_track_store import TRACK_SCHEMA
 
@@ -71,6 +71,14 @@ def test_a_gap_in_the_recording_counts_at_most_four_median_steps() -> None:
     assert GRID.counts(_tracks(rows)).sum() == pytest.approx(1.0 + 4 * 0.5 + 0.5)
 
 
+def test_a_map_as_rows_keeps_the_bins_that_hold_time() -> None:
+    cells = GRID.cells(GRID.counts(_tracks(_walk_east("a"))))
+    # east falls in the bin [0, 45) degrees, whose centre is 22.5 degrees
+    assert cells["x"].to_list() == [0.25, 0.75, 1.25, 1.75, 2.25] and set(cells["y"]) == {0.75}
+    assert cells["heading_rad"].to_list() == pytest.approx([np.pi / 8] * 5) and cells["ped_seconds"].sum() == pytest.approx(2.5)
+    assert GRID.cells(GRID.empty()).is_empty()
+
+
 def test_divergence_is_zero_for_the_same_flow_and_one_for_disjoint_flow() -> None:
     a = GRID.counts(_tracks(_stand("a", 0.25, 0.25)))
     b = GRID.counts(_tracks(_stand("a", 3.75, 1.75)))
@@ -115,7 +123,7 @@ def _rows(planner: str = "peds_only", first: int = 0) -> list[dict]:
     return rows
 
 
-def _measure(rows: list[dict], recordings: dict[tuple[int, str], list[tuple]] | None = None, loaded: list[tuple[int, str]] | None = None) -> int:
+def _measure(rows: list[dict], recordings: dict[tuple[int, str], list[tuple]] | None = None, loaded: list[tuple[int, str]] | None = None) -> FlowOutput:
     """Flow outputs of `rows`, episode `i` (and `i + 100`) recording EPISODES' i-th stage unless `recordings` names its (episode, env)."""
     stages = list(EPISODES)
 
@@ -132,7 +140,7 @@ def _measure(rows: list[dict], recordings: dict[tuple[int, str], list[tuple]] | 
 
 def test_each_edit_is_scored_against_its_base_world_at_the_same_seed() -> None:
     rows = _rows()
-    assert _measure(rows) == 5
+    assert _measure(rows).rows == 5
     by = {r["stage"]: r for r in rows[:5]}
     base, s1, s2, s6 = by["hospital_1__s1"], by["hospital_1__move_fountain__ab__s1"], by["hospital_1__move_fountain__ab__s2"], by["hospital_1__move_fountain__ab__s6"]
     assert base["flow_reference_stage"] is None and base["flow_jsd"] is None and base["flow_base"] == "hospital_1"
@@ -147,6 +155,26 @@ def test_each_edit_is_scored_against_its_base_world_at_the_same_seed() -> None:
     assert pooled_jsd == s2["flow_jsd_pooled"] == s6["flow_jsd_pooled"] and s1["flow_pooled_seeds"] == 2
     assert 0.311 < pooled_jsd < 1.0
     assert s6["flow_reference_stage"] is None and s6["flow_jsd"] is None
+
+
+def test_each_scored_run_keeps_its_map_as_cell_rows() -> None:
+    rows = _rows()
+    cells = _measure(rows).cells
+    assert cells.columns == list(FLOW_CELL_SCHEMA)
+    by_stage = {stage: group for (stage,), group in cells.group_by("stage")}
+    assert set(by_stage) == set(EPISODES)
+    for row in rows[:5]:
+        assert by_stage[row["stage"]]["ped_seconds"].sum() == pytest.approx(row["flow_room_ped_seconds"])
+    # both drinkers stand in the corner cell: its standing bin, no heading
+    base = by_stage["hospital_1__s1"]
+    assert base.select("x", "y", "cell_m", "heading_rad", "ped_seconds").rows() == [(0.25, 0.25, 0.5, None, pytest.approx(5.0))]
+    assert base.select("planner", "flow_world", "flow_base", "flow_seed").unique().rows() == [("peds_only", "hospital_1", "hospital_1", 1)]
+
+
+def test_rows_without_suite_stages_keep_no_maps() -> None:
+    rows = [{"episode": 1, "planner": "dwb", "robot": "env_0_jackal", "stage": "a planner stage", "status": "evaluated", "is_reference": False}]
+    out = _measure(rows)
+    assert out.rows == 0 and out.cells.is_empty() and out.cells.columns == list(FLOW_CELL_SCHEMA)
 
 
 def test_reference_planner_and_failed_rows_are_left_alone() -> None:

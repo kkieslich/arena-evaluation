@@ -13,6 +13,7 @@ from arena_evaluation.presentation.manifest_registry import resolve_manifest
 from arena_evaluation.presentation.plotly_renderer import PlotlyRenderer
 from arena_evaluation.presentation.seaborn_renderer import SeabornRenderer
 from arena_evaluation.presentation.viz_manifest import VizManifest
+from arena_evaluation.processing.flow import FLOW_CELLS_FILE
 from arena_evaluation.processing.metrics.registry import MetricRegistry
 from arena_evaluation.processing.parquet_store import ParquetStore
 
@@ -23,6 +24,7 @@ if typing.TYPE_CHECKING:
 # ".parquet" is used verbatim as the filename in the benchmark/output dir.
 _DATA_FILES = {
     "metrics": None,
+    "flow_cells": FLOW_CELLS_FILE,
 }
 
 # Legacy group headings, used verbatim when a manifest declares no groups.

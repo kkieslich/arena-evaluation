@@ -8,7 +8,7 @@ from arena_evaluation.presentation.manifest_registry import find_manifest_file, 
 from arena_evaluation.presentation.viz_manifest import VizManifest
 
 
-@pytest.mark.parametrize("manifest_name", ["standard", "safety", "social", "ecological", "characterization", "everything", "failure_modes"])
+@pytest.mark.parametrize("manifest_name", ["standard", "safety", "social", "ecological", "characterization", "everything", "failure_modes", "flow"])
 def test_all_bundled_manifests_load_and_roundtrip(manifest_name: str):
     """Test that all bundled manifests exist, validate schema, have unique IDs, and roundtrip cleanly."""
     p = find_manifest_file(manifest_name)
@@ -35,7 +35,7 @@ def test_all_bundled_manifests_load_and_roundtrip(manifest_name: str):
 def test_available_manifests_contains_all_manifests():
     """Verify registry discovers all bundled manifests including everything and failure_modes."""
     manifests = available_manifests()
-    for expected in ["standard", "safety", "social", "ecological", "characterization", "everything", "failure_modes"]:
+    for expected in ["standard", "safety", "social", "ecological", "characterization", "everything", "failure_modes", "flow"]:
         assert expected in manifests, f"Expected manifest '{expected}' in available_manifests()"
 
 
