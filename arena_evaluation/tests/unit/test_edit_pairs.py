@@ -98,6 +98,26 @@ def test_the_paired_test_matches_scipy_and_gives_d_z_and_the_t_interval():
     assert paired_test([])["n"] == 0
 
 
+def _signed_rank_by_enumeration(diffs: list[float]) -> float:
+    """Two-sided signed-rank p over every sign flip of the nonzero differences, mid-ranks for ties."""
+    import itertools
+
+    from scipy import stats
+
+    d = [x for x in diffs if x != 0]
+    ranks = stats.rankdata([abs(x) for x in d])
+    observed = sum(r for r, x in zip(ranks, d, strict=True) if x > 0)
+    centre = sum(ranks) / 2
+    flips = [sum(r for r, s in zip(ranks, signs, strict=True) if s) for signs in itertools.product((False, True), repeat=len(d))]
+    return sum(abs(w - centre) >= abs(observed - centre) - 1e-9 for w in flips) / len(flips)
+
+
+@pytest.mark.parametrize("diffs", [[1.0, -1.0, 1.0, -1.0, 2.0], [0.0, 1.0, 1.0, 2.0, -2.0], [2.0, 2.0, 2.0, -1.0, 3.0], [11.0, 12.0, 13.0, -14.0, 15.0], [0.0, 2.0, 3.0, 4.0, 5.0]])
+def test_the_signed_rank_p_is_exact_with_ties_and_zeros(diffs):
+    # count measures (contacts, encounters) tie: scipy's `exact` null distribution would then be off (0.625 for the first)
+    assert paired_test(diffs)["p_wilcoxon"] == pytest.approx(_signed_rank_by_enumeration(diffs))
+
+
 def test_holm_adjusts_step_down_and_keeps_missing_values():
     assert holm([0.01, None, 0.04, 0.03]) == pytest.approx([0.03, None, 0.06, 0.06])
     assert holm([0.5, 0.9]) == pytest.approx([1.0, 1.0])

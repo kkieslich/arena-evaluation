@@ -45,6 +45,9 @@ DEFAULT_MEASURES = (
 
 EDIT, CONTROL, UNLABELLED = "edit", "control", "edited"
 
+#: Seeds up to which tied differences get the signed-rank p by enumerating every sign flip (2^n of them)
+_MAX_ENUMERATED = 16
+
 PAIRS_SCHEMA = {
     "planner": pl.String,
     "world": pl.String,
@@ -164,10 +167,25 @@ def paired_test(diffs: Sequence[float]) -> dict[str, float | int | None]:
         out["p_t"] = 1.0
     if any(x != 0 for x in d):
         try:
-            out["p_wilcoxon"] = float(stats.wilcoxon(d, method="exact").pvalue)
+            out["p_wilcoxon"] = float(stats.wilcoxon(d, method=_signed_rank_method(d)).pvalue)
         except ValueError:
             out["p_wilcoxon"] = None
     return out
+
+
+def _signed_rank_method(d: Sequence[float]) -> typing.Any:
+    """scipy's `method` that makes the signed-rank p exact for `d`: its exact null distribution without ties, else every
+    sign flip of the differences enumerated (exact given the tied ranks; scipy's `exact` is not, gh-19872).
+
+    Count measures (contacts, encounters) tie often. Zeros are dropped either way (Wilcoxon's zero method)."""
+    from scipy import stats
+
+    nonzero = [abs(x) for x in d if x != 0]
+    if len(set(nonzero)) == len(nonzero):
+        return "exact"
+    if len(d) > _MAX_ENUMERATED:
+        return "asymptotic"
+    return stats.PermutationMethod(n_resamples=2 ** len(d))
 
 
 def holm(p_values: Sequence[float | None]) -> list[float | None]:
