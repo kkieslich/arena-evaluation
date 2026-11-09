@@ -130,6 +130,42 @@ def test_reference_grid_adds_an_unobstructed_run_per_cell_and_one_ped_run_per_st
     assert {s.record_dir for s in steps} == {tmp_path / "episodes"}
 
 
+def test_reference_grid_adds_only_the_listed_reference_runs(tmp_path: pathlib.Path):
+    peds = _all_steps_grid(Suite.parse("suite", {"references": ["unhindered_peds"], "stages": [_stage_doc("s1"), _stage_doc("s2")]}), _contest("a", "b"), 1.0, tmp_path)
+    robot = _all_steps_grid(Suite.parse("suite", {"references": ["unobstructed_robot"], "stages": [_stage_doc("s1")]}), _contest("a"), 1.0, tmp_path)
+
+    assert [s.key for s in peds] == ["a/s1", "a/s2", "b/s1", "b/s2", "unhindered_peds/s1", "unhindered_peds/s2"]
+    assert [(s.is_reference, s.reference_type) for s in peds[-2:]] == [(True, "unhindered_peds")] * 2
+    assert [s.key for s in robot] == ["a/s1", "a_unobstructed_robot/s1"]
+
+
+@pytest.mark.parametrize(
+    ("value", "references", "types"),
+    [
+        (None, False, ()),
+        (False, False, ()),
+        (True, True, ("unobstructed_robot", "unhindered_peds")),
+        ([], False, ()),
+        ("unhindered_peds", True, ("unhindered_peds",)),
+        (["unhindered_peds", "unobstructed_robot"], True, ("unobstructed_robot", "unhindered_peds")),
+    ],
+)
+def test_suite_references_take_a_bool_or_the_reference_types(value: object, references: bool, types: tuple[str, ...]):
+    suite = Suite.parse("suite", {"references": value, "stages": [_stage_doc("s1")]})
+
+    assert (suite.references, suite.reference_types if suite.references else ()) == (references, types)
+
+
+@pytest.mark.parametrize("value", [["unhindered"], [1], {"unhindered_peds": True}])
+def test_suite_references_refuse_unknown_reference_types(value: object):
+    with pytest.raises(ValueError, match="suite references"):
+        Suite.parse("suite", {"references": value, "stages": [_stage_doc("s1")]})
+
+
+def _stage_doc(name: str) -> dict:
+    return {"name": name, "episodes": 1, "robot": "jackal", "map": "map1", "modes": {"robots": RANDOM_ROBOTS, "obstacles": RANDOM_OBSTACLES}, "seed": 7, "timeout": 60.0}
+
+
 @pytest.mark.parametrize("references", [False, True])
 def test_grid_refuses_duplicate_stage_names(references: bool):
     suite = _suite(_stage("s1"), _stage("s1"), references=references)
