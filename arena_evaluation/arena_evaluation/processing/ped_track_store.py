@@ -10,7 +10,7 @@ from collections.abc import Mapping
 
 import polars as pl
 
-from arena_evaluation.processing.episode_topics import episode_window, native_topics
+from arena_evaluation.processing.episode_topics import episode_start_stamp, episode_window, native_topics
 from arena_evaluation.processing.mcap_reader import bundle_env
 from arena_evaluation.processing.parquet_store import TopicParquetStore
 
@@ -20,7 +20,7 @@ if typing.TYPE_CHECKING:
 DEFAULT_AGENT_TYPE = "adult"
 TOPICS_DIR = "topics"
 TRACK_TOPICS = ("peds_physics", "peds", "agent_meta")
-TRACKS_VERSION = 1
+TRACKS_VERSION = 2
 _META_COLUMNS = ("meta_name", "meta_type", "source_name", "source_seq")
 _ENV_PREFIX = re.compile(r"^/?env_\d+/")
 _EPISODE_DIR = re.compile(r"^episode_(\d+)$")
@@ -56,9 +56,11 @@ def _frames(peds: pl.DataFrame | None) -> pl.DataFrame:
     """One row per agent per frame from a `peds_*` table: time_ns, agent_id, recorded name, x, y, vx, vy, radius."""
     need = {"time_ns", "peds_ids", "peds_positions"}
     if peds is None or len(peds) == 0 or not need <= set(peds.columns):
-        return pl.DataFrame(schema={"time_ns": pl.Int64, "agent_id": pl.Int64, "recorded": pl.String, "x": pl.Float64, "y": pl.Float64, "vx": pl.Float64, "vy": pl.Float64, "radius": pl.Float64})
+        return pl.DataFrame(schema={"time_ns": pl.Int64, "stamp_ns": pl.Int64, "agent_id": pl.Int64, "recorded": pl.String, "x": pl.Float64, "y": pl.Float64, "vx": pl.Float64, "vy": pl.Float64, "radius": pl.Float64})
     optional = {"peds_twists": pl.Float64, "peds_names": pl.String, "peds_radii": pl.Float64}
-    cols = [pl.col("time_ns"), pl.col("peds_ids"), pl.col("peds_positions")]
+    # an extraction without header stamps (older caches) times its frames by the log time
+    stamp = pl.col("stamp_ns") if "stamp_ns" in peds.columns else pl.lit(None, dtype=pl.Int64).alias("stamp_ns")
+    cols = [pl.col("time_ns"), stamp, pl.col("peds_ids"), pl.col("peds_positions")]
     cols.extend(pl.col(c).cast(pl.List(dtype)) if c in peds.columns else pl.lit(None, dtype=pl.List(dtype)).alias(c) for c, dtype in optional.items())
     df = peds.select(cols).filter(pl.col("peds_ids").list.len() > 0)
     n = pl.col("peds_ids").list.len()
@@ -75,7 +77,7 @@ def _frames(peds: pl.DataFrame | None) -> pl.DataFrame:
         pl.when(pl.col("peds_radii").list.len() == n).then(pl.col("peds_radii")).otherwise(nan).alias("radius"),
         pl.when(pl.col("peds_names").list.len() == n).then(pl.col("peds_names")).otherwise(pl.col("peds_ids").list.eval(pl.element().cast(pl.String))).alias("recorded"),
     )
-    out = df.select("time_ns", pl.col("peds_ids").alias("agent_id"), "recorded", "x", "y", "vx", "vy", "radius").explode("agent_id", "recorded", "x", "y", "vx", "vy", "radius")
+    out = df.select("time_ns", "stamp_ns", pl.col("peds_ids").alias("agent_id"), "recorded", "x", "y", "vx", "vy", "radius").explode("agent_id", "recorded", "x", "y", "vx", "vy", "radius")
     # a radius of 0 is the arena_peds sentinel for unknown
     radius = pl.col("radius").fill_null(float("nan"))
     return out.with_columns(pl.col("agent_id").cast(pl.Int64), pl.col("recorded").fill_null("").cast(pl.String), pl.when(radius.is_nan() | (radius <= 0)).then(float("nan")).otherwise(radius).alias("radius"))
@@ -95,8 +97,14 @@ def _meta(agent_meta: pl.DataFrame | None) -> pl.DataFrame:
     ).sort("time_ns")
 
 
-def track_table(topics: Mapping[str, pl.DataFrame | None], start_ns: int | None = None, end_ns: int | None = None, episode_id: int | None = None) -> pl.DataFrame:
-    """One env's pedestrian tracks (TRACK_SCHEMA) from its native topic frames, cut to [start_ns, end_ns]; the metrics README defines the columns."""
+def track_table(topics: Mapping[str, pl.DataFrame | None], start_ns: int | None = None, end_ns: int | None = None, episode_id: int | None = None, start_stamp_ns: int | None = None) -> pl.DataFrame:
+    """One env's pedestrian tracks (TRACK_SCHEMA) from its native topic frames, cut to [start_ns, end_ns]; the metrics README defines the columns.
+
+    `start_ns`/`end_ns` are the recorder's log times of the episode. With `start_stamp_ns`, the sim time the episode
+    started at, and frames that carry their header stamp, a frame's `time_ns` is its stamp and `t` its stamp minus the
+    start: the crowd engine's tick time. The recorder logs a frame at its own clock when the frame arrives, up to ~0.4 s
+    late at an episode's start and a few ticks late at random later, so two runs of the same crowd would otherwise
+    disagree on when a frame happened. Without them the log time stands in, as before."""
     peds = topics.get("peds_physics")
     if peds is None or len(peds) == 0:
         peds = topics.get("peds")
@@ -118,13 +126,20 @@ def track_table(topics: Mapping[str, pl.DataFrame | None], start_ns: int | None 
     else:
         frames = frames.with_columns(pl.lit("").alias("meta_name"), pl.lit("").alias("meta_type"), pl.lit("").alias("source_name"), pl.lit(0, dtype=pl.Int64).alias("source_seq"))
     frames = frames.with_columns(pl.col("meta_name").fill_null(""), pl.col("meta_type").fill_null(""), pl.col("source_name").fill_null(""), pl.col("source_seq").fill_null(0))
+    # time each frame by the engine's own clock where the episode's start and the frame's stamp are known
+    stamped = start_stamp_ns is not None and frames["stamp_ns"].null_count() == 0 and bool((frames["stamp_ns"] > 0).all())
+    if stamped:
+        # a frame stamped before the start is a late copy of the previous episode's crowd
+        frames = frames.with_columns(pl.col("stamp_ns").alias("time_ns")).filter(pl.col("time_ns") >= start_stamp_ns).unique(subset=["agent_id", "time_ns"], keep="first", maintain_order=True)
+        if len(frames) == 0:
+            return empty_tracks()
     # the engine table names agents by their id; a recorded name equal to the id is no name
     recorded = pl.when(pl.col("recorded") == pl.col("agent_id").cast(pl.String)).then(pl.lit("")).otherwise(pl.col("recorded"))
     name = pl.when(pl.col("meta_name") != "").then(pl.col("meta_name")).otherwise(recorded).str.replace(_ENV_PREFIX.pattern, "")
     frames = frames.with_columns(name.alias("name"))
     released = pl.col("source_name") + "#" + pl.col("source_seq").cast(pl.String)
     key = pl.when(pl.col("source_name") != "").then(released).when(pl.col("name") != "").then(pl.col("name")).otherwise(pl.lit("id") + pl.col("agent_id").cast(pl.String))
-    t0 = start_ns if start_ns is not None else int(frames["time_ns"].min())  # pyright: ignore[reportArgumentType]
+    t0 = start_stamp_ns if stamped else start_ns if start_ns is not None else int(frames["time_ns"].min())  # pyright: ignore[reportArgumentType]
     out = frames.with_columns(
         key.alias("key"),
         ((pl.col("time_ns") - t0) / 1e9).alias("t"),
@@ -145,7 +160,7 @@ def episode_envs(bundles: Mapping[str, TopicBundle]) -> dict[str, TopicBundle]:
 def env_tracks(bundle: TopicBundle, episode_id: int | None = None) -> pl.DataFrame:
     """The tracks of one env's bundle, cut to its episode window as the metrics see the episode."""
     start_ns, end_ns = episode_window(bundle.episode_record)
-    return track_table(native_topics(bundle, TRACK_TOPICS), start_ns, end_ns, episode_id)
+    return track_table(native_topics(bundle, TRACK_TOPICS), start_ns, end_ns, episode_id, episode_start_stamp(bundle.episode_record))
 
 
 def _episode_id(episode_dir: pathlib.Path) -> int | None:

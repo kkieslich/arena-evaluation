@@ -17,6 +17,23 @@ SHARED_FRAMES = frozenset({"tf", "tf_static", "semantic_snapshot", "episode_reco
 RECORD_RUNNING = 1  # arena_runtime_msgs/msg/EpisodeRecord.RUNNING
 
 
+def episode_start_stamp(record: pl.DataFrame | pl.LazyFrame | None) -> int | None:
+    """The sim time the episode started at (the RUNNING row's `start_ns`, the record's start_time), None when unrecorded.
+
+    The crowd engine stamps its frames on the same clock, so a frame's time in the episode is its stamp minus this,
+    free of the recorder's delivery delay."""
+    if record is None:
+        return None
+    df = record.collect() if isinstance(record, pl.LazyFrame) else record
+    if len(df) == 0 or "start_ns" not in df.columns:
+        return None
+    rows = df.sort("time_ns")
+    if "outcome_state" in rows.columns:
+        rows = rows.filter(pl.col("outcome_state") == RECORD_RUNNING)
+    starts = [int(v) for v in rows["start_ns"].to_list() if v]
+    return starts[0] if starts else None
+
+
 def episode_window(record: pl.DataFrame | pl.LazyFrame | None) -> tuple[int | None, int | None]:
     """[RUNNING stamp, terminal stamp] of the episode record, a bound is None when its row is missing."""
     if record is None:
@@ -48,4 +65,4 @@ def native_topics(bundle: TopicBundle, names: Iterable[str] | None = None) -> di
     return topics
 
 
-__all__ = ["RECORD_RUNNING", "SHARED_FRAMES", "episode_window", "native_topics"]
+__all__ = ["RECORD_RUNNING", "SHARED_FRAMES", "episode_start_stamp", "episode_window", "native_topics"]

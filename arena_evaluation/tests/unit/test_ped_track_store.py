@@ -140,3 +140,31 @@ def test_kept_tracks_are_read_back_until_the_topic_cache_is_written_again(tmp_pa
     assert len(tracks_for_episode(episode, "env_1")) == 0
     _episode(tmp_path, {"env_1": 4.0})
     assert tracks_for_episode(episode, "env_1")["x"].to_list() == [4.0, 4.5]
+
+
+def test_tracks_are_timed_by_the_engine_stamps_from_the_episodes_start_time() -> None:
+    # the recorder logged the first frame 0.4 s late and the second 30 ms late; the engine stamped them at its ticks
+    stamped = ENGINE.with_columns(pl.Series("stamp_ns", [100 * S + S // 20, 100 * S + S // 10]))
+    logged = stamped.with_columns(pl.Series("time_ns", [10 * S + 2 * S // 5, 10 * S + 13 * S // 100]))
+    tracks = track_table({"peds_physics": logged, "agent_meta": META}, start_ns=10 * S, end_ns=20 * S, start_stamp_ns=100 * S)
+    assert tracks["t"].to_list() == pytest.approx([0.05] * 3 + [0.1] * 3)
+    assert set(tracks["time_ns"].to_list()) == {100 * S + S // 20, 100 * S + S // 10}
+    # the same frames logged on time give the same tracks: the log delay is gone
+    on_time = stamped.with_columns(pl.Series("time_ns", [10 * S + S // 20, 10 * S + S // 10]))
+    again = track_table({"peds_physics": on_time, "agent_meta": META}, start_ns=10 * S, end_ns=20 * S, start_stamp_ns=100 * S)
+    assert again.select("key", "t", "x", "y").equals(tracks.select("key", "t", "x", "y"))
+    # a late copy of the previous episode's frame (stamped before the start) is dropped
+    stale = pl.concat([logged.head(1).with_columns(pl.lit(99 * S).alias("stamp_ns")), logged])
+    assert track_table({"peds_physics": stale, "agent_meta": META}, start_ns=10 * S, end_ns=20 * S, start_stamp_ns=100 * S)["t"].min() == pytest.approx(0.05)
+    # without the start time, or frames without stamps, the log time stands in
+    assert track_table({"peds_physics": logged, "agent_meta": META}, start_ns=10 * S, end_ns=20 * S)["t"].to_list() == pytest.approx([0.13] * 3 + [0.4] * 3)
+    assert track_table({"peds_physics": ENGINE, "agent_meta": META}, start_ns=10 * S, end_ns=20 * S, start_stamp_ns=100 * S)["t"].to_list() == [0.0] * 3 + [1.0] * 3
+
+
+def test_the_episode_start_stamp_is_the_running_rows_start_time() -> None:
+    from arena_evaluation.processing.episode_topics import episode_start_stamp
+
+    record = pl.DataFrame({"time_ns": [5 * S, 10 * S, 20 * S], "start_ns": [0, 100 * S, 100 * S], "outcome_state": [0, 1, 3]})
+    assert episode_start_stamp(record) == 100 * S
+    assert episode_start_stamp(record.drop("start_ns")) is None and episode_start_stamp(None) is None
+    assert episode_start_stamp(record.with_columns(pl.lit(0).alias("start_ns"))) is None

@@ -85,6 +85,9 @@ def nearest_return(ranges: Iterable[float], range_min: float, range_max: float) 
 _PEDS_SCHEMA = pa.schema(
     [
         ("time_ns", pa.int64()),
+        # the frame's own header stamp: the crowd engine's tick time, which the recorder's log time (time_ns) follows
+        # with a varying delay, up to ~0.4 s at an episode's start
+        ("stamp_ns", pa.int64()),
         ("peds_frame_id", pa.string()),
         ("num_pedestrians", pa.int64()),
         ("peds_names", pa.list_(pa.string())),
@@ -133,6 +136,8 @@ _TOPIC_SCHEMAS: dict[str, pa.Schema] = {
     "episode_record": pa.schema(
         [
             ("time_ns", pa.int64()),
+            # the record's start_time: the sim time the episode started at, the clock of the crowd engine's frame stamps
+            ("start_ns", pa.int64()),
             ("episode_id", pa.int64()),
             ("outcome_state", pa.int64()),
             ("outcome_info", pa.string()),
@@ -755,6 +760,7 @@ class MCAPReader:
                         elif topic.endswith("/arena_peds") or topic.endswith("/peds") or topic.endswith("/agent_states"):
                             target = env_data[env_key]["peds_physics" if topic.endswith("/agent_states") else "peds"]
                             target["time_ns"].append(ts_ns)
+                            target["stamp_ns"].append(self._stamp_ns(ros_msg.header))
                             target["peds_frame_id"].append(ros_msg.header.frame_id)
 
                             names: list[str] = []
@@ -964,6 +970,8 @@ class MCAPReader:
                         elif topic.endswith("/state/episode"):
                             target = env_data[env_key]["episode_record"]
                             target["time_ns"].append(ts_ns)
+                            start_time = getattr(ros_msg, "start_time", None)
+                            target["start_ns"].append(int(start_time.sec) * 1_000_000_000 + int(start_time.nanosec) if start_time is not None else 0)
                             target["episode_id"].append(ros_msg.episode_id)
                             target["outcome_state"].append(ros_msg.outcome_state)
                             target["outcome_info"].append(ros_msg.outcome_info)
