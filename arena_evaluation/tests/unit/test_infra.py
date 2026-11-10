@@ -58,7 +58,10 @@ def test_the_fleet_log_is_the_last_value_of_each_field_of_the_fleet_entity() -> 
 def test_service_scores_the_jobs_released_after_the_warm_up() -> None:
     s = infra.service(LOG, warmup_s=420.0, episode_s=1500.0)
     assert (s["jobs_released"], s["jobs_completed"], s["jobs_failed"], s["jobs_abandoned"], s["jobs_open"], s["jobs_jammed"]) == (5, 2, 1, 1, 1, 1)
-    assert s["task_time_s"] == pytest.approx((200.0 + 400.0) / 2)
+    # T is the restricted mean up to 1080 s: completions at 200 and 400 s, censored at 50 (open), 100 (jam) and 500 s (abandoned)
+    assert s["task_time_s"] == pytest.approx(560.0)
+    assert s["task_time_completed_s"] == pytest.approx((200.0 + 400.0) / 2)
+    assert (s["task_time_tau_s"], s["completed_share"], s["censored_share"]) == (1080.0, pytest.approx(0.4), pytest.approx(0.6))
     assert s["busy_s_per_job"] == pytest.approx((190.0 + 400.0) / 2)
     assert s["assign_wait_s"] == pytest.approx((10.0 + 0.0) / 2) and s["dock_wait_s"] == pytest.approx(40.0)
     assert infra.jobs(LOG)[1]["timeout_0"] == 330.0
@@ -213,13 +216,14 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     monkeypatch.setattr(infra, "tracks_for_episode", fake)
     manifest = tmp_path / "infra_h1.layouts.json"
     manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
-    args = argparse.Namespace(infra="pick", site=site, layouts=layouts, manifest=manifest, warmup=None, output_dir=None, out=None, boot=200)
+    args = argparse.Namespace(infra="pick", site=site, layouts=layouts, manifest=manifest, warmup=None, tau=None, output_dir=None, out=None, boot=200)
     assert infra.infra_command(args) == 0
     table = pl.read_parquet(layouts / infra.TABLE_FILE)
     assert len(table) == 4 and table["complete"].all()
     assert table.filter(pl.col("layout_id") == "aaaa")["C_adult"].to_list() == pytest.approx([60.0 / 300.0] * 2)
     assert table.filter(pl.col("layout_id") == "aaaa")["C_adult_element"].to_list() == pytest.approx([30.0 / 300.0] * 2)
-    assert table["task_time_s"].to_list() == pytest.approx([300.0] * 4)
+    assert table["task_time_completed_s"].to_list() == pytest.approx([300.0] * 4)
+    assert table["task_time_s"].to_list() == pytest.approx([560.0] * 4)
     chosen = json.loads((layouts / "infra_pick.json").read_text())
     assert (chosen["robot_only"], chosen["joint_pick"]) == ("aaaa", "bbbb")
     assert (layouts / "plots" / infra.FIGURE_FILE).is_file()
@@ -227,3 +231,39 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     assert "joint pick: bbbb" in printed and "C_adult" in printed
     with pytest.raises(FileNotFoundError, match="no combined_metrics"):
         infra.runs(tmp_path)
+    # a stage the runner ran twice (the failed attempt kept its recording) is refused, not read silently
+    metrics = pl.read_parquet(layouts / "combined_metrics.parquet")
+    extra = metrics.filter((pl.col("stage") == "site__layout_aaaa__s1") & (pl.col("planner") == "fleet_dwb")).with_columns(pl.lit(99, dtype=metrics.schema["episode"]).alias("episode"))
+    pl.concat([metrics, extra]).write_parquet(layouts / "combined_metrics.parquet")
+    with pytest.raises(ValueError, match="stage site__layout_aaaa__s1 has more than one usable run"):
+        infra.infra_command(args)
+
+
+def test_the_restricted_mean_counts_censored_jobs_up_to_the_horizon() -> None:
+    # no censoring: the mean of the times cut at the horizon
+    assert infra.restricted_mean([100.0, 300.0, 2000.0], [True, True, True], 1000.0) == pytest.approx((100.0 + 300.0 + 1000.0) / 3)
+    # a job censored at 500 s keeps the curve at its level beyond its last completion
+    assert infra.restricted_mean([100.0, 500.0], [True, False], 1000.0) == pytest.approx(100.0 + 0.5 * 900.0)
+    # dropping the open jobs (the plain mean) would read 100 s; ties put completions before censorings
+    assert infra.restricted_mean([200.0, 200.0], [True, False], 1000.0) == pytest.approx(200.0 + 0.5 * 800.0)
+    assert infra.restricted_mean([], [], 1000.0) is None
+
+
+def test_runs_leave_out_failed_attempts_and_robot_references_and_a_stage_run_twice_is_refused(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "bench"
+    root.mkdir()
+    rows = [
+        {"planner": "fleet_dwb", "stage": "w__s1", "episode": 0, "robot": "env_0_jackal_0", "status": "error", "is_reference": False, "reference_type": None},
+        {"planner": "fleet_dwb", "stage": "w__s1", "episode": 1, "robot": "env_0_jackal_0", "status": "evaluated", "is_reference": False, "reference_type": None},
+        {"planner": "fleet_dwb_unobstructed_robot", "stage": "w__s1", "episode": 2, "robot": "env_0_jackal_0", "status": "evaluated", "is_reference": True, "reference_type": "unobstructed_robot"},
+        {"planner": "unhindered_peds", "stage": "w__s1", "episode": 3, "robot": "env_0_jackal_0", "status": "no_trajectory", "is_reference": True, "reference_type": "unhindered_peds"},
+        {"planner": "unhindered_peds", "stage": "w__s2", "episode": 4, "robot": "env_0_jackal_0", "status": "path_only", "is_reference": True, "reference_type": "unhindered_peds"},
+        {"planner": "unhindered_peds", "stage": "w__s2", "episode": 5, "robot": "env_0_jackal_0", "status": "evaluated", "is_reference": True, "reference_type": "unhindered_peds"},
+    ]
+    pl.DataFrame(rows).write_parquet(root / "combined_metrics.parquet")
+    found = infra.runs(root)
+    assert [(r.planner, r.stage, r.episode) for r in found] == [("fleet_dwb", "w__s1", 1), ("unhindered_peds", "w__s1", 3), ("unhindered_peds", "w__s2", 4), ("unhindered_peds", "w__s2", 5)]
+    assert infra.unique([r for r in found if r.stage == "w__s1" and r.planner == "fleet_dwb"], "here").episode == 1
+    assert infra.unique([], "here") is None
+    with pytest.raises(ValueError, match=r"stage w__s2 has more than one usable run \(episode_004 \(env_0\), episode_005 \(env_0\)\)"):
+        infra.unique([r for r in found if r.stage == "w__s2"], "here")

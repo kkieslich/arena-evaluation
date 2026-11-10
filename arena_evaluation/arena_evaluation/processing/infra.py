@@ -4,8 +4,11 @@ Inputs are benchmark directories `evaluation process` has run on (their `combine
 extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite:
 
 - **Robot service** (§6), from the fleet mode's task log (the `fleet` semantic entity, schema in kkieslich/Arena's
-  `task_generator/tasks/robots/README.md#fleet-task-log`): `T` = mean task time (`ended - released`) of the completed
-  jobs released after the warm-up; success rate = completed over released after the warm-up (jobs still open at the
+  `task_generator/tasks/robots/README.md#fleet-task-log`): `T` = the restricted mean task time (release to
+  completion) of the jobs released after the warm-up, up to a horizon fixed per study (default the episode minus the
+  warm-up), from the Kaplan-Meier estimate with the jobs not completed censored at their elapsed time, so the slow jobs
+  an episode cuts off still count (`restricted_mean`); the plain mean over completed jobs, the completed and censored
+  shares are reported beside it; success rate = completed over released after the warm-up (jobs still open at the
   episode end apart); charger queue time (`dispatched - queued`); tasks per hour; failed and abandoned jobs, and the
   jobs failed by jams (`reason: jam`, §8); the time a job waited for a robot (`assigned - released`) and the time its
   robot held in place before busy docks (`wait_s`), both part of T.
@@ -76,23 +79,70 @@ class Run:
     episode_dir: pathlib.Path
 
 
+#: Processing statuses of a row whose episode has no usable recording (a failed attempt the runner retried)
+_UNUSABLE = frozenset({"error", "no_recording"})
+
+
 def runs(benchmark_dir: pathlib.Path) -> list[Run]:
-    """Every run of a processed benchmark dir whose stage is `<world>__s<seed>`, one per (planner, stage, episode, env)."""
+    """Every usable run of a processed benchmark dir whose stage is `<world>__s<seed>`, one per (planner, stage,
+    episode, env): rows of status `error` or `no_recording` are left out (a failed attempt the runner retried), and of
+    the reference rows only the runs without robots (`unhindered_peds`). Check for a stage run twice with `unique`."""
     benchmark_dir = pathlib.Path(benchmark_dir)
     path = benchmark_dir / "combined_metrics.parquet"
     if not path.is_file():
         raise FileNotFoundError(f"{benchmark_dir}: no combined_metrics.parquet, run `evaluation process --benchmark-dir {benchmark_dir}` first")
     metrics = pl.read_parquet(path, columns=None)
     out: dict[tuple[str, str, int, str], Run] = {}
-    for row in metrics.select([c for c in ("planner", "stage", "episode", "robot", "status") if c in metrics.columns]).iter_rows(named=True):
+    columns = [c for c in ("planner", "stage", "episode", "robot", "status", "is_reference", "reference_type") if c in metrics.columns]
+    for row in metrics.select(columns).iter_rows(named=True):
         match = _STAGE.match(str(row.get("stage") or ""))
         if match is None or row.get("episode") is None:
+            continue
+        if str(row.get("status") or "") in _UNUSABLE:
+            continue
+        if row.get("is_reference") and str(row.get("reference_type") or row.get("planner")) != NO_ROBOTS:
             continue
         env_match = re.search(r"(env_\d+)", str(row.get("robot") or ""))
         key = (str(row["planner"]), str(row["stage"]), int(row["episode"]), env_match.group(1) if env_match else "env_0")
         if key not in out:
             out[key] = Run(key[0], key[1], match["world"], int(match["seed"]), key[2], key[3], benchmark_dir / "episodes" / f"episode_{key[2]:03d}")
     return sorted(out.values(), key=lambda r: (r.world, r.seed, r.planner, r.episode, r.env))
+
+
+def unique(candidates: typing.Sequence[Run], what: str) -> Run | None:
+    """The one run of `candidates`, None without any; ValueError naming the stage and its episodes when a stage was
+    run more than once (a retried step whose failed attempt still has a recording): the analysis never guesses."""
+    if not candidates:
+        return None
+    if len({(r.episode, r.env) for r in candidates}) > 1:
+        episodes = ", ".join(f"episode_{r.episode:03d} ({r.env})" for r in candidates)
+        raise ValueError(f"{what}: stage {candidates[0].stage} has more than one usable run ({episodes}); remove the failed attempt or re-process")
+    return candidates[0]
+
+
+def restricted_mean(times: typing.Sequence[float], completed: typing.Sequence[bool], tau_s: float) -> float | None:
+    """The restricted mean of a time to completion up to `tau_s` from the Kaplan-Meier estimate: the area under the
+    survival curve S(t) (the share not yet completed) from 0 to `tau_s`. A time with `completed` False is right-censored
+    there (a job still open at the episode end, or one that failed or was abandoned: its task time exceeds what was
+    seen). At a tie, completions go before censorings; S stays at its last value up to `tau_s`. None without times."""
+    pairs = sorted((float(t), bool(c)) for t, c in zip(times, completed, strict=True) if t is not None and math.isfinite(t))
+    if not pairs:
+        return None
+    at_risk, survival, area, last = len(pairs), 1.0, 0.0, 0.0
+    i = 0
+    while i < len(pairs) and pairs[i][0] < tau_s:
+        t = max(pairs[i][0], 0.0)
+        area += survival * (t - last)
+        last = t
+        j, events = i, 0
+        while j < len(pairs) and pairs[j][0] == pairs[i][0]:
+            events += pairs[j][1]
+            j += 1
+        if events:
+            survival *= 1.0 - events / at_risk
+        at_risk -= j - i
+        i = j
+    return area + survival * (tau_s - last)
 
 
 # --- robot service ---------------------------------------------------------------------------------------------------
@@ -148,10 +198,17 @@ def charges(log: typing.Mapping[str, str]) -> list[dict[str, typing.Any]]:
     return [{**c, **{k: _f(c.get(k)) for k in ("queued", "dispatched", "started", "ended", "soc_start", "soc_end")}} for c in _table(log, "charge")]
 
 
-def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episode_s: float | None = None) -> dict[str, typing.Any]:
-    """Robot service of one run (§6) over the jobs released after `warmup_s`: mean task time of the completed ones,
-    success rate (completed over those that ended), counts by outcome and of jam failures, the charger queue time of
-    charges queued after the warm-up, and completed tasks per hour of the scored time (`episode_s` - `warmup_s`)."""
+def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episode_s: float | None = None, tau_s: float | None = None) -> dict[str, typing.Any]:
+    """Robot service of one run (§6) over the jobs released after `warmup_s`.
+
+    T (`task_time_s`) is the restricted mean task time up to `tau_s` (default `episode_s` - `warmup_s`) from the
+    Kaplan-Meier estimate of the time from release to completion (`restricted_mean`): a completed job counts at
+    `ended - released`, a job that failed or was abandoned is censored at `ended - released`, and a job still open at the
+    episode end at `episode_s - released`. So the slow jobs an episode cuts off still count. The plain mean over the
+    completed jobs is `task_time_completed_s`, and `completed_share` and `censored_share` say how many there were. Also:
+    success rate (completed over those that ended), counts by outcome and of jam failures, the time a job waited for a
+    robot and for docks, the charger queue time of charges queued after the warm-up, and completed tasks per hour of the
+    scored time (`episode_s` - `warmup_s`). Without `episode_s` the open jobs are left out of T."""
     scored = [j for j in jobs(log) if j["released"] is not None and j["released"] >= warmup_s]
     ended = [j for j in scored if j["ended"] is not None]
     completed = [j for j in ended if j.get("outcome") == "completed"]
@@ -163,14 +220,23 @@ def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episod
     dock_waits = [j["wait_s"] for j in completed if j["wait_s"] is not None]
     charging = [c["ended"] - c["dispatched"] for c in queued if c["dispatched"] is not None and c["ended"] is not None and c.get("outcome") == "charged"]
     hours = None if episode_s is None or episode_s <= warmup_s else (episode_s - warmup_s) / 3600.0
+    tau = tau_s if tau_s is not None else (episode_s - warmup_s if episode_s is not None else None)
+    observed = [(j["ended"] - j["released"], j.get("outcome") == "completed") for j in ended]
+    if episode_s is not None:
+        observed += [(episode_s - j["released"], False) for j in scored if j["ended"] is None]
+    rmst = restricted_mean([t for t, _ in observed], [c for _, c in observed], tau) if tau is not None and observed else None
     return {
+        "task_time_s": rmst,
+        "task_time_completed_s": float(np.mean([j["ended"] - j["released"] for j in completed])) if completed else None,
+        "task_time_tau_s": tau,
+        "completed_share": len(completed) / len(scored) if scored else None,
+        "censored_share": (len(scored) - len(completed)) / len(scored) if scored else None,
         "jobs_released": len(scored),
         "jobs_completed": len(completed),
         "jobs_failed": sum(j.get("outcome") == "failed" for j in ended),
         "jobs_abandoned": sum(j.get("outcome") == "abandoned" for j in ended),
         "jobs_open": len(scored) - len(ended),
         "jobs_jammed": len(jam),
-        "task_time_s": float(np.mean([j["ended"] - j["released"] for j in completed])) if completed else None,
         "busy_s_per_job": float(np.mean(busy)) if busy else None,
         "assign_wait_s": float(np.mean(assign_waits)) if assign_waits else None,
         "dock_wait_s": float(np.mean(dock_waits)) if dock_waits else None,
@@ -271,16 +337,14 @@ def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> 
 # --- tables ----------------------------------------------------------------------------------------------------------
 
 
-def layout_table(site_dir: pathlib.Path, layouts_dir: pathlib.Path, manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None) -> pl.DataFrame:
+def layout_table(site_dir: pathlib.Path, layouts_dir: pathlib.Path, manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None) -> pl.DataFrame:
     """One row per layout of `manifest` and seed: its roles, the service of its fleet run, its pedestrian cost against
     the site as is at that seed (`cost`), flattened (`C_<group>`, `C_<group>_element`, `C_<group>_traffic`,
     `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`)."""
     warmup = float(manifest.get("warmup_s", WARMUP_S) if warmup_s is None else warmup_s)
     episode_s = float(manifest.get("episode_s") or 0.0) or None
     visitor_sources = list(manifest.get("visitor_sources") or [])
-    site: dict[tuple[str, int], Run] = {}
-    for r in runs(site_dir):
-        site.setdefault((r.world, r.seed), r)
+    site_runs = runs(site_dir)
     layout_runs = runs(layouts_dir)
     roles: dict[str, list[str]] = {}
     ranking: dict[str, float | None] = {}
@@ -294,12 +358,12 @@ def layout_table(site_dir: pathlib.Path, layouts_dir: pathlib.Path, manifest: ty
     site_name = str(manifest["site"])
     for layout_id, world in world_of.items():
         for seed in manifest.get("seeds") or []:
-            off = next((r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS), None)
-            on = next((r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)), None)
-            ref = site.get((site_name, seed))
+            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS], f"{layouts_dir} (without robots)")
+            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_dir} (with the fleet)")
+            ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_dir} (the site as is)")
             row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": off is not None and on is not None and ref is not None}
             if on is not None:
-                row.update(service(fleet_log(on.episode_dir, on.env), warmup_s=warmup, episode_s=episode_s))
+                row.update(service(fleet_log(on.episode_dir, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
             if off is not None and ref is not None:
                 measured = cost(tracks_for_episode(ref.episode_dir, ref.env), tracks_for_episode(off.episode_dir, off.env), None if on is None else tracks_for_episode(on.episode_dir, on.env), visitor_sources=visitor_sources, warmup_s=warmup)
                 row.update(_flatten(measured))
@@ -558,10 +622,10 @@ def _fmt(value: typing.Any, spec: str = ".3f") -> str:
 
 def _print_layouts(means: pl.DataFrame) -> None:
     groups = [g for g in GROUPS if f"C_{g}" in means.columns]
-    print(f"{'layout':10s} {'roles':16s} {'seeds':>5s} {'T s':>7s} {'success':>7s} {'queue s':>7s} {'tasks/h':>7s} {'jams':>5s} " + " ".join(f"{'C_' + g:>12s}" for g in groups) + f" {'C_worst':>8s} worst")
+    print(f"{'layout':10s} {'roles':16s} {'seeds':>5s} {'T s':>7s} {'done':>5s} {'success':>7s} {'queue s':>7s} {'tasks/h':>7s} {'jams':>5s} " + " ".join(f"{'C_' + g:>12s}" for g in groups) + f" {'C_worst':>8s} worst")
     for r in means.to_dicts():
         print(
-            f"{r['layout_id']:10s} {str(r['roles'])[:16]:16s} {r['seeds']:5d} {_fmt(r.get('task_time_s'), '.1f'):>7s} {_fmt(r.get('success_rate'), '.2f'):>7s} {_fmt(r.get('charger_queue_s'), '.1f'):>7s} {_fmt(r.get('tasks_per_h'), '.1f'):>7s} {_fmt(r.get('jam_share'), '.2f'):>5s} "
+            f"{r['layout_id']:10s} {str(r['roles'])[:16]:16s} {r['seeds']:5d} {_fmt(r.get('task_time_s'), '.1f'):>7s} {_fmt(r.get('completed_share'), '.2f'):>5s} {_fmt(r.get('success_rate'), '.2f'):>7s} {_fmt(r.get('charger_queue_s'), '.1f'):>7s} {_fmt(r.get('tasks_per_h'), '.1f'):>7s} {_fmt(r.get('jam_share'), '.2f'):>5s} "
             + " ".join(f"{_fmt(r.get(f'C_{g}')):>12s}" for g in groups)
             + f" {_fmt(r.get('c_worst_of_means')):>8s} {r.get('worst_group_of_means') or '-'}"
         )
@@ -573,7 +637,7 @@ def _print_layouts(means: pl.DataFrame) -> None:
 def infra_command(args: typing.Any) -> int:
     """`evaluation infra {table,premise,pick,compare}`; see `add_infra_parser`."""
     manifest = _manifest(args.manifest)
-    table = layout_table(args.site, args.layouts, manifest, warmup_s=args.warmup)
+    table = layout_table(args.site, args.layouts, manifest, warmup_s=args.warmup, tau_s=args.tau)
     out_dir = pathlib.Path(args.output_dir or args.layouts)
     table.write_parquet(out_dir / TABLE_FILE)
     means = layout_means(table)
@@ -627,6 +691,7 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     common.add_argument("--layouts", type=pathlib.Path, required=True, help="processed benchmark dir of a layout suite (premise, selection or evaluation)")
     common.add_argument("--manifest", type=pathlib.Path, required=True, help="the suite's <suite>.layouts.json from flowedit infra")
     common.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g})")
+    common.add_argument("--tau", type=float, default=None, help="horizon of the restricted mean task time T, s (default the episode minus the warm-up; one value for a whole study)")
     common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default --layouts)")
     common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
     sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
