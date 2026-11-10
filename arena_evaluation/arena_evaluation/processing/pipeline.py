@@ -70,6 +70,7 @@ def _extract_worker(
     ep: EpisodeDescriptor,
     force_extract: bool,
     status_dict: typing.MutableMapping[int, tuple[str, str, str, int, int, float]] | None = None,
+    measures: tuple[str, ...] | None = None,
 ) -> int:
     import pathlib
     import time
@@ -83,7 +84,7 @@ def _extract_worker(
         except Exception:
             pass
     fm = FolderManager(data_root=pathlib.Path(data_root_str))
-    pipeline = ProcessingPipeline(fm, profiler=None, workers=1)
+    pipeline = ProcessingPipeline(fm, profiler=None, workers=1, measures=measures)
     pipeline.extract_episode(ep, force_extract=force_extract)
     if status_dict is not None:
         try:
@@ -98,6 +99,7 @@ def _process_worker(
     ep: EpisodeDescriptor,
     force_extract: bool,
     status_dict: typing.MutableMapping[int, tuple[str, str, str, int, int, float]] | None = None,
+    measures: tuple[str, ...] | None = None,
 ) -> tuple[int, typing.Any]:
     import pathlib
     import time
@@ -111,7 +113,7 @@ def _process_worker(
         except Exception:
             pass
     fm = FolderManager(data_root=pathlib.Path(data_root_str))
-    pipeline = ProcessingPipeline(fm, profiler=None, workers=1)
+    pipeline = ProcessingPipeline(fm, profiler=None, workers=1, measures=measures)
     try:
         result = pipeline.process_episode(ep, force_extract=force_extract, status_dict=status_dict)
     except Exception as e:
@@ -284,7 +286,7 @@ from arena_evaluation.benchmark.profiler import PipelineProfiler
 from arena_evaluation.processing.episode_topics import RECORD_RUNNING, episode_window, native_topics
 from arena_evaluation.processing.flow import FLOW_CELLS_FILE
 from arena_evaluation.processing.flow.benchmark import FLOW_REFERENCE_DTYPES, add_flow_reference_metrics
-from arena_evaluation.processing.mcap_reader import MCAPReader, bundle_env
+from arena_evaluation.processing.mcap_reader import MCAPReader, bundle_env, recorded_tables
 from arena_evaluation.processing.metrics.ecological.mechanism_common import robot_env_snapshot
 from arena_evaluation.processing.metrics.flow.flow_episode import FLOW_EPISODE_DTYPES
 from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_DTYPES, add_paired_ped_measures
@@ -329,7 +331,23 @@ _METRIC_DTYPES = {
     **PAIRED_DTYPES,
 }
 
-from .metrics.registry import MetricRegistry
+from .metrics.registry import MetricRegistry, calculator_tables, select_calculators
+
+# what process_episode reads beside the calculators' tables: the robots (odom), their pose source (tf_gt, anchored by
+# tf_static), the episode window and verdict, the endpoints and the fleet poses; and the tracks the cross-run measures read
+PIPELINE_TABLES: tuple[str | tuple[str, ...], ...] = ("odom", "odom_controller", "tf_gt", "tf_static", "episode_record", "semantic_snapshot", "plan", "task_pose", ("peds_physics", "peds"), "agent_meta")
+
+
+def resolve_tables(needs: typing.Iterable[str | tuple[str, ...]], recorded: frozenset[str] | None) -> frozenset[str]:
+    """The tables to extract for `needs`: each table, and of alternatives the first the recording has (all of them when it is unknown which)."""
+    out: set[str] = set()
+    for need in needs:
+        if isinstance(need, str):
+            out.add(need)
+            continue
+        have = [t for t in need if recorded is None or t in recorded]
+        out.update(have[:1] if recorded is not None else have)
+    return frozenset(out)
 
 # EpisodeRecord.outcome_state -> (result, success)
 _OUTCOME_VERDICTS: dict[int | None, tuple[str, bool]] = {2: ("GOAL_REACHED", True), 3: ("FAILED", False), 4: ("CANCELLED", False), 5: ("FATAL", False)}
@@ -504,11 +522,21 @@ class ProcessingPipeline:
     MCAP -> Extract -> Align -> Split -> Metrics -> Parquet
     """
 
-    def __init__(self, folder_manager: FolderManager, profiler: PipelineProfiler | None = None, workers: int | None = None):
+    def __init__(self, folder_manager: FolderManager, profiler: PipelineProfiler | None = None, workers: int | None = None, measures: typing.Iterable[str] | None = None):
+        """`measures` (calculator names, categories or tags) runs only those calculators and extracts only the tables they and
+        the pipeline read; the cross-run measures (flow change, paired pedestrians) still run on the tracks. None runs all."""
         self.folder_manager = folder_manager
         self.profiler = profiler
         # -1 (or None) = auto-detect the CPU count; any value < 1 falls back to it.
         self.workers = (os.cpu_count() or 1) if (workers is None or workers < 1) else workers
+        self.measures = None if measures is None else tuple(measures)
+        self._calculators = None if self.measures is None else select_calculators(self.measures)
+
+    def tables(self, mcap_path: pathlib.Path) -> frozenset[str] | None:
+        """The tables to extract from an episode's MCAP for the selected measures, None for every table."""
+        if self._calculators is None:
+            return None
+        return resolve_tables([*PIPELINE_TABLES, *calculator_tables(self._calculators)], recorded_tables(mcap_path))
 
     def extract_episode(self, ep: EpisodeDescriptor, force_extract: bool = False) -> dict[str, TopicBundle] | None:
         """Extract topics from a single episode MCAP into episode_dir/topics/."""
@@ -520,7 +548,8 @@ class ProcessingPipeline:
             print(f"  [skip] No MCAP found for episode_{ep.episode_id:03d} ({ep.planner}/{ep.stage})")
             return None
 
-        if not force_extract and TopicParquetStore.is_current(topics_dir):
+        tables = self.tables(mcap_path)
+        if not force_extract and TopicParquetStore.is_current(topics_dir, tables):
             bundles = TopicParquetStore.read(topics_dir)
             if bundles:
                 return bundles
@@ -530,8 +559,8 @@ class ProcessingPipeline:
             if topics_dir.exists():
                 shutil.rmtree(topics_dir)
             with tempfile.TemporaryDirectory(dir=episode_dir, prefix=".extract-") as scratch:
-                bundles = MCAPReader(mcap_path).read(pathlib.Path(scratch), map_name_fallback=ep.map)
-                TopicParquetStore.write(bundles, topics_dir, overwrite=True)
+                bundles = MCAPReader(mcap_path).read(pathlib.Path(scratch), map_name_fallback=ep.map, tables=tables)
+                TopicParquetStore.write(bundles, topics_dir, overwrite=True, tables=tables)
             bundles = TopicParquetStore.read(topics_dir)
             if bundles is None:
                 raise RuntimeError(f"no parquet written to {topics_dir}")
@@ -602,7 +631,7 @@ class ProcessingPipeline:
                 pedsim_avail = metadata.pedsim_available or False
 
             robot_params = RobotParams.load(robot_model)
-            registry = MetricRegistry(robot_params, world=_metric_world(metadata, ep), metrics_config=_suite_metrics(episode_dir, self.folder_manager.data_root))
+            registry = MetricRegistry(robot_params, world=_metric_world(metadata, ep), metrics_config=_suite_metrics(episode_dir, self.folder_manager.data_root), measures=self.measures)
 
             all_results: list[dict] = []
             robots = {name: bundle for name, bundle in bundles.items() if bundle.odom is not None}
@@ -783,7 +812,7 @@ class ProcessingPipeline:
         ) as display:
             executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.workers, initializer=_worker_init, mp_context=_spawn())
             try:
-                futures = {executor.submit(_extract_worker, data_root_str, ep, force_extract, status_dict): (ep, time.perf_counter()) for ep in episodes}
+                futures = {executor.submit(_extract_worker, data_root_str, ep, force_extract, status_dict, self.measures): (ep, time.perf_counter()) for ep in episodes}
                 for future in concurrent.futures.as_completed(futures):
                     ep, t_start = futures[future]
                     try:
@@ -828,7 +857,7 @@ class ProcessingPipeline:
             ) as display:
                 executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.workers, initializer=_worker_init, mp_context=_spawn())
                 try:
-                    futures = {executor.submit(_process_worker, data_root_str, ep, False, status_dict): (ep, time.perf_counter()) for ep in episodes}
+                    futures = {executor.submit(_process_worker, data_root_str, ep, False, status_dict, self.measures): (ep, time.perf_counter()) for ep in episodes}
 
                     for future in concurrent.futures.as_completed(futures):
                         ep, t_start = futures[future]

@@ -111,6 +111,8 @@ class TopicParquetStore:
 
     VERSION = 6
     VERSION_FILE = ".cache_version"
+    # Beside the version of a cache extracted for some tables only (MCAPReader.read `tables`): their names, one per line.
+    TABLES_FILE = ".cache_tables"
     # Tables built from the cache live here: every write clears them, and reading the topics skips them.
     DERIVED_DIR = ".derived"
 
@@ -120,18 +122,31 @@ class TopicParquetStore:
         return source_dir / TopicParquetStore.DERIVED_DIR
 
     @staticmethod
-    def is_current(source_dir: pathlib.Path) -> bool:
-        """True when source_dir holds an extraction cache written by this layout."""
+    def cached_tables(source_dir: pathlib.Path) -> frozenset[str] | None:
+        """The tables a partial cache was extracted for, None for a whole one."""
+        try:
+            text = (source_dir / TopicParquetStore.TABLES_FILE).read_text()
+        except OSError:
+            return None
+        return frozenset(line.strip() for line in text.splitlines() if line.strip())
+
+    @staticmethod
+    def is_current(source_dir: pathlib.Path, tables: frozenset[str] | set[str] | None = None) -> bool:
+        """True when source_dir holds an extraction cache written by this layout that covers `tables` (None: every table)."""
         try:
             stamp = (source_dir / TopicParquetStore.VERSION_FILE).read_text().strip()
         except OSError:
             return False
-        return stamp == str(TopicParquetStore.VERSION)
+        if stamp != str(TopicParquetStore.VERSION):
+            return False
+        cached = TopicParquetStore.cached_tables(source_dir)
+        return cached is None or (tables is not None and set(tables) <= cached)
 
     @staticmethod
-    def write(bundles: dict[str, TopicBundle], dest_dir: pathlib.Path, overwrite: bool = False) -> None:
-        """Write TopicBundle DataFrames to Parquet files using zstd compression."""
+    def write(bundles: dict[str, TopicBundle], dest_dir: pathlib.Path, overwrite: bool = False, tables: frozenset[str] | set[str] | None = None) -> None:
+        """Write TopicBundle DataFrames to Parquet files using zstd compression; `tables` marks a cache extracted for those tables only."""
         dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / TopicParquetStore.TABLES_FILE).unlink(missing_ok=True)
         shutil.rmtree(TopicParquetStore.derived_dir(dest_dir), ignore_errors=True)
         import dataclasses
 
@@ -172,6 +187,8 @@ class TopicParquetStore:
                         temp_path.rename(final_path)
 
         if complete:
+            if tables is not None:
+                (dest_dir / TopicParquetStore.TABLES_FILE).write_text("".join(f"{t}\n" for t in sorted(tables)))
             (dest_dir / TopicParquetStore.VERSION_FILE).write_text(f"{TopicParquetStore.VERSION}\n")
 
     @staticmethod

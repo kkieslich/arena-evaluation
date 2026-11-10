@@ -22,6 +22,10 @@ class BaseMetricCalculator(ABC):
     REQUIRES_PEDSIM: bool = False
     DEPENDS_ON: list[str] = []
     REQUIRED_TOPICS: list[str | list[str] | tuple[str, ...] | set[str]] = []
+    # tables the calculator also reads when the recording has them, beyond REQUIRED_TOPICS: a selective extraction keeps them
+    OPTIONAL_TOPICS: tuple[str, ...] = ()
+    # names `evaluation process --measures` selects the calculator by, beside its NAME and CATEGORY
+    TAGS: tuple[str, ...] = ()
     UNITS: dict[str, str] = {}
     PRIMARY_OUTPUTS: list[str] = []
     OUTPUT_DIRECTIONS: dict[str, str] = {}

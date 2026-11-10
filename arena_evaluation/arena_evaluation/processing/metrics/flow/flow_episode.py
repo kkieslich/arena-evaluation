@@ -42,6 +42,8 @@ class FlowEpisodeCalculator(BaseMetricCalculator):
     CATEGORY = "social"
     REQUIRES_PEDSIM = True
     REQUIRED_TOPICS = [("peds_physics", "peds")]
+    OPTIONAL_TOPICS = ("interactions",)
+    TAGS = ("flow",)
     UNITS = {"flow_peds": "count", "flow_object_uses": "list"}
 
     @classmethod
