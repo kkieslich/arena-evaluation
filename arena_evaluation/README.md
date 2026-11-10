@@ -171,6 +171,7 @@ Commands:
   report    Generate report.html from existing metrics.parquet
   plot      Generate static PNG plots only
   groups    Print each pedestrian measure per group (mean over seeds), write ped_groups.parquet
+  edits     Each robot measure of an edited world minus its base world per planner and seed, paired tests, write edit_pairs.parquet
   acoustic  Acoustic analysis subcommands (list, animate, snapshot)
 ```
 
@@ -187,6 +188,8 @@ Commands:
 `process` and `run` exit 1 when a benchmark or episode directory produced no metrics.
 
 `groups --benchmark-dir DIR... | --run-dir DIR...` reads each directory's `combined_metrics.parquet` (else `metrics.parquet`), prints every pedestrian measure per group of agent types for each contestant and stage as the mean over seeds, the worst group marked `*`, and writes the per-seed rows and the means to `ped_groups.parquet` next to it (see [Per-group table](arena_evaluation/processing/metrics/README.md)); it exits 1 for a directory without metrics. `--report-manifest groups` reports that file.
+
+`edits --benchmark-dir DIR... [--split SPLIT] [--measure M]... [--plot]` pairs every `flowedit suite` stage of an edited world (`<base>__<edit>__s<seed>`) with its base world's stage at the same seed and contestant, and tests the seeds' differences per contestant, edited world and measure ([`processing/edit_pairs.py`](arena_evaluation/processing/edit_pairs.py)): a paired t-test (df = n - 1) with Cohen's d_z, the 95 % t interval of the mean difference, Holm across the measure's rows, and the exact Wilcoxon signed-rank p as a check without normality (its two-sided p cannot fall below 2/2^n, 0.0625 at five seeds). The default measures are `personal_space_time` (time with a person within 1.2 m edge to edge, `time_in_intimate_zone` plus `time_in_personal_zone`), `personal_space_intrusion_integral`, `time_in_intimate_zone`, `psi_personal_events`, `ped_robot_contacts` and `path_length`. A FLOWEDIT `--split` labels each edited world a function-carrying `edit` or a geometry-only `control` by its `control_worlds` and orders the figure's panels by its `contest`. It writes `edit_pairs.parquet` (one row per contestant, world, seed and measure) and `edit_tests.csv` next to the metrics, `--plot` also `plots/edit_pairs_<first measure>.png`, and exits 1 for a directory without metrics or pairs.
 
 ---
 
