@@ -197,3 +197,26 @@ def test_summary_roundtrip_keeps_counts() -> None:
     s = LockstepSummary(active=True, channels=("planner/jackal",), ticks=3, beats=2, beats_due=3)
     assert LockstepSummary.from_dict(s.to_dict()) == s
     assert "ticks=3 beats=2/3 beat_channels=planner/jackal" in s.short()
+
+
+def test_a_window_without_a_planner_passes_on_ticks_alone_and_still_fails_on_a_stall() -> None:
+    # a parked robot (peds_only): the engine ticks, no planner channel registers, no beat is due
+    m = LockstepMonitor()
+    engine_only = (("engine", "/arena/env_0/agent_states", 0, 0),)
+    m.observe(_status(rtf=1.0, ticks=0, channels=("engine",), counts=engine_only), 0.0)
+    m.open("parked", 1.0, beats=False)
+    m.open("driving", 1.0)
+    m.observe(_status(rtf=1.0, ticks=30, channels=("engine",), counts=(("engine", "/arena/env_0/agent_states", 30, 30),)), 2.0)
+    parked, driving = m.close("parked", 3.0), m.close("driving", 3.0)
+    assert not parked.beat_seen and parked.verdict == "pass" and not parked.beats_expected
+    assert driving.verdict == "fail"
+    assert "(none due)" in format_report([("peds_only", "hospital_1__s1", parked)]) and "(none due)" in parked.short()
+    assert LockstepSummary.from_dict(parked.to_dict()) == parked and LockstepSummary.from_dict({"active": True}).beats_expected
+    assert parked.merge(parked).beats_expected is False and parked.merge(driving).beats_expected is True
+    # a long stall or no tick at all still fails a window without a planner
+    m.open("stalled", 4.0, beats=False)
+    m.observe(_status(waiting=("engine",), ticks=30, channels=("engine",)), 5.0)
+    m.observe(_status(ticks=40, channels=("engine",)), 5.0 + STALL_FAIL_S + 1.0)
+    assert m.close("stalled", 12.0).verdict == "fail"
+    m.open("idle", 13.0, beats=False)
+    assert m.close("idle", 14.0).verdict == "fail"

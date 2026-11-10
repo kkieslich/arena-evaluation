@@ -9,6 +9,7 @@ import pytest
 
 from arena_evaluation.benchmark.config import Contest, Suite
 from arena_evaluation.benchmark.runner import (
+    drives_robot,
     _all_steps,
     _all_steps_grid,
     _default_run_id,
@@ -451,6 +452,17 @@ def test_shared_run_needs_one_explicit_run_for_every_lane():
     assert _shared_lane("tok", None, None) == (None, "--shared needs --run-id <id> for a fresh run or --resume <run_id>, shared by every lane")
     assert _shared_lane("tok", "r", None) == (lane, None)
     assert _shared_lane("tok", None, "r") == (lane, None)
+
+
+def test_planner_beats_are_due_only_when_the_robot_drives_under_a_planner():
+    parked = Suite.Stage(name="s1", episodes=1, robot="jackal", map="map1", modes={"robots": "stationary", "obstacles": "scenario"}, config={}, seed=7, timeout=60.0, optim=None)
+    assert drives_robot(_step())
+    assert drives_robot(_step(args={"mobile": {"driver": "nav2", "local_planner": "dwb"}}))
+    # the no-op mobile adapter, a parked robot, and the runner's own unhindered-peds reference drive under no planner
+    assert not drives_robot(_step(args={"mobile": "none"}))
+    assert not drives_robot(_step(stage=parked))
+    assert not drives_robot(_step(is_reference=True, reference_type="unhindered_peds"))
+    assert drives_robot(_step(is_reference=True, reference_type="unobstructed_robot"))
 
 
 def test_a_suites_record_block_parses_and_refuses_what_the_recorder_cannot_take():

@@ -27,6 +27,8 @@ class LockstepSummary:
     ticks: int = 0
     beats: int = 0
     beats_due: int = 0
+    #: False for a robot that drives under no planner (parked, or the no-op mobile adapter): no planner beat is due
+    beats_expected: bool = True
 
     @property
     def beat_channels(self) -> tuple[str, ...]:
@@ -40,7 +42,9 @@ class LockstepSummary:
     def verdict(self) -> str:
         if not self.active:
             return "inactive"
-        if self.max_stall_s >= STALL_FAIL_S or not self.beat_seen or self.ticks == 0 or self.beats == 0:
+        if self.max_stall_s >= STALL_FAIL_S or self.ticks == 0:
+            return "fail"
+        if self.beats_expected and (not self.beat_seen or self.beats == 0):
             return "fail"
         return "pass"
 
@@ -57,11 +61,15 @@ class LockstepSummary:
             ticks=self.ticks + other.ticks,
             beats=self.beats + other.beats,
             beats_due=self.beats_due + other.beats_due,
+            beats_expected=self.beats_expected or other.beats_expected,
         )
 
     def short(self) -> str:
         channels = ",".join(self.beat_channels) or "-"
-        return f"lockstep {self.verdict}: stalls={self.stalls} max={self.max_stall_s:.1f}s rtf={self.rtf:.2f} ticks={self.ticks} beats={self.beats}/{self.beats_due} beat_channels={channels}"
+        return f"lockstep {self.verdict}: stalls={self.stalls} max={self.max_stall_s:.1f}s rtf={self.rtf:.2f} ticks={self.ticks} beats={self._beats()} beat_channels={channels}"
+
+    def _beats(self) -> str:
+        return f"{self.beats}/{self.beats_due}" if self.beats_expected else f"{self.beats}/{self.beats_due} (none due)"
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -79,6 +87,7 @@ class LockstepSummary:
             ticks=int(d.get("ticks", 0)),
             beats=int(d.get("beats", 0)),
             beats_due=int(d.get("beats_due", 0)),
+            beats_expected=bool(d.get("beats_expected", True)),
         )
 
 
@@ -128,6 +137,7 @@ class _Window:
     stalled_on: set[str] = dataclasses.field(default_factory=set)
     stall_since: float | None = None
     env: str = ""
+    beats_expected: bool = True
     base: _Counters = dataclasses.field(default_factory=_Counters)
     folded: _Counters = dataclasses.field(default_factory=_Counters)
 
@@ -180,10 +190,11 @@ class LockstepMonitor:
                     if msg.active and msg.measured_rtf > 0.0:
                         w.rtf_samples.append(float(msg.measured_rtf))
 
-    def open(self, key: object, now: float, env: str = "") -> None:
-        """env scopes the beat counts to channels whose topic lies under that namespace."""
+    def open(self, key: object, now: float, env: str = "", beats: bool = True) -> None:
+        """env scopes the beat counts to channels whose topic lies under that namespace; `beats` False for a window whose
+        robot drives under no planner, so its verdict asks for ticks and no long stall but no planner beat."""
         with self._lock:
-            w = _Window(active=self._active, channels=set(self._channels), env=env, base=self._counters)
+            w = _Window(active=self._active, channels=set(self._channels), env=env, beats_expected=beats, base=self._counters)
             if self._waiting:
                 w.stalled_on |= self._waiting
                 w.stall_since = now
@@ -207,6 +218,7 @@ class LockstepMonitor:
                 ticks=delta.ticks,
                 beats=sum(delta.received[t] for t in beat_topics),
                 beats_due=sum(delta.due[t] for t in beat_topics),
+                beats_expected=w.beats_expected,
             )
 
 
@@ -229,7 +241,7 @@ def format_report(rows: typing.Sequence[tuple[str, str, LockstepSummary]]) -> st
             f"{s.max_stall_s:.1f}",
             f"{s.rtf:.2f}",
             str(s.ticks),
-            f"{s.beats}/{s.beats_due}",
+            s._beats(),
             ",".join(s.beat_channels) or "-",
             ",".join(s.stalled_on) or "-",
         )
