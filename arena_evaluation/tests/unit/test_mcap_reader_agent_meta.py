@@ -67,7 +67,9 @@ def test_arena_peds_record_each_pedestrians_radius(tmp_path: pathlib.Path) -> No
     peds.header.frame_id = "map"
     out = tmp_path / "out"
     MCAPReader(_bag(tmp_path, peds, _PEDS, "arena_people_msgs/msg/Pedestrians")).read(out)
-    assert pq.read_table(out / "env_2" / "peds.parquet").column("peds_radii").to_pylist() == [[0.325]]
+    # the message field is a float32: 0.325 comes back as 0.32499998807907104
+    (radii,) = pq.read_table(out / "env_2" / "peds.parquet").column("peds_radii").to_pylist()
+    assert radii == [pytest.approx(0.325, rel=1e-6)]
 
 
 @pytest.mark.skipif(_PEDS_HAVE_RADIUS, reason="arena_people_msgs built with Pedestrian.radius")
