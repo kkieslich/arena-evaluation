@@ -8,7 +8,7 @@ Runs multi-planner benchmark campaigns: spawns simulation environments, drives e
 |---|---|
 | `runner.py` | `BenchmarkRunner`: spawns environments, executes episodes via `RunEpisode`, writes `progress.csv` and `.benchmark_state.json` |
 | `config.py` | `Suite` and `Contest` parsers: YAML schema, the suite's `task_layer`, stage `modes` per axis, sweep expansion, inline contest resolution |
-| `state.py` | `Manifest`, `RunDir`, `StateFile`: run manifest, config hash, resume discovery, git SHA capture |
+| `state.py` | `Manifest`, `RunDir`, `StateFile`: run manifest, config hash, resume discovery, the commits a run depends on |
 | `step.py` | `Step`, `StepResult`, `StepErrorKind`: grid model for contestant x stage combinations |
 | `debug.py` | Process introspection: `running_processes()`, `tail_console()`, `console_log_path()` |
 | `profiler.py` | `PipelineProfiler`: CPU, GPU, RAM, duration metrics |
@@ -37,7 +37,7 @@ For each group:
 Run output structure in `$ARENA_DATA_DIR/benchmarks/<run_id>/`:
 ```
 <run_id>/
-|-- manifest.yaml              # Config snapshot
+|-- manifest.yaml              # Config snapshot and the commits the run depends on (`commits`)
 |-- progress.csv               # Append-only, one row per episode
 |-- superseded_progress.csv    # Rows of a step's earlier attempts, kept out of progress.csv
 |-- runner.log                 # Python logging and launch output
@@ -51,6 +51,12 @@ Run output structure in `$ARENA_DATA_DIR/benchmarks/<run_id>/`:
 |-- combined_metrics.parquet   # Processed metrics
 `-- report_manifest.yaml       # Used report manifest
 ```
+
+`commits` in `manifest.yaml` holds the checkouts as the runner's process sees them (`state.capture_commits`):
+- `arena`: the Arena checkout (the superproject of arena_evaluation's checkout, else found from the install up, or its `src/Arena`); `arena_git_sha` and `arena_git_dirty` repeat it.
+- `humansim`, `arena_evaluation`: the checkout of the code that runs (its Python module's, `arena_humansim` and `arena_evaluation`, symlinks resolved; else the Arena submodule's), and `pinned`, the commit Arena's HEAD pins that submodule at.
+- Each is `path`, `commit` and `dirty` (`git status` lists anything); what git cannot read is null, with a `reason`.
+- Manifests written before it have no `commits`.
 
 ## Liveness
 

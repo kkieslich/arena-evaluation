@@ -70,7 +70,7 @@ from .progress_display import BenchmarkProgressDisplay
 from .state import (
     Manifest,
     RunDir,
-    capture_git_sha,
+    capture_commits,
     compute_config_hash,
     find_most_recent_resumable,
 )
@@ -2546,7 +2546,8 @@ def cli_main(argv: list[str] | None = None) -> int:
         if fresh is not None:
             suite_dict, contest_dict, suite_provenance, contest_provenance, cfg_hash = fresh
             run_id = args.run_id or _default_run_id(args.suite, args.contest, os.environ.get("ARENA_LANE"))
-            sha, dirty = capture_git_sha(share.parent.parent.parent)
+            commits = capture_commits(share.parent.parent.parent)
+            sha, dirty = commits["arena"]["commit"], bool(commits["arena"]["dirty"])
             steps_list = [
                 {
                     "key": c.key,
@@ -2577,6 +2578,7 @@ def cli_main(argv: list[str] | None = None) -> int:
                 launch_args=dict(arena_passthrough),
                 suite_provenance=suite_provenance,
                 contest_provenance=contest_provenance,
+                commits=commits,
             )
             run_dir = RunDir.create(data_root, run_id, manifest, lane=lane)
     except FileNotFoundError as exc:
