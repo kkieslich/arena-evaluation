@@ -154,7 +154,9 @@ def test_process_episode_with_the_flow_measures_gives_the_flow_columns_and_track
     assert flow_row["flow_peds"] == full_row["flow_peds"] == 2
     assert flow_row["flow_object_uses"] == full_row["flow_object_uses"]
     assert set(flow_row) < set(full_row)
-    tracks = "topics/.derived/ped_tracks.v1/env_0.parquet"
+    from arena_evaluation.processing.ped_track_store import TRACKS_VERSION
+
+    tracks = f"topics/.derived/ped_tracks.v{TRACKS_VERSION}/env_0.parquet"
     assert pl.read_parquet(flow_dir / tracks).equals(pl.read_parquet(full_dir / tracks))
     assert TopicParquetStore.cached_tables(flow_dir / "topics") == FLOW_TABLES
     assert not (flow_dir / "topics" / "env_0_jackal" / "scan.parquet").exists()

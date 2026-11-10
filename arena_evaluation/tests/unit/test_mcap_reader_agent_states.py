@@ -63,6 +63,7 @@ def test_agent_states_nested_and_flat_layouts_read_into_identical_peds(tmp_path:
     assert flat == [
         {
             "time_ns": 2_000_000_000,
+            "stamp_ns": 2_000_000_000,
             "peds_frame_id": "map",
             "num_pedestrians": 2,
             "peds_names": ["3", "7"],
@@ -118,6 +119,7 @@ def test_agent_frames_without_humans_before_the_first_flush_keep_the_peds_schema
     assert table.slice(10_000).to_pylist() == [
         {
             "time_ns": 2_000_000_000,
+            "stamp_ns": 2_000_000_000,
             "peds_frame_id": "map",
             "num_pedestrians": 2,
             "peds_names": ["3", "7"],

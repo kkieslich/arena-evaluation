@@ -238,6 +238,7 @@ def test_arena_peds_win_over_engine_agent_states(every_topic: tuple[pathlib.Path
     assert peds == [
         {
             "time_ns": 2 * SEC,
+            "stamp_ns": 0,
             "peds_frame_id": "map",
             "num_pedestrians": 1,
             "peds_names": ["alice"],
