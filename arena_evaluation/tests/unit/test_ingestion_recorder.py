@@ -1751,6 +1751,20 @@ def test_excluded_topics_are_never_subscribed_by_key_name_or_discovery():
     assert node.subs == [] and node._topic_registry == {}
 
 
+def test_excluding_the_humans_tf_keeps_the_tf_topic():
+    from arena_evaluation.ingestion.topics import TopicDefinition, excluded_topics
+
+    # `<env>/humans/tf` ends in `tf` like `/tf`: excluding the skeleton frames must keep the robot's transforms
+    node = _bare_node()
+    node.config = {"exclude": ["tf_humans"]}
+    node.excluded = frozenset(excluded_topics(node.config))
+    assert node.excluded == {"tf_humans"}
+    assert not node._records("tf_humans", TopicDefinition("/arena/env_0/humans/tf", object))
+    assert node._records("tf", TopicDefinition("/tf", object)) and not node._excluded_name("/tf")
+    # a name part no other topic has is still excluded with its key
+    assert "arena_peds" in excluded_topics({"exclude": ["peds", "tf_humans"]}) and "tf" not in excluded_topics({"exclude": ["peds", "tf_humans"]})
+
+
 def test_read_config_takes_the_record_config_parameter(tmp_path):
     path = tmp_path / "recorder_config.yaml"
     path.write_text("record_frequencies:\n  default: 50.0\nexclude: [peds]\n")

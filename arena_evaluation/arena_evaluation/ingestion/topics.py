@@ -113,7 +113,8 @@ def merged_config(base: typing.Mapping[str, typing.Any], overrides: typing.Mappi
 
 
 def excluded_topics(config: typing.Mapping[str, typing.Any]) -> set[str]:
-    """The topic keys a config excludes, with the last name part of each one's topic (`arena_peds` for `peds`)."""
+    """The topic keys a config excludes, with the last name part of each one's topic (`arena_peds` for `peds`) when no
+    other topic's name ends in it: `tf_humans` (`<env>/humans/tf`) excludes itself, not `/tf` with it."""
     keys = set(config.get("exclude") or [])
     if not keys:
         return set()
@@ -121,4 +122,5 @@ def excluded_topics(config: typing.Mapping[str, typing.Any]) -> set[str]:
         names = {key: t.name_template.rstrip("/").rsplit("/", 1)[-1] for key, t in get_topics("", "").items()}
     except ImportError:
         names = {}
-    return keys | {names[key] for key in keys if key in names}
+    kept = {name for key, name in names.items() if key not in keys}
+    return keys | {names[key] for key in keys if key in names and names[key] not in kept}
