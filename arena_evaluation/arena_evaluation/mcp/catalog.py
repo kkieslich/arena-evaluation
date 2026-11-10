@@ -116,7 +116,7 @@ def evaluation_config_schema(kind: Literal["suite", "contest"]) -> dict[str, Any
                 "stages": "list of stages (required)",
                 "launch": "launch args for the whole run",
                 "task_layer": "task runtime name, default $ARENA_TASK_LAYER or task_generator",
-                "references": f"bool, default {config.Suite._field_defaults['references']}",
+                "references": f"bool or a list of {list(config.REFERENCE_TYPES)} (only those reference runs), default {config.Suite._field_defaults['references']}",
                 "metrics": f"metric overrides, keys {sorted(config._SUITE_METRIC_KEYS)}",
             },
             "stage_fields": {field: {"type": str(stage.__annotations__.get(field)), **({"default": jsonable(stage._field_defaults[field])} if field in stage._field_defaults else {})} for field in stage._fields},

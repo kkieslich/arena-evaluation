@@ -81,7 +81,8 @@ def plot_edit_pairs(pairs: pl.DataFrame, tests: pl.DataFrame, measure: str, out:
             if r["mean_diff"] is not None:
                 ax.plot([x + 0.2, x + 0.36], [r["mean_diff"], r["mean_diff"]], color=_INK, linewidth=2.0, solid_capstyle="round", zorder=2)
             d_z = "-" if r["d_z"] is None else f"{r['d_z']:.2f}"
-            ax.annotate(f"{_p(r['p_t_holm'] if contrasts else r['p_t'])}{' (Holm)' if contrasts else ''}\nd_z = {d_z}", xy=(x, 1.0), xycoords=("data", "axes fraction"), xytext=(0, -4), textcoords="offset points", ha="center", va="top", fontsize=7.5, color=_INK_2)
+            # the Holm-adjusted p of the row's family, as the table's p_holm
+            ax.annotate(f"{_p(r['p_t_holm'])} (Holm)\nd_z = {d_z}", xy=(x, 1.0), xycoords=("data", "axes fraction"), xytext=(0, -4), textcoords="offset points", ha="center", va="top", fontsize=7.5, color=_INK_2)
         ax.set_xticks(range(len(worlds)), [label(w, a) for w, a, _ in worlds], rotation=20, ha="right", fontsize=8, color=_INK_2)
         ax.set_xlim(-0.6, len(worlds) - 0.4)
         ax.set_title(planner, fontsize=10, color=_INK)

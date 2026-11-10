@@ -45,6 +45,25 @@ _LEGACY_MODE_PREFIX = "tm_"
 
 _IMPLICIT_SEED_EXCLUDES = ("timeout", "timeout_peds", "optim")
 
+#: The reference runs a suite's `references` can ask for: per stage and contestant the robot without pedestrians, and
+#: per stage the pedestrians without the robot (its robots parked)
+REFERENCE_TYPES = ("unobstructed_robot", "unhindered_peds")
+
+
+def parse_references(value: object) -> tuple[bool, tuple[str, ...]]:
+    """A suite's `references`: `true` (both reference runs), `false` (none), or a list of `REFERENCE_TYPES` (only those),
+    as (any reference runs, which ones in `REFERENCE_TYPES` order)."""
+    if value is None or isinstance(value, bool):
+        return bool(value), REFERENCE_TYPES if value else ()
+    names = [value] if isinstance(value, str) else value
+    if not isinstance(names, (list, tuple)) or not all(isinstance(name, str) for name in names):
+        raise ValueError(f"suite references: true, false or a list of {list(REFERENCE_TYPES)}, got {value!r}")
+    unknown = sorted(set(names) - set(REFERENCE_TYPES))
+    if unknown:
+        raise ValueError(f"suite references: unknown reference types {unknown}, known: {list(REFERENCE_TYPES)}")
+    chosen = tuple(name for name in REFERENCE_TYPES if name in names)
+    return bool(chosen), chosen
+
 
 def _layer(task_layer_key: str = "") -> TaskLayer:
     from arena_runtime.env.task_layer import task_layer
@@ -92,11 +111,13 @@ class Suite(typing.NamedTuple):
     def parse(cls, name: str, obj: dict) -> Suite:
         task_layer_key = str(obj.get("task_layer") or "")
         layer = _layer(task_layer_key)
+        references, reference_types = parse_references(obj.get("references", False))
         return cls(
             name=name,
             stages=[cls.Stage.parse(stage, layer) for stage in obj["stages"]],
             launch_args=cls._parse_launch(obj.get("launch") or {}),
-            references=bool(obj.get("references", False)),
+            references=references,
+            reference_types=reference_types,
             metrics=cls._parse_metrics(obj.get("metrics") or {}),
             task_layer=task_layer_key,
         )
@@ -182,6 +203,12 @@ class Suite(typing.NamedTuple):
     references: bool = False
     metrics: dict[str, typing.Any] = {}
     task_layer: str = ""
+    #: which reference runs `references` adds (`REFERENCE_TYPES`); a suite built with `references=True` gets both
+    reference_types: tuple[str, ...] = REFERENCE_TYPES
+
+    def adds_reference(self, reference_type: str) -> bool:
+        """Whether the runner adds the `reference_type` runs (`REFERENCE_TYPES`) to this suite's steps."""
+        return self.references and reference_type in self.reference_types
 
     @property
     def min_index(self) -> Suite.Index:

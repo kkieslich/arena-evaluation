@@ -53,6 +53,9 @@ EDIT, CONTROL, UNLABELLED = "edit", "control", "edited"
 #: The role of an edit-minus-control row: `world` the edit, `against` the control
 CONTRAST = "contrast"
 
+#: Seeds up to which tied differences get the signed-rank p by enumerating every sign flip (2^n of them)
+_MAX_ENUMERATED = 16
+
 #: `against` is the world the row subtracts (the base world, or for a contrast the control) and `base_value` its value
 PAIRS_SCHEMA = {
     "planner": pl.String,
@@ -201,14 +204,31 @@ def paired_test(diffs: Sequence[float]) -> dict[str, float | int | None]:
         out["d_z"] = mean / sd
         out["t"] = mean / (sd / math.sqrt(n))
         out["p_t"] = float(2 * stats.t.sf(abs(out["t"]), n - 1))
-    elif mean == 0:
-        out["p_t"] = 1.0
+    else:
+        # every seed the same difference (count measures can do that): 1 when it is zero, else the limit of the t-test's
+        # p as the spread goes to zero, 0, so the row stays in the Holm family; t and d_z are infinite and left out
+        out["p_t"] = 1.0 if mean == 0 else 0.0
     if any(x != 0 for x in d):
         try:
-            out["p_wilcoxon"] = float(stats.wilcoxon(d, method="exact").pvalue)
+            out["p_wilcoxon"] = float(stats.wilcoxon(d, method=_signed_rank_method(d)).pvalue)
         except ValueError:
             out["p_wilcoxon"] = None
     return out
+
+
+def _signed_rank_method(d: Sequence[float]) -> typing.Any:
+    """scipy's `method` that makes the signed-rank p exact for `d`: its exact null distribution without ties, else every
+    sign flip of the differences enumerated (exact given the tied ranks; scipy's `exact` is not, gh-19872).
+
+    Count measures (contacts, encounters) tie often. Zeros are dropped either way (Wilcoxon's zero method)."""
+    from scipy import stats
+
+    nonzero = [abs(x) for x in d if x != 0]
+    if len(set(nonzero)) == len(nonzero):
+        return "exact"
+    if len(d) > _MAX_ENUMERATED:
+        return "asymptotic"
+    return stats.PermutationMethod(n_resamples=2 ** len(d))
 
 
 def holm(p_values: Sequence[float | None]) -> list[float | None]:

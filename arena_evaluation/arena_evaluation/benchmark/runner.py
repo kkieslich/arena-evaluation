@@ -298,28 +298,26 @@ def _all_steps_grid(
                 record_dir=episodes_dir,
                 task_layer=suite.task_layer,
             )
-            if not suite.references:
-                if main_step.key in seen:
-                    raise ValueError(f"duplicate step key: {main_step.key!r}")
-                seen.add(main_step.key)
-                steps.append(main_step)
-                continue
-            ref_robot_step = Step(
-                contestant=contestant,
-                stage=stage,
-                episodes=int(round(stage.episodes * scale_episodes)),
-                record_dir=episodes_dir,
-                is_reference=True,
-                reference_type="unobstructed_robot",
-                task_layer=suite.task_layer,
-            )
-            for step in (main_step, ref_robot_step):
+            cell = [main_step]
+            if suite.adds_reference("unobstructed_robot"):
+                cell.append(
+                    Step(
+                        contestant=contestant,
+                        stage=stage,
+                        episodes=int(round(stage.episodes * scale_episodes)),
+                        record_dir=episodes_dir,
+                        is_reference=True,
+                        reference_type="unobstructed_robot",
+                        task_layer=suite.task_layer,
+                    )
+                )
+            for step in cell:
                 if step.key in seen:
                     raise ValueError(f"duplicate step key: {step.key!r}")
                 seen.add(step.key)
                 steps.append(step)
 
-    if not suite.references:
+    if not suite.adds_reference("unhindered_peds"):
         return steps
 
     dummy_peds_contestant = Contest.Contestant(name="unhindered_peds", args={})

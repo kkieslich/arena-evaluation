@@ -41,6 +41,13 @@ def _worker_init():
         pass
 
 
+def _spawn() -> multiprocessing.context.SpawnContext:
+    """The start method of the worker pools and their status manager: a forked child copies the parent's polars thread
+    pool with its locks held by threads that do not exist in the child, so it hangs on its first polars call, and keeps
+    the parent's thread count, which `_worker_init` cannot lower any more."""
+    return multiprocessing.get_context("spawn")
+
+
 def _shutdown_executor_cleanly(executor: concurrent.futures.ProcessPoolExecutor):
     """Force terminate all child worker processes without blocking on wait=True."""
     try:
@@ -764,7 +771,7 @@ class ProcessingPipeline:
 
         from .progress_display import PipelineProgressDisplay
 
-        manager = multiprocessing.Manager()
+        manager = _spawn().Manager()
         status_dict = manager.dict()
         data_root_str = str(self.folder_manager.data_root)
 
@@ -774,7 +781,7 @@ class ProcessingPipeline:
             self.workers,
             status_dict=status_dict,
         ) as display:
-            executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.workers, initializer=_worker_init)
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.workers, initializer=_worker_init, mp_context=_spawn())
             try:
                 futures = {executor.submit(_extract_worker, data_root_str, ep, force_extract, status_dict): (ep, time.perf_counter()) for ep in episodes}
                 for future in concurrent.futures.as_completed(futures):
@@ -808,7 +815,7 @@ class ProcessingPipeline:
 
         from .progress_display import PipelineProgressDisplay
 
-        manager = multiprocessing.Manager()
+        manager = _spawn().Manager()
         status_dict = manager.dict()
 
         _ctx_process = self.profiler.phase("process") if self.profiler else contextlib.nullcontext()
@@ -819,7 +826,7 @@ class ProcessingPipeline:
                 self.workers,
                 status_dict=status_dict,
             ) as display:
-                executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.workers, initializer=_worker_init)
+                executor = concurrent.futures.ProcessPoolExecutor(max_workers=self.workers, initializer=_worker_init, mp_context=_spawn())
                 try:
                     futures = {executor.submit(_process_worker, data_root_str, ep, False, status_dict): (ep, time.perf_counter()) for ep in episodes}
 
