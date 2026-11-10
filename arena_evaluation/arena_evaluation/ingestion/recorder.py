@@ -7,6 +7,7 @@ import shutil
 import signal
 import sys
 import threading
+import typing
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
@@ -27,6 +28,8 @@ from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.serialization import serialize_message
 from rosgraph_msgs.msg import Clock
 from tf2_msgs.msg import TFMessage
+
+from .topics import excluded_topics
 
 if TYPE_CHECKING:
     from arena_evaluation_msgs.srv import RecordEpisode
@@ -91,6 +94,7 @@ class _RecorderConfig(TypedDict, total=False):
     record_frequencies: dict[str, float]
     tf_frames: list[tuple[str, float]]
     optional_topics: list[str]
+    exclude: list[str]
 
 
 def copy_scenario(source: pathlib.Path, target: pathlib.Path) -> bool:
@@ -111,6 +115,9 @@ def copy_scenario(source: pathlib.Path, target: pathlib.Path) -> bool:
 
 
 class DataRecorderNode(Node, EpisodeWriter):
+    #: topic keys and topic names the run's record config leaves out (`topics.excluded_topics`)
+    excluded: frozenset[str] = frozenset()
+
     def __init__(self, **node_kwargs: Unpack[_NodeKwargs]):
         super().__init__('arena_evaluation_data_recorder', automatically_declare_parameters_from_overrides=True, **node_kwargs)
 
@@ -135,6 +142,7 @@ class DataRecorderNode(Node, EpisodeWriter):
             ("workspace_dir", ""),
             ("world.lighting", "authored"),
             ("kg.derive", "auto"),
+            ("record_config", ""),
         ]:
             if not self.has_parameter(name):
                 try:
@@ -273,6 +281,9 @@ class DataRecorderNode(Node, EpisodeWriter):
         self.config = self.read_config()
         self.freqs = self.config.get("record_frequencies", {"default": 20.0})
         self.tf_frames = [(re.compile(pattern), float(ms)) for pattern, ms in self.config.get("tf_frames", [])]
+        self.excluded = frozenset(excluded_topics(self.config))
+        if self.excluded:
+            self._log_info(f"Not recording topics {sorted(self.excluded)} (the run's record config)")
 
         self._log_info(f"Recorder ready. Episodes root: {self.episodes_root}")
         self._log_info(f"planner={self.planner!r} stage={self.stage!r} map={self.map_name!r} benchmark_id={self.benchmark_id!r}")
@@ -519,6 +530,8 @@ class DataRecorderNode(Node, EpisodeWriter):
                             break
 
     def _discover_state_topic(self, topic_name: str, types: list[str]) -> None:
+        if self._excluded_name(topic_name):
+            return
         for type_name in types:
             entry = self._state_types.get(type_name)
             if entry is None:
@@ -537,6 +550,8 @@ class DataRecorderNode(Node, EpisodeWriter):
             return
 
     def _subscribe_discovered(self, topic_name: str, msg_type: type):
+        if self._excluded_name(topic_name):
+            return
         self._register_topic(topic_name, msg_type)
         sub = self.create_subscription(msg_type, topic_name, self._create_throttled_callback(topic_name), self.qos, raw=True)
         self.subs.append(sub)
@@ -646,8 +661,16 @@ class DataRecorderNode(Node, EpisodeWriter):
         self._write_to_bag_at(topic, msg, now)
 
     def _records(self, key: str, t_def: TopicDefinition) -> bool:
-        """Default topics always, the others only when listed under optional_topics in data_recorder_config.yaml."""
+        """Default topics always, the others only when listed under optional_topics in data_recorder_config.yaml, none
+        that the config excludes."""
+        if key in self.excluded or self._excluded_name(t_def.name_template):
+            return False
         return t_def.recorded or key in self.config.get("optional_topics", [])
+
+    def _excluded_name(self, topic_name: str) -> bool:
+        """Whether a topic's last name part is an excluded topic key or an excluded topic's name (`arena_peds` for
+        `peds`), so a topic found by discovery or a backend's recorded-topics row is left out the same way."""
+        return bool(self.excluded) and topic_name.rstrip("/").rsplit("/", 1)[-1] in self.excluded
 
     def robots_fleet_callback(self, msg: RobotFleet):
         env_namespace = self.get_namespace().strip('/')
@@ -779,6 +802,8 @@ class DataRecorderNode(Node, EpisodeWriter):
                     if pattern.search(child):
                         interval_ms = ms
                         break
+                if interval_ms < 0:
+                    continue
                 key = (transform.header.frame_id, child)
                 if (now - self._tf_last_written.get(key, 0)) / 1e6 >= interval_ms:
                     self._tf_pending[key] = transform
@@ -974,7 +999,13 @@ class DataRecorderNode(Node, EpisodeWriter):
         return mapping.get(val.type, lambda v: str(v))(val)
 
     def read_config(self) -> _RecorderConfig:
-        config_path = os.path.join(self.base_dir, "config", "data_recorder_config.yaml")
+        """The `record_config` parameter's file (the benchmark runner writes one per run with a suite's `record`
+        block), else the packaged data_recorder_config.yaml."""
+        try:
+            given = str(self.get_parameter("record_config").value or "")
+        except Exception:
+            given = ""
+        config_path = given or os.path.join(self.base_dir, "config", "data_recorder_config.yaml")
         try:
             with open(config_path) as f:
                 return yaml.safe_load(f)

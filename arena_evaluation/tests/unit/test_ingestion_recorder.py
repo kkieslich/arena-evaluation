@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 from collections.abc import Callable
 
 import pytest
@@ -1714,3 +1715,56 @@ def test_start_stop_episode_service_end_to_end(tmp_path, full_node):
     assert data["outcome_state"] == 2
     assert data["outcome_info"] == "ok"
     assert data["recording_ended_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# A suite's record block: excluded topics and dropped tf frames
+# ---------------------------------------------------------------------------
+
+
+def test_a_negative_tf_interval_drops_the_frame(tmp_path):
+    import re
+
+    node = _bare_node(current_time=0)
+    node.tf_frames = [(re.compile(r"_agent_\d+$"), -1.0), *node.tf_frames]
+    read = _tf_bag(node, tmp_path)
+    for step in range(0, 100_000_001, 20_000_000):
+        node.current_time = step
+        node._tf_callback(_tf_message(("map", "body_env_0_agent_2", 0.0), ("body_env_0_agent_2", "l_p_collar_env_0_agent_2", 0.0), ("env_0/jackal_0/odom", "env_0/jackal_0/base_link", 1.0)))
+        node._flush_tf(step)
+    writes = _tf_writes(read())
+    assert writes and all(set(frames) == {"env_0/jackal_0/base_link"} for _, frames in writes)
+
+
+def test_excluded_topics_are_never_subscribed_by_key_name_or_discovery():
+    from arena_evaluation.ingestion.topics import TopicDefinition, excluded_topics
+
+    node = _bare_node()
+    node.config = {"exclude": ["peds", "animation_states"]}
+    node.excluded = frozenset(excluded_topics(node.config))
+    assert {"peds", "arena_peds", "animation_states"} <= node.excluded
+    assert not node._records("peds", TopicDefinition("/arena/env_0/arena_peds", object))
+    assert not node._records("whatever", TopicDefinition("/arena/env_0/animation_states", object))
+    assert node._records("agent_states", TopicDefinition("/arena/env_0/arena_env_node/agent_states", object))
+    node._subscribe_discovered("/arena/env_0/arena_peds", object)
+    node._discover_state_topic("/arena/env_0/animation_states", ["x"])
+    assert node.subs == [] and node._topic_registry == {}
+
+
+def test_read_config_takes_the_record_config_parameter(tmp_path):
+    path = tmp_path / "recorder_config.yaml"
+    path.write_text("record_frequencies:\n  default: 50.0\nexclude: [peds]\n")
+    node = _bare_node(base_dir=str(tmp_path / "missing"))
+    node.get_parameter = lambda name: SimpleNamespace(value=str(path) if name == "record_config" else "")
+    assert node.read_config() == {"record_frequencies": {"default": 50.0}, "exclude": ["peds"]}
+
+
+def test_merged_config_puts_the_suite_block_over_the_packaged_config():
+    from arena_evaluation.ingestion.topics import merged_config
+
+    base = {"record_frequencies": {"default": 20.0, "peds": 20.0}, "tf_frames": [["^body_env_\\d+_agent_\\d+$", 0.0]], "exclude": ["lidar"]}
+    out = merged_config(base, {"exclude": ["peds", "lidar"], "tf_frames": [["_agent_\\d+$", -1.0]], "frequencies": {"agent_states": 100.0}})
+    assert out["exclude"] == ["lidar", "peds"]
+    assert out["tf_frames"] == [["_agent_\\d+$", -1.0], ["^body_env_\\d+_agent_\\d+$", 0.0]]
+    assert out["record_frequencies"] == {"default": 20.0, "peds": 20.0, "agent_states": 100.0}
+    assert merged_config(base, {}) == base
