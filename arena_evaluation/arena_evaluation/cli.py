@@ -198,14 +198,14 @@ Examples:
     groups_input.add_argument("--run-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Episode directories with a metrics.parquet")
     edits_parser = subparsers.add_parser(
         "edits",
-        help="Each robot measure of an edited world minus its base world at the same seed, per planner, with a paired test across seeds; writes edit_pairs.parquet and edit_tests.csv.",
+        help="Each robot measure of an edited world minus its base world at the same seed, and of an edit minus each of its controls (with --split, the H2 test), per planner, with a paired test across seeds; writes edit_pairs.parquet and edit_tests.csv.",
     )
     edits_input = edits_parser.add_mutually_exclusive_group(required=False)
     edits_input.add_argument("--benchmark-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Benchmark directories with a combined_metrics.parquet")
     edits_input.add_argument("--run-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Episode directories with a metrics.parquet")
-    edits_parser.add_argument("--split", type=pathlib.Path, default=None, help="FLOWEDIT split whose control_worlds label the edited worlds edit or control")
+    edits_parser.add_argument("--split", type=pathlib.Path, default=None, help="FLOWEDIT split whose control_worlds label the edited worlds edit or control and give the edit-minus-control contrasts")
     edits_parser.add_argument("--measure", action="append", default=None, help="a measure to pair (repeatable, default: personal_space_time, its integral, intimate time, encounters, contacts, path length)")
-    edits_parser.add_argument("--plot", action="store_true", help="also save plots/edit_pairs_<first measure>.png")
+    edits_parser.add_argument("--plot", action="store_true", help="also save plots/edit_pairs_<first measure>.png and, with contrasts, plots/edit_contrasts_<first measure>.png")
 
     from arena_evaluation.cli_acoustic import setup_acoustic_subparsers
 

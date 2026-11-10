@@ -9,12 +9,15 @@ import pytest
 
 from arena_evaluation import cli
 from arena_evaluation.processing.edit_pairs import (
+    CONTRAST,
     CONTROL,
     EDIT,
     EDIT_PAIRS_FILE,
     EDIT_TESTS_FILE,
     PAIRS_SCHEMA,
     TESTS_SCHEMA,
+    contrast_table,
+    controls_from_split,
     edit_tests,
     episode_table,
     format_tests,
@@ -93,6 +96,9 @@ def test_the_paired_test_matches_scipy_and_gives_d_z_and_the_t_interval():
     assert (test["ci_low"], test["ci_high"]) == pytest.approx((13.0 - half, 13.0 + half))
     # five seeds all one way: the exact signed-rank test cannot go below 2 / 2^5
     assert test["p_wilcoxon"] == pytest.approx(0.0625)
+    # every seed the same non-zero difference: p 0 (the t-test's limit), so the row stays in Holm's family
+    same = paired_test([2.0, 2.0, 2.0])
+    assert same["p_t"] == 0.0 and same["t"] is None and same["d_z"] is None and holm([same["p_t"], 0.04]) == pytest.approx([0.0, 0.04])
     assert paired_test([0.0, 0.0])["p_t"] == 1.0 and paired_test([0.0, 0.0])["p_wilcoxon"] is None
     assert paired_test([3.0])["mean_diff"] == 3.0 and paired_test([3.0])["p_t"] is None
     assert paired_test([])["n"] == 0
@@ -161,9 +167,12 @@ def test_the_edits_command_prints_writes_and_plots(tmp_path: pathlib.Path, monke
     assert "personal_space_time: edited world minus base world" in out and "path_length:" in out
     pairs = pl.read_parquet(run / EDIT_PAIRS_FILE)
     assert set(pairs["measure"].to_list()) == {"personal_space_time", "time_in_intimate_zone", "path_length"}
-    assert pl.read_csv(run / EDIT_TESTS_FILE)["role"].unique().sort().to_list() == [CONTROL, EDIT]
-    figure = run / "plots" / "edit_pairs_personal_space_time.png"
-    assert figure.is_file() and figure.stat().st_size > 10_000
+    assert pl.read_csv(run / EDIT_TESTS_FILE)["role"].unique().sort().to_list() == [CONTRAST, CONTROL, EDIT]
+    # the H2 contrasts print first
+    assert out.index("function-carrying edit minus geometry-only control") < out.index("edited world minus base world")
+    for name in ("edit_pairs", "edit_contrasts"):
+        figure = run / "plots" / f"{name}_personal_space_time.png"
+        assert figure.is_file() and figure.stat().st_size > 10_000
 
 
 def test_the_edits_command_fails_without_pairs(tmp_path: pathlib.Path, monkeypatch, capsys):
@@ -172,3 +181,48 @@ def test_the_edits_command_fails_without_pairs(tmp_path: pathlib.Path, monkeypat
     _frame([_row("dwb", BASE, 1, 1.0, 2.0)]).write_parquet(run / "combined_metrics.parquet")
     assert _cli(monkeypatch, "edits", "--benchmark-dir", str(run)) == 1
     assert "No edit/base pairs" in capsys.readouterr().out and not (run / EDIT_PAIRS_FILE).exists()
+
+
+LEAVE = "hospital_1__move_fountain_leave_demand__66723c25"
+TWO_CONTROLS = {"control_worlds": {MOVE: [INERT, LEAVE]}}
+# the model moved without its demand: +2 s at every seed (plus 0..1 s), next to ROWS' move (+11..15 s) and inert copy (+-1 s)
+CONTRAST_ROWS = [*ROWS, *(_row("dwb", LEAVE, s, 1.0, 22.0 + s + 0.25 * s) for s in range(1, 6))]
+
+
+def test_each_edit_minus_each_of_its_controls_at_the_same_seed_and_planner():
+    episodes = episode_table(_frame(CONTRAST_ROWS), ["personal_space_time"])
+    assert controls_from_split(TWO_CONTROLS) == {MOVE: [INERT, LEAVE]} and controls_from_split({}) == {}
+    rows = contrast_table(episodes, controls_from_split(TWO_CONTROLS))
+    assert dict(rows.schema) == PAIRS_SCHEMA and set(rows["role"].to_list()) == {CONTRAST}
+    assert rows.select("world", "against").unique(maintain_order=True).rows() == [(MOVE, INERT), (MOVE, LEAVE)]
+    assert set(rows["base"].to_list()) == {BASE}
+    # the contrast is the edit's difference to the base minus the control's, the base cancels
+    pairs = pair_table(episodes, roles_from_split(TWO_CONTROLS))
+    for control in (INERT, LEAVE):
+        got = rows.filter(pl.col("against") == control).sort("seed")["diff"].to_list()
+        edit = pairs.filter(pl.col("world") == MOVE).sort("seed")["diff"].to_list()
+        ctl = pairs.filter(pl.col("world") == control).sort("seed")["diff"].to_list()
+        assert got == pytest.approx([e - c for e, c in zip(edit, ctl, strict=True)])
+    assert pairs["against"].unique().to_list() == [BASE]
+    # a control without a run at a seed, or no control at all, gives no row
+    assert contrast_table(episodes.filter(~((pl.col("world") == LEAVE) & (pl.col("seed") == 3))), {MOVE: [LEAVE]})["seed"].to_list() == [1, 2, 4, 5]
+    assert contrast_table(episodes, {}).is_empty()
+
+
+def test_the_h2_contrasts_are_holm_adjusted_apart_from_the_rows_against_the_base():
+    episodes = episode_table(_frame(CONTRAST_ROWS), ["personal_space_time"])
+    pairs = pl.concat([contrast_table(episodes, controls_from_split(TWO_CONTROLS)), pair_table(episodes, roles_from_split(TWO_CONTROLS))])
+    tests = edit_tests(pairs)
+    assert dict(tests.schema) == TESTS_SCHEMA
+    by = {(r["world"], r["against"]): r for r in tests.iter_rows(named=True)}
+    contrasts = [by[(MOVE, INERT)], by[(MOVE, LEAVE)]]
+    against_base = [by[(MOVE, BASE)], by[(INERT, BASE)], by[(LEAVE, BASE)]]
+    assert all(r["role"] == CONTRAST for r in contrasts) and {r["role"] for r in against_base} == {EDIT, CONTROL}
+    # two contrasts in their family, three rows against the base in theirs
+    assert [r["p_t_holm"] for r in contrasts] == pytest.approx(holm([r["p_t"] for r in contrasts]))
+    assert [r["p_t_holm"] for r in against_base] == pytest.approx(holm([r["p_t"] for r in against_base]))
+    move_inert = by[(MOVE, INERT)]
+    assert move_inert["mean_diff"] == pytest.approx(13.0 - (-0.2)) and move_inert["p_t"] < 0.001 and move_inert["base_mean"] == pytest.approx(by[(INERT, BASE)]["mean"])
+    text = format_tests(tests)
+    assert text.startswith("personal_space_time: function-carrying edit minus geometry-only control, paired by seed (H2)")
+    assert "move_fountain_leave_demand" in text and "edited world minus base world" in text
