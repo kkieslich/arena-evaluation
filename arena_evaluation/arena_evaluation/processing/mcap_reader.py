@@ -530,7 +530,6 @@ class MCAPReader:
         """
         wanted = None if tables is None else frozenset(tables)
         keep_tf = wanted is None or "tf" in wanted
-        skipped: dict[int, bool] = {}
         if self.data_path.is_dir():
             mcap_files = sorted(list(self.data_path.glob("*.mcap")))
             if not mcap_files:
@@ -641,6 +640,8 @@ class MCAPReader:
 
                     msg_count = 0
                     decoders = {}
+                    # channel ids are per file, like the decoders
+                    skipped: dict[int, bool] = {}
                     collision_kind_schema_cache: dict[int, bool] = {}
                     phases_schema_cache: dict[int, bool] = {}
                     integrity_schema_cache: dict[int, bool] = {}
