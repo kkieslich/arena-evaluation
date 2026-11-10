@@ -25,6 +25,9 @@ if typing.TYPE_CHECKING:
     from arena_runtime_msgs.msg import EpisodeRecord
 
 SUPERSEDED_PROGRESS = "superseded_progress.csv"
+#: the packages whose commits a run records beside Arena's: (name, the Python module that runs it, its submodule path in the
+#: Arena tree, the fallback when the module lies in no git checkout)
+RUN_PACKAGES = (("humansim", "arena_humansim", "humansim"), ("arena_evaluation", "arena_evaluation", "arena_evaluation"))
 
 
 def compute_config_hash(suite: object, contest: object) -> str:
@@ -87,6 +90,96 @@ def capture_git_sha(workspace: pathlib.Path) -> tuple[str | None, bool]:
         return None, False
 
 
+def _git(cwd: pathlib.Path, *args: str) -> str | None:
+    """git's stdout in `cwd`, None when it fails."""
+    try:
+        out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def git_checkout(path: pathlib.Path) -> pathlib.Path | None:
+    """The git work tree holding `path`: the nearest directory from it up with a `.git` (a file in a submodule), None without."""
+    path = pathlib.Path(path).resolve()
+    for d in [path, *path.parents] if path.is_dir() else path.parents:
+        if (d / ".git").exists():
+            return d
+    return None
+
+
+def module_origin(module: str) -> pathlib.Path | None:
+    """Where the installed Python package `module` lies, symlinks resolved (colcon's symlink install points into the
+    checkout), without importing it; None when it is not installed."""
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec(module)
+    except (ImportError, ValueError):
+        return None
+    if spec is None:
+        return None
+    origin = spec.origin if spec.origin not in (None, "namespace") else next(iter(spec.submodule_search_locations or []), None)
+    return None if origin is None else pathlib.Path(origin).resolve()
+
+
+def commit_of(checkout: pathlib.Path | None, missing: str) -> dict:
+    """{path, commit, dirty} of a git checkout, `git status` listing anything for dirty; what git cannot read is null,
+    with a `reason` (`missing` without a checkout)."""
+    if checkout is None:
+        return {"path": None, "commit": None, "dirty": None, "reason": missing}
+    sha = _git(checkout, "rev-parse", "HEAD")
+    if sha is None:
+        return {"path": str(checkout), "commit": None, "dirty": None, "reason": f"git rev-parse HEAD failed in {checkout}"}
+    status = _git(checkout, "status", "--porcelain")
+    if status is None:
+        return {"path": str(checkout), "commit": sha, "dirty": None, "reason": f"git status failed in {checkout}"}
+    return {"path": str(checkout), "commit": sha, "dirty": bool(status)}
+
+
+def _pinned(arena: pathlib.Path, checkout: pathlib.Path) -> str | None:
+    """The commit Arena's HEAD pins the submodule at `checkout` at, None when it is no submodule of it."""
+    rel = os.path.relpath(checkout.resolve(), arena.resolve())
+    if rel.startswith(".."):
+        return None
+    line = (_git(arena, "ls-tree", "HEAD", rel) or "").split()
+    return line[2] if len(line) >= 3 and line[1] == "commit" else None
+
+
+def capture_commits(start: pathlib.Path, origin_of: typing.Callable[[str], pathlib.Path | None] = module_origin) -> dict[str, dict]:
+    """The commits a run depends on, as this process sees them (`Manifest.commits`).
+
+    - `arena`: the Arena checkout, the superproject of arena_evaluation's checkout, else found from `start` up (or its
+      `src/Arena`).
+    - one entry per RUN_PACKAGES package: the checkout of the code that runs, its Python module's, else the Arena
+      submodule's; `pinned` is the commit Arena's HEAD pins that submodule at.
+    Each is {path, commit, dirty}, null with a `reason` where git cannot read it.
+    """
+    from ..ingestion.metadata import IngestionMetadata
+
+    own = origin_of("arena_evaluation")
+    own_checkout = git_checkout(own) if own is not None else None
+    above = _git(own_checkout, "rev-parse", "--show-superproject-working-tree") if own_checkout is not None else None
+    arena = pathlib.Path(above) if above else git_checkout(pathlib.Path(IngestionMetadata.resolve_git_workspace(str(start))))
+    out = {"arena": commit_of(arena, f"no git checkout above {start} (or its src/Arena), and arena_evaluation ({own}) is no submodule of one")}
+    for name, module, sub in RUN_PACKAGES:
+        origin = origin_of(module)
+        checkout = git_checkout(origin) if origin is not None else None
+        if checkout is None and arena is not None and (arena / sub / ".git").exists():
+            checkout = arena / sub
+        where = f"module {module} at {origin}" if origin is not None else f"module {module} not installed"
+        entry = commit_of(checkout, f"no git checkout holds it ({where}" + ("" if arena is None else f", nor is {arena / sub} one") + ")")
+        if arena is not None and checkout is not None:
+            entry["pinned"] = _pinned(arena, checkout)
+        out[name] = entry
+    return out
+
+
+def _revisions(commits: dict | None) -> dict:
+    """Commit and dirty flag per checkout, what lanes of one run must agree on."""
+    return {k: (v.get("commit"), v.get("dirty")) for k, v in (commits or {}).items() if isinstance(v, dict)}
+
+
 @dataclasses.dataclass
 class Manifest:
     run_id: str
@@ -107,6 +200,8 @@ class Manifest:
     launch_args: dict = dataclasses.field(default_factory=dict)
     suite_provenance: dict | None = None
     contest_provenance: dict | None = None
+    #: the checkouts the run depends on (`capture_commits`); None in manifests written before it was recorded
+    commits: dict | None = None
 
     def to_yaml(self) -> str:
         return yaml.dump(dataclasses.asdict(self), allow_unicode=True, sort_keys=False)
@@ -517,6 +612,8 @@ class RunDir:
             existing = Manifest.from_yaml(manifest_path.read_text())
             if existing.config_hash != manifest.config_hash:
                 raise ManifestMismatchError(f"run dir {path} was created with config_hash {existing.config_hash}, lane {lane!r} has {manifest.config_hash}") from None
+            if manifest.commits is not None and _revisions(existing.commits) != _revisions(manifest.commits):
+                logging.getLogger(__name__).warning("run dir %s records commits %s, lane %r runs %s", path, _revisions(existing.commits), lane, _revisions(manifest.commits))
             manifest = existing
         finally:
             tmp.unlink()
