@@ -115,6 +115,28 @@ The pooled divergence is the primary score: it measures the systematic flow chan
 | `heading_rad` | centre of the walking-direction bin, None for standing |
 | `ped_seconds` | pedestrian-seconds in the cell and bin |
 
+## INFRA measures (`evaluation infra`)
+
+`processing/infra.py` scores runs of kkieslich/Arena's `flowedit infra` suites after `evaluation process`, from each
+episode's fleet task log (`topics/semantic_snapshot.parquet`, kind `fleet`) and the track store. One row per layout
+and seed goes to `infra_layouts.parquet`; per layout, every measure is the equal-weight mean over its seeds.
+
+| Measure | Definition |
+|---|---|
+| `task_time_s` (T) | Restricted mean task time up to `task_time_tau_s`: the area under the Kaplan-Meier curve of the time from a job's release to its completion, over the jobs released after the warm-up. A completed job counts at `ended - released`. A failed or abandoned one is censored at `ended - released`, and one still open at the episode end at `episode_s - released`: their task time is known only to exceed that. The horizon is one value per study (`--tau`, default the episode minus the warm-up, 1080 s for INFRA's 25 min with 7 min warm-up). At a tie, completions go before censorings; past the last time the curve stays at its last value. §6's equal-service rule (T <= 1.05 T(robot-only)) and §12's comparison use this T. |
+| `task_time_completed_s` | The plain mean of `ended - released` over the completed jobs: reported, not scored. It drops the jobs an episode cuts off, which are the slow ones. |
+| `completed_share`, `censored_share` | Completed jobs, and jobs not completed (open, failed, abandoned), over the jobs released after the warm-up. |
+| `success_rate`, `jam_share` | Completed jobs, and jobs failed with reason `jam`, over the jobs that ended. A layout with `jam_share` over 0.2 is dropped from the pick (§8). |
+| `assign_wait_s`, `dock_wait_s` | Mean time a completed job waited for a robot (`assigned - released`) and its robot held in place before busy docks (`wait_s`); both are part of T. |
+| `charger_queue_s`, `charge_s`, `tasks_per_h`, `empty_batteries` | Mean `dispatched - queued` of charges queued after the warm-up, seconds charged, completed jobs per hour of the scored time, batteries that reached 0 %. |
+| `C_<group>`, `C_<group>_element`, `C_<group>_traffic` | Extra travel time over the group's travel time in the site as is (a ratio of sums), through-walkers paired by `source_name#source_seq`, spawned after the warm-up and finished in all three runs; element = layout without robots vs the site, traffic = with robots vs without, total = element + traffic. |
+| `c_worst`, `worst_group` | The largest `C_<group>` and its group. |
+| `visitor_<group>_*` | Locker visitors (sources `<end>_locker_<group>`): count, walk without robots, traffic part. |
+
+A stage with more than one usable run in a benchmark (a retried step whose failed attempt kept a recording) is refused
+with its episodes named; rows of status `error` or `no_recording` and reference rows other than `unhindered_peds` are
+left out.
+
 ## Mechanism metrics (mechanisms)
 
 Robot behaviour at doors, elevators and alarms, replayed from the episode's `semantic_snapshot`
