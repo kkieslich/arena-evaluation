@@ -90,6 +90,9 @@ Examples:
   # Print each pedestrian measure per group (mean over seeds) and write ped_groups.parquet:
   evaluation groups --benchmark-dir /opt/arena_ws/data/my_benchmark
 
+  # Each robot measure of an edited world minus its base world per planner and seed, paired tests, one figure:
+  evaluation edits --benchmark-dir /opt/arena_ws/data/my_benchmark --split h2_planners.yaml --plot
+
   # With no input dir, operate on the most recent benchmark under $ARENA_DATA_DIR/benchmarks:
   evaluation run
 """,
@@ -186,6 +189,16 @@ Examples:
     groups_input = groups_parser.add_mutually_exclusive_group(required=False)
     groups_input.add_argument("--benchmark-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Benchmark directories with a combined_metrics.parquet")
     groups_input.add_argument("--run-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Episode directories with a metrics.parquet")
+    edits_parser = subparsers.add_parser(
+        "edits",
+        help="Each robot measure of an edited world minus its base world at the same seed, per planner, with a paired test across seeds; writes edit_pairs.parquet and edit_tests.csv.",
+    )
+    edits_input = edits_parser.add_mutually_exclusive_group(required=False)
+    edits_input.add_argument("--benchmark-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Benchmark directories with a combined_metrics.parquet")
+    edits_input.add_argument("--run-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Episode directories with a metrics.parquet")
+    edits_parser.add_argument("--split", type=pathlib.Path, default=None, help="FLOWEDIT split whose control_worlds label the edited worlds edit or control")
+    edits_parser.add_argument("--measure", action="append", default=None, help="a measure to pair (repeatable, default: personal_space_time, its integral, intimate time, encounters, contacts, path length)")
+    edits_parser.add_argument("--plot", action="store_true", help="also save plots/edit_pairs_<first measure>.png")
 
     from arena_evaluation.cli_acoustic import setup_acoustic_subparsers
 
@@ -232,6 +245,11 @@ Examples:
         from arena_evaluation.processing.ped_groups import groups_command
 
         return groups_command(target_dirs)
+
+    if args.command == "edits":
+        from arena_evaluation.processing.edit_pairs import edits_command
+
+        return edits_command(target_dirs, args.split, args.measure, args.plot)
 
     profiler = None
     if args.profile:
