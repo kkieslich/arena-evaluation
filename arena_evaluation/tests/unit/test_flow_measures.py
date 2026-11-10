@@ -91,6 +91,19 @@ def test_divergence_is_zero_for_the_same_flow_and_one_for_disjoint_flow() -> Non
     assert jsd(a, GRID.empty()) is None
 
 
+def test_divergence_stays_finite_with_denormal_shares() -> None:
+    # half of the smallest denormal rounds to 0, so (a + b) / 2 can vanish where a holds mass
+    a, b = np.array([1.0, 5e-324]), np.array([1.0, 0.0])
+    assert jsd(a, b) == pytest.approx(0.0, abs=1e-12) and jsd(b, a) == pytest.approx(0.0, abs=1e-12)
+    rng = np.random.default_rng(0)
+    p, q = rng.random(200), rng.random(200)
+    p[rng.random(200) < 0.3] = 0.0
+    p, q = p / p.sum(), q / q.sum()
+    m = (p + q) / 2
+    textbook = 0.5 * sum(x * np.log2(x / y) for x, y in zip(p, m, strict=True) if x > 0) + 0.5 * sum(x * np.log2(x / y) for x, y in zip(q, m, strict=True) if x > 0)
+    assert jsd(p, q) == pytest.approx(textbook)
+
+
 def test_pooling_averages_each_seed_as_a_share() -> None:
     a = GRID.counts(_tracks(_stand("a", 0.25, 0.25)))
     b = GRID.counts(_tracks(_stand("a", 3.75, 1.75, seconds=6.0)))
