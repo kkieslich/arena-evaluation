@@ -93,6 +93,9 @@ Examples:
   # Each robot measure of an edited world minus its base world per planner and seed, paired tests, one figure:
   evaluation edits --benchmark-dir /opt/arena_ws/data/my_benchmark --split h2_planners.yaml --plot
 
+  # INFRA: service and cost per layout, the premise check, the pick, the comparison (see processing/infra.py):
+  evaluation infra pick --site <site run> --layouts <selection run> --manifest <suites>/infra_h1.layouts.json
+
   # With no input dir, operate on the most recent benchmark under $ARENA_DATA_DIR/benchmarks:
   evaluation run
 """,
@@ -201,10 +204,21 @@ Examples:
     edits_parser.add_argument("--plot", action="store_true", help="also save plots/edit_pairs_<first measure>.png")
 
     from arena_evaluation.cli_acoustic import setup_acoustic_subparsers
+    from arena_evaluation.processing.infra import add_infra_parser
 
     setup_acoustic_subparsers(subparsers)
+    add_infra_parser(subparsers)
 
     args = parser.parse_args()
+
+    if args.command == "infra":
+        from arena_evaluation.processing.infra import infra_command
+
+        try:
+            return infra_command(args)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}")
+            return 1
 
     if args.list_manifests:
         from arena_evaluation.presentation.manifest_registry import available_manifests
