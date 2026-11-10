@@ -41,6 +41,50 @@ _STAGE_OWNED_PREFIXES = ("task.", "record.")
 
 _SUITE_METRIC_KEYS = frozenset({"max_collisions", "barn"})
 
+#: The keys of a suite's `record` block, what the recorder keeps of a run (see `parse_record`)
+RECORD_KEYS = frozenset({"exclude", "tf_frames", "frequencies"})
+
+
+def parse_record(obj: object) -> dict[str, typing.Any]:
+    """A suite's `record` block, overrides of the recorder's config (`config/data_recorder_config.yaml`) for its runs:
+
+    - `exclude`: recorder topic keys (`ingestion.topics.get_topics`) not recorded at all, e.g. `peds` (`arena_peds`,
+      which processing rebuilds from the engine's `agent_states`) or `animation_states`;
+    - `tf_frames`: `[regex, ms]` pairs matched against a transform's child frame before the config's own, a negative
+      interval drops the frame, e.g. `["_agent_\\d+$", -1]` for the pedestrians' skeleton and body frames;
+    - `frequencies`: throttle intervals in ms by topic substring, over the config's `record_frequencies`.
+    """
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        raise ValueError(f"suite record: a mapping of {sorted(RECORD_KEYS)}, got {obj!r}")
+    unknown = sorted(set(obj) - RECORD_KEYS)
+    if unknown:
+        raise ValueError(f"suite record: unknown keys {unknown}, known: {sorted(RECORD_KEYS)}")
+    out: dict[str, typing.Any] = {}
+    if "exclude" in obj:
+        exclude = obj["exclude"]
+        if not isinstance(exclude, list) or not all(isinstance(k, str) for k in exclude):
+            raise ValueError(f"suite record: exclude must be a list of topic keys, got {exclude!r}")
+        out["exclude"] = list(dict.fromkeys(exclude))
+    if "tf_frames" in obj:
+        frames = []
+        for entry in obj["tf_frames"] or []:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2 or not isinstance(entry[0], str):
+                raise ValueError(f"suite record: tf_frames entries are [regex, ms], got {entry!r}")
+            try:
+                re.compile(entry[0])
+            except re.error as exc:
+                raise ValueError(f"suite record: tf_frames regex {entry[0]!r}: {exc}") from None
+            frames.append([entry[0], float(entry[1])])
+        out["tf_frames"] = frames
+    if "frequencies" in obj:
+        freqs = obj["frequencies"]
+        if not isinstance(freqs, dict):
+            raise ValueError(f"suite record: frequencies must map topic substrings to ms, got {freqs!r}")
+        out["frequencies"] = {str(k): float(v) for k, v in freqs.items()}
+    return out
+
 _LEGACY_MODE_PREFIX = "tm_"
 
 _IMPLICIT_SEED_EXCLUDES = ("timeout", "timeout_peds", "optim")
@@ -119,6 +163,7 @@ class Suite(typing.NamedTuple):
             references=references,
             reference_types=reference_types,
             metrics=cls._parse_metrics(obj.get("metrics") or {}),
+            record=parse_record(obj.get("record")),
             task_layer=task_layer_key,
         )
 
@@ -203,6 +248,8 @@ class Suite(typing.NamedTuple):
     references: bool = False
     metrics: dict[str, typing.Any] = {}
     task_layer: str = ""
+    #: overrides of the recorder's config for this suite's runs (`parse_record`), {} for none
+    record: dict[str, typing.Any] = {}
     #: which reference runs `references` adds (`REFERENCE_TYPES`); a suite built with `references=True` gets both
     reference_types: tuple[str, ...] = REFERENCE_TYPES
 

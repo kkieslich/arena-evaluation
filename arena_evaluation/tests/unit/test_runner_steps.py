@@ -451,3 +451,32 @@ def test_shared_run_needs_one_explicit_run_for_every_lane():
     assert _shared_lane("tok", None, None) == (None, "--shared needs --run-id <id> for a fresh run or --resume <run_id>, shared by every lane")
     assert _shared_lane("tok", "r", None) == (lane, None)
     assert _shared_lane("tok", None, "r") == (lane, None)
+
+
+def test_a_suites_record_block_parses_and_refuses_what_the_recorder_cannot_take():
+    from arena_evaluation.benchmark.config import parse_record
+
+    stage = {"name": "s1", "episodes": 1, "robot": "jackal", "map": "map1", "modes": {"robots": RANDOM_ROBOTS, "obstacles": RANDOM_OBSTACLES}, "seed": 7}
+    suite = Suite.parse("suite", {"record": {"exclude": ["peds", "peds", "animation_states"], "tf_frames": [["_agent_\\d+$", -1]], "frequencies": {"agent_states": 100}}, "stages": [stage]})
+    assert suite.record == {"exclude": ["peds", "animation_states"], "tf_frames": [["_agent_\\d+$", -1.0]], "frequencies": {"agent_states": 100.0}}
+    assert Suite.parse("suite", {"stages": [stage]}).record == {}
+    for bad, match in (({"drop": []}, "unknown keys"), ({"exclude": "peds"}, "list of topic keys"), ({"tf_frames": [["(", 1]]}, "regex"), ({"tf_frames": [["a"]]}, r"\[regex, ms\]"), ({"frequencies": [1]}, "map topic substrings"), ([1], "a mapping")):
+        with pytest.raises(ValueError, match=match):
+            parse_record(bad)
+
+
+def test_the_runner_writes_the_recorder_config_of_a_suite_with_a_record_block(tmp_path: pathlib.Path):
+    import yaml
+
+    from arena_evaluation.benchmark.runner import RECORDER_CONFIG_FILE, write_recorder_config
+
+    base = tmp_path / "packaged.yaml"
+    base.write_text("record_frequencies:\n  default: 20.0\ntf_frames:\n  - ['^body_env_\\d+_agent_\\d+$', 0.0]\n")
+    assert write_recorder_config(_suite(_stage("s1")), tmp_path, base) is None
+    suite = _suite(_stage("s1"))._replace(record={"exclude": ["peds"], "tf_frames": [["_agent_\\d+$", -1.0]]})
+    out = write_recorder_config(suite, tmp_path / "run", base)
+    assert out == tmp_path / "run" / RECORDER_CONFIG_FILE
+    doc = yaml.safe_load(out.read_text())
+    assert doc["exclude"] == ["peds"] and doc["tf_frames"][0] == ["_agent_\\d+$", -1.0] and doc["record_frequencies"] == {"default": 20.0}
+    stamp = out.stat().st_mtime_ns
+    assert write_recorder_config(suite, tmp_path / "run", base) == out and out.stat().st_mtime_ns == stamp

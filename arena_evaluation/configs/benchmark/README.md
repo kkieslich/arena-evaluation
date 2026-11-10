@@ -157,6 +157,20 @@ A list adds only the reference steps it names: `references: [unhindered_peds]` a
 run with the robots parked and no `<contestant>_unobstructed_robot` runs, for a study that pairs
 pedestrians with the robot-free run but has no use for the robot alone (INFRA's layouts without robots).
 
+A suite-level `record` block changes what the recorder keeps of its runs, over
+`config/data_recorder_config.yaml`; the runner writes the merged config to `<run dir>/recorder_config.yaml` and
+starts every recorder with it:
+
+```yaml
+record:
+  exclude: [peds, animation_states]   # topic keys not recorded (arena_peds is rebuilt from the engine's agent_states)
+  tf_frames: [["_agent_\\d+$", -1]]   # [regex on the child frame, min interval ms] before the config's; < 0 drops it
+  frequencies: {agent_states: 50.0}   # throttle intervals by topic substring
+```
+
+Leave it out to record everything as before. A crowd of hundreds puts every pedestrian's skeleton on `/tf` and in
+`arena_peds`, which a study that scores only tracks, robots and semantics never reads.
+
 ### Characterization suite
 
 ```yaml
