@@ -19,6 +19,9 @@ extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` wr
   robots with the one without; all divide by the same reference travel time, so element + traffic = total.
   `C_worst` = max over groups. Locker visitors (the layout's own sources) are reported apart: their walk in the layout
   without robots and their traffic part.
+- **The premise check** (§10) on the narrowest and the widest layout: their `C_worst` gap against the seed spread,
+  over both layouts, and the task rate the selection runs at, 75 % of the fleet's measured capacity in the wide layout
+  (`RATE_ROLE`); the narrow layout's capacity is reported, its service and cost count as layout cost.
 - **The pick** (§5, §6): among the joint top 10, the layout with the lowest `C_worst` whose `T` is at most 1.05 times
   the robot-only pick's, both as means over the selection seeds; a layout with more than 20 % of its tasks failed by
   jams is dropped (§8).
@@ -558,10 +561,19 @@ def figure(means: pl.DataFrame, picks: typing.Mapping[str, typing.Any], out: pat
     return out
 
 
-def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4) -> dict[str, typing.Any]:
+#: The premise layout whose measured fleet capacity sets the task rate: `flowedit infra premise`'s layout with every
+#: element at the widest section (its roles are `narrow` and `wide`)
+RATE_ROLE = "wide"
+
+
+def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4, rate_role: str = RATE_ROLE) -> dict[str, typing.Any]:
     """§10's premise check: the two layouts' mean `C_worst` against the seed spread (the larger of their per-seed
-    standard deviations), and the task rate at `utilisation` of the fleet's measured capacity in the slower layout:
-    robots x 3600 over (busy seconds per completed job + charging seconds per completed job)."""
+    standard deviations), and the task rate at `utilisation` of the fleet's measured capacity in the layout with role
+    `rate_role`, the wide one: robots x 3600 over (busy seconds per completed job + charging seconds per completed job).
+
+    Both layouts stay in the `C_worst` comparison, and each reports its own measured capacity; only the wide one sets the
+    rate. The narrow one's crowd cost and failed jobs are layout cost (at the study density it may complete no job at
+    all, which would give a rate of about 0). ValueError unless exactly one layout has role `rate_role`."""
     out: dict[str, typing.Any] = {"layouts": {}}
     for layout_id, sub in table.group_by("layout_id", maintain_order=True):
         c = sub["c_worst"].cast(pl.Float64).drop_nulls().to_numpy() if "c_worst" in sub.columns else np.array([])
@@ -569,10 +581,13 @@ def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4) 
         busy = sub["busy_s_per_job"].cast(pl.Float64).drop_nulls().to_numpy() if "busy_s_per_job" in sub.columns else np.array([])
         charge = float(sub["charge_s"].sum()) if "charge_s" in sub.columns else 0.0
         per_job = (float(np.mean(busy)) + (charge / completed if completed else 0.0)) if len(busy) else None
+        roles = sorted({role for value in sub["roles"].drop_nulls().to_list() for role in str(value).split(",") if role}) if "roles" in sub.columns else []
         out["layouts"][layout_id[0] if isinstance(layout_id, tuple) else layout_id] = {
+            "roles": roles,
             "c_worst": float(c.mean()) if len(c) else None,
             "c_worst_sd": float(c.std(ddof=1)) if len(c) > 1 else None,
             "seeds": len(c),
+            "jobs_completed": int(completed),
             "busy_s_per_job": per_job,
             "rate_per_h": round(utilisation * robots * 3600.0 / per_job, 2) if per_job else None,
         }
@@ -582,8 +597,12 @@ def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4) 
         spread = max((r["c_worst_sd"] or 0.0) for r in measured)
         gap = max(r["c_worst"] for r in measured) - min(r["c_worst"] for r in measured)
         out |= {"c_worst_gap": gap, "seed_spread": spread, "raise_density": bool(gap < spread)}
-    rates = [r["rate_per_h"] for r in layouts if r["rate_per_h"] is not None]
-    out["rate_per_h"] = min(rates) if rates else None
+    sets_rate = [layout_id for layout_id, r in out["layouts"].items() if rate_role in r["roles"]]
+    if len(sets_rate) != 1:
+        found = ", ".join(f"{layout_id} ({','.join(r['roles']) or 'no role'})" for layout_id, r in out["layouts"].items())
+        raise ValueError(f"the task rate comes from the premise layout with role {rate_role!r}, and {len(sets_rate)} layouts have it: {found or 'no layouts'}; read the premise suite's manifest from `flowedit infra premise`")
+    out["rate_layout"] = sets_rate[0]
+    out["rate_per_h"] = out["layouts"][sets_rate[0]]["rate_per_h"]
     return out
 
 
@@ -652,7 +671,9 @@ def infra_command(args: typing.Any) -> int:
         if result.get("raise_density"):
             print("C_worst of the two layouts differs by less than the seed spread: raise the density and rerun the premise check (§10)")
         if result.get("rate_per_h"):
-            print(f"task rate at 75 % of the measured capacity of the slower layout: {result['rate_per_h']:g} jobs/h (pass it as `flowedit infra layouts --rate`)")
+            print(f"task rate at 75 % of the measured capacity of the wide layout {result['rate_layout']}: {result['rate_per_h']:g} jobs/h (pass it as `flowedit infra layouts --rate`)")
+        else:
+            print(f"the wide layout {result['rate_layout']} completed no job: no measured task rate")
         write_json(result, out_dir / "infra_premise.json")
     elif args.infra == "pick":
         chosen = pick(means)
@@ -695,7 +716,7 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default --layouts)")
     common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
     sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
-    sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the measured task rate")
+    sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the task rate at 75 %% of the wide layout's measured capacity")
     sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10 at equal service, the forecaster check, the T vs C_worst figure")
     q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick on the evaluation seeds, with bootstrap intervals and Holm")
     q.add_argument("--boot", type=int, default=10_000, help="bootstrap draws (default 10000)")
