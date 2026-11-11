@@ -155,17 +155,52 @@ def test_compare_takes_per_seed_differences_with_intervals_and_holm() -> None:
     assert not infra.compare(_table(slow), {"joint": "joint", "robot_only": "robot"}, n_boot=500)["h1_holds"]
 
 
-def test_the_premise_check_compares_c_worst_with_the_seed_spread_and_measures_the_rate() -> None:
+def _premise_rows(narrow: dict, wide: dict) -> list[dict]:
+    """Premise rows at seeds 1-3: the narrow layout `n1` and the wide `w1` by their premise roles, with C_worst per seed
+    and the service fields in `narrow` and `wide`."""
     rows = []
     for seed, (a, b) in enumerate([(0.10, 0.30), (0.12, 0.31), (0.11, 0.29)], start=1):
-        rows.append({"layout_id": "narrow", "seed": seed, "c_worst": b, "jobs_completed": 10, "busy_s_per_job": 400.0, "charge_s": 600.0})
-        rows.append({"layout_id": "wide", "seed": seed, "c_worst": a, "jobs_completed": 10, "busy_s_per_job": 200.0, "charge_s": 300.0})
+        rows.append({"layout_id": "n1", "roles": "narrow", "seed": seed, "c_worst": b, **narrow})
+        rows.append({"layout_id": "w1", "roles": "wide", "seed": seed, "c_worst": a, **wide})
+    return rows
+
+
+def test_the_premise_check_compares_c_worst_with_the_seed_spread_and_measures_the_rate_in_the_wide_layout() -> None:
+    rows = _premise_rows({"jobs_completed": 10, "busy_s_per_job": 400.0, "charge_s": 600.0}, {"jobs_completed": 10, "busy_s_per_job": 200.0, "charge_s": 300.0})
     result = infra.premise(_table(rows))
     assert result["c_worst_gap"] == pytest.approx(0.30 - 0.11) and not result["raise_density"]
-    # the slower layout: 400 s per job plus 1800 s of charging over 30 jobs
-    assert result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (400.0 + 60.0), 2))
+    # the wide layout: 200 s per job plus 900 s of charging over 30 jobs; the narrow one's capacity is reported beside it
+    assert result["rate_layout"] == "w1" and result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (200.0 + 30.0), 2))
+    assert result["layouts"]["n1"]["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (400.0 + 60.0), 2))
+    assert result["layouts"]["w1"]["roles"] == ["wide"] and result["layouts"]["n1"]["roles"] == ["narrow"]
     close = [{**r, "c_worst": 0.2 + 0.05 * (r["seed"] % 2)} for r in rows]
     assert infra.premise(_table(close))["raise_density"]
+
+
+def test_the_premise_rate_comes_from_the_wide_layout_by_its_role_whichever_is_faster() -> None:
+    # the narrow layout measured faster here: the rate still comes from the wide one, not from the slower or the faster
+    rows = _premise_rows({"jobs_completed": 10, "busy_s_per_job": 150.0, "charge_s": 0.0}, {"jobs_completed": 10, "busy_s_per_job": 300.0, "charge_s": 0.0})
+    result = infra.premise(_table(rows))
+    assert result["rate_layout"] == "w1" and result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / 300.0, 2))
+
+
+def test_a_narrow_layout_without_a_completed_job_keeps_its_cost_in_the_premise_check() -> None:
+    rows = _premise_rows({"jobs_completed": 0, "busy_s_per_job": None, "charge_s": 1200.0}, {"jobs_completed": 9, "busy_s_per_job": 250.0, "charge_s": 900.0})
+    result = infra.premise(_table(rows))
+    assert result["layouts"]["n1"]["rate_per_h"] is None and result["layouts"]["n1"]["jobs_completed"] == 0
+    # its C_worst still counts in the gap
+    assert result["c_worst_gap"] == pytest.approx(0.30 - 0.11) and result["layouts"]["n1"]["c_worst"] == pytest.approx(0.30)
+    assert result["rate_layout"] == "w1" and result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (250.0 + 2700.0 / 27), 2))
+
+
+def test_the_premise_check_needs_exactly_one_wide_layout() -> None:
+    rows = _premise_rows({"jobs_completed": 10, "busy_s_per_job": 400.0, "charge_s": 0.0}, {"jobs_completed": 10, "busy_s_per_job": 200.0, "charge_s": 0.0})
+    with pytest.raises(ValueError, match="role 'wide', and 0 layouts have it"):
+        infra.premise(_table([{**r, "roles": "narrow"} for r in rows]))
+    with pytest.raises(ValueError, match="role 'wide', and 0 layouts have it"):
+        infra.premise(_table([{k: v for k, v in r.items() if k != "roles"} for r in rows]))
+    with pytest.raises(ValueError, match="role 'wide', and 2 layouts have it"):
+        infra.premise(_table([{**r, "roles": "wide"} for r in rows]))
 
 
 def test_the_figure_draws_one_point_per_layout(tmp_path: pathlib.Path) -> None:
