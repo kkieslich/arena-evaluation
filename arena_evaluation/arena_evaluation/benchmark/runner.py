@@ -6,6 +6,7 @@ import collections
 import contextlib
 import copy
 import datetime
+import faulthandler
 import hashlib
 import json
 import logging
@@ -58,12 +59,14 @@ _SIM_STALL_S = 60.0
 _MAX_SIM_DEATHS = 3
 _LOOP_DEADLINE_S = 120.0
 _HUNG_EXIT_CODE = 4
+_SHUTDOWN_DEADLINE_S = _ARENA_SIGINT_GRACE_S + _ARENA_SIGTERM_GRACE_S + _ARENA_ORPHAN_GRACE_S + 60.0
 
 # EpisodeRecord.outcome_state labels (arena_runtime_msgs/msg/EpisodeRecord.msg)
 _EPISODE_OUTCOME_LABELS = {0: "QUEUED", 1: "RUNNING", 2: "SUCCESS", 3: "FAILED", 4: "SKIPPED", 5: "FATAL"}
 
 
 from ..storage.planner_names import split_planner_name
+from . import dashboard
 from .config import Contest, Suite, stage_modes
 from .lockstep import LockstepMonitor, LockstepSummary, format_report, format_table
 from .progress_display import BenchmarkProgressDisplay
@@ -174,6 +177,11 @@ def cell_verdict(result: StepResult) -> str:
     if result.episodes_weak > 0:
         return "weak"
     return "ok"
+
+
+def _yaml_str(value: object) -> str:
+    """value as a quoted YAML string, so a ros-args parameter stays a string whatever it looks like."""
+    return json.dumps(str(value))
 
 
 class _WithSteps(typing.Protocol):
@@ -744,6 +752,7 @@ class _RetryBudget:
 
 class BenchmarkRunner(ArenaMixinNode):
     exit_code: typing.ClassVar[int] = 0
+    shutdown_deadline_s: typing.ClassVar[float] = _SHUTDOWN_DEADLINE_S
 
     @classmethod
     def run_main(cls, *args: object, aiomonitor: bool = False, **kwargs: object) -> None:
@@ -798,6 +807,7 @@ class BenchmarkRunner(ArenaMixinNode):
         except (KeyboardInterrupt, asyncio.CancelledError):
             cls.exit_code = 130
         finally:
+            faulthandler.dump_traceback_later(cls.shutdown_deadline_s, exit=True)
             if watchdog_stop is not None:
                 watchdog_stop.set()
             # Ensure arena runtime subprocess is terminated cleanly
@@ -824,6 +834,7 @@ class BenchmarkRunner(ArenaMixinNode):
             loop.close()
             signal.signal(signal.SIGINT, prev_sigint)
             signal.signal(signal.SIGTERM, prev_sigterm)
+            faulthandler.cancel_dump_traceback_later()
 
     def __init__(
         self,
@@ -1667,32 +1678,32 @@ class BenchmarkRunner(ArenaMixinNode):
                         "-p",
                         "use_sim_time:=true",
                         "-p",
-                        f"record_data_dir:={step.record_dir}",
+                        f"record_data_dir:={_yaml_str(step.record_dir)}",
                         "-p",
-                        f"benchmark_id:={self._run_id}",
+                        f"benchmark_id:={_yaml_str(self._run_id)}",
                         "-p",
-                        f"contestant:={step.contestant.name}",
+                        f"contestant:={_yaml_str(step.contestant.name)}",
                         "-p",
-                        f"stage:={step.stage.name}",
+                        f"stage:={_yaml_str(step.stage.name)}",
                         "-p",
-                        f"map:={step.stage.map}",
+                        f"map:={_yaml_str(step.stage.map)}",
                         "-p",
-                        f"suite_name:={self._suite.name}",
+                        f"suite_name:={_yaml_str(self._suite.name)}",
                         "-p",
-                        f"contest_name:={self._contest.name}",
+                        f"contest_name:={_yaml_str(self._contest.name)}",
                         "-p",
-                        f"local_planner:={lp}",
+                        f"local_planner:={_yaml_str(lp)}",
                         "-p",
-                        f"inter_planner:={ip}",
+                        f"inter_planner:={_yaml_str(ip)}",
                         "-p",
-                        f"robot:={step.robot}",
+                        f"robot:={_yaml_str(step.robot)}",
                         "-p",
                         f"episodes_requested:={step.episodes}",
                         "-p",
                         f"is_reference:={str(step.is_reference).lower()}",
                     ]
                     if step.reference_type:
-                        recorder_args.extend(["-p", f"reference_type:={step.reference_type}"])
+                        recorder_args.extend(["-p", f"reference_type:={_yaml_str(step.reference_type)}"])
                     record_config = write_recorder_config(self._suite, self._run_dir.path)
                     if record_config is not None:
                         recorder_args.extend(["-p", f"record_config:={record_config}"])
@@ -2033,6 +2044,8 @@ class BenchmarkRunner(ArenaMixinNode):
             env_n=self._env_n,
             run_id=self._run_id,
             sim_now=lambda: self.sim_time.to_seconds(),
+            live_path=self._run_dir.live_path,
+            lane=self._run_dir.lane,
         )
 
         owned: set[str] = set()
@@ -2455,6 +2468,17 @@ def cli_main(argv: list[str] | None = None) -> int:
         metavar="TOKEN",
         help="Run as one lane (named by ARENA_LANE) of a run several lanes share. Every lane gets the same TOKEN, a fresh one per launch, and the same --run-id or --resume <run_id>. Lanes claim env blocks under claims/<TOKEN>/ and fold their lane files into progress.csv and .benchmark_state.json on exit.",
     )
+    p.add_argument(
+        "--viz",
+        action="store_true",
+        help="Serve the live dashboard of this run (arena evaluation serve) while it runs and print its URL. A dashboard of the same data root already on the port is reused, any other program there exits 2 before the sim starts.",
+    )
+    p.add_argument(
+        "--viz-port",
+        type=int,
+        default=dashboard.DEFAULT_PORT,
+        help=f"Port of the --viz dashboard on {dashboard.DEFAULT_HOST} (default {dashboard.DEFAULT_PORT}).",
+    )
     args, extras = p.parse_known_args(argv)
 
     lane, shared_error = _shared_lane(args.shared, args.run_id, args.resume)
@@ -2488,6 +2512,12 @@ def cli_main(argv: list[str] | None = None) -> int:
         else:
             data_root = share / "data"
             print(f"benchmark: data_root from default: {data_root}", file=sys.stderr)
+
+        if args.viz:
+            problem = dashboard.port_problem(dashboard.DEFAULT_HOST, args.viz_port, data_root)
+            if problem is not None:
+                print(f"benchmark: --viz: {problem}", file=sys.stderr)
+                return 2
 
         if args.resume:
             resume_id = args.resume
@@ -2591,6 +2621,17 @@ def cli_main(argv: list[str] | None = None) -> int:
         return 2
     assert run_dir is not None
 
+    viz = None
+    if args.viz:
+        try:
+            viz_url, viz = dashboard.start_child(dashboard.DEFAULT_HOST, args.viz_port, data_root, run_dir.manifest.run_id)
+        except dashboard.DashboardError as exc:
+            print(f"benchmark: --viz: {exc}", file=sys.stderr)
+            return 2
+        print(f"{dashboard.VIZ_PREFIX}{viz_url}", file=sys.stderr, flush=True)
+        with run_dir.log_path.open("a") as fh:
+            fh.write(f"{datetime.datetime.now(tz=datetime.UTC).isoformat()} INFO benchmark: {dashboard.VIZ_PREFIX}{viz_url}\n")
+
     print(
         f"{PREPARED}{run_dir.manifest.run_id} steps={len(steps)} dir={run_dir.path}",
         file=sys.stderr,
@@ -2634,6 +2675,8 @@ def cli_main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
+        if viz is not None:
+            dashboard.stop_child(viz)
         if profiler is not None:
             profiler.stop()
         if lane is not None:
