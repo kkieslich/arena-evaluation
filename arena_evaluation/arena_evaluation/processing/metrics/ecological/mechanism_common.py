@@ -210,6 +210,7 @@ class ElevatorGeom:
     activation_distance: float
     capacity: int | None = None
     destinations: list[str] = dataclasses.field(default_factory=list)
+    door_kind: str = "sliding_split"
 
     @property
     def door_center(self) -> tuple[float, float]:
@@ -308,6 +309,7 @@ def _level_geometry(out: MechanismWorld, level_id: str, level: Level) -> None:
                 activation_distance=float(elevator.activation_distance),
                 capacity=elevator.capacity,
                 destinations=list(elevator.destinations),
+                door_kind=elevator.door_kind,
             )
         )
     for zone in level.zones:
