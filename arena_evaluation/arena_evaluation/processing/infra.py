@@ -1,7 +1,15 @@
 """INFRA measures (study design §6, §8, §10, §12) over processed benchmark runs of `flowedit infra`'s suites.
 
 Inputs are benchmark directories `evaluation process` has run on (their `combined_metrics.parquet`, each episode's
-extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite:
+extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite. One suite's
+runs may lie in several run dirs (its parts recorded on several machines): they are read as one, their manifests must
+name the same Arena and humansim commits (`check_commits`), and a stage two of them hold is refused like a stage run
+twice. What the measures read of an episode is small once `evaluation infra times` has kept each run's walker travel
+times beside its tracks (`walker_times`): the run dir's `combined_metrics.parquet` and `manifest.yaml`, and per episode
+`topics/semantic_snapshot.parquet` and `topics/.derived/infra_times.*/`; such a copy of a run dir reads like the
+original without its recording or its tracks, for the warm-up the times were kept for (another one raises). Kept times
+name the track store's version and a digest of their code, and record the arena_evaluation commit that computed them:
+times of other code are never read, and times of different commits are refused like runs of different commits.
 
 - **Robot service** (§6), from the fleet mode's task log (the `fleet` semantic entity, schema in kkieslich/Arena's
   `task_generator/tasks/robots/README.md#fleet-task-log`): `T` = the restricted mean task time (release to
@@ -35,6 +43,7 @@ extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` wr
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import math
 import pathlib
@@ -46,7 +55,9 @@ import polars as pl
 
 from arena_evaluation.processing.metrics.social.paired_peds import _travel_times
 from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group
-from arena_evaluation.processing.ped_track_store import tracks_for_episode
+from arena_evaluation.processing import ped_track_store
+from arena_evaluation.processing.parquet_store import TopicParquetStore
+from arena_evaluation.processing.ped_track_store import TOPICS_DIR, episode_envs, tracks_for_episode
 
 #: The warm-up the analysis leaves out and the episode length (Kolja, 9 Nov: 25 min with 7 min warm-up)
 WARMUP_S = 420.0
@@ -63,6 +74,16 @@ FLEET_KIND = "fleet"
 TABLE_FILE = "infra_layouts.parquet"
 FIGURE_FILE = "infra_service_cost.png"
 _STAGE = re.compile(r"^(?P<world>.+)__s(?P<seed>\d+)$")
+#: the checkouts whose commits the run dirs read together must share (`check_commits`): the code that recorded them
+#: (arena_evaluation is the runner: it records the episodes and sets their seeds)
+SAME_COMMITS = ("arena", "humansim", "arena_evaluation")
+#: the runner's manifest of a run dir
+RUN_MANIFEST = "manifest.yaml"
+#: version of the kept walker travel times' layout (`walker_times`); their dir also names the track store's version and a
+#: digest of the code that computes them (`times_dir`)
+TIMES_VERSION = 2
+#: the parquet metadata key of a kept times file's provenance
+TIMES_META = b"infra_times"
 _VISITOR = re.compile(r"_locker_(?P<group>.+)$")
 
 
@@ -112,15 +133,103 @@ def runs(benchmark_dir: pathlib.Path) -> list[Run]:
     return sorted(out.values(), key=lambda r: (r.world, r.seed, r.planner, r.episode, r.env))
 
 
+def runs_of(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path]) -> list[Run]:
+    """Every usable run of one or several processed benchmark dirs (`runs`), in one list."""
+    out: list[Run] = []
+    for benchmark_dir in _dirs(benchmark_dirs):
+        out.extend(runs(benchmark_dir))
+    return sorted(out, key=lambda r: (r.world, r.seed, r.planner, str(r.episode_dir), r.env))
+
+
+def _dirs(value: pathlib.Path | str | typing.Sequence[pathlib.Path | str]) -> list[pathlib.Path]:
+    """One run dir or several, as a list of paths."""
+    if isinstance(value, (str, pathlib.Path)):
+        return [pathlib.Path(value)]
+    return [pathlib.Path(v) for v in value]
+
+
 def unique(candidates: typing.Sequence[Run], what: str) -> Run | None:
     """The one run of `candidates`, None without any; ValueError naming the stage and its episodes when a stage was
-    run more than once (a retried step whose failed attempt still has a recording): the analysis never guesses."""
+    run more than once (a retried step whose failed attempt still has a recording, or a stage two run dirs read
+    together both hold): the analysis never guesses."""
     if not candidates:
         return None
-    if len({(r.episode, r.env) for r in candidates}) > 1:
-        episodes = ", ".join(f"episode_{r.episode:03d} ({r.env})" for r in candidates)
-        raise ValueError(f"{what}: stage {candidates[0].stage} has more than one usable run ({episodes}); remove the failed attempt or re-process")
+    if len({(r.episode_dir, r.env) for r in candidates}) > 1:
+        several = len({r.episode_dir.parent.parent for r in candidates}) > 1
+        episodes = ", ".join(f"episode_{r.episode:03d} ({r.env})" + (f" in {r.episode_dir.parent.parent}" if several else "") for r in candidates)
+        raise ValueError(f"{what}: stage {candidates[0].stage} has more than one usable run ({episodes}); remove the failed attempt or re-process" + ("; run dirs read together must not share a stage" if several else ""))
     return candidates[0]
+
+
+_WARNED: set[str] = set()
+
+
+def _warn(message: str) -> None:
+    """A warning on stderr, once per process."""
+    import sys
+
+    if message not in _WARNED:
+        _WARNED.add(message)
+        print(f"warning: {message}", file=sys.stderr)
+
+
+def check_commits(run_dirs: typing.Sequence[pathlib.Path], *, allow_mixed: bool = False) -> None:
+    """Fail when the manifests of `run_dirs` (the site and layout dirs alike) name different commits of a SAME_COMMITS
+    checkout: their runs ran other code and do not belong in one comparison; `allow_mixed` warns instead.
+
+    A run dir without a manifest, or with one that records no commits or not this checkout's, is not compared, with a
+    warning. A dirty checkout is compared by its commit, with a warning: git counts untracked files (local worlds, run
+    data) as dirty, so most study checkouts are, and refusing them would refuse every run; the check therefore refuses
+    runs of different releases, it does not prove that two runs ran the same code."""
+    import yaml
+
+    seen: dict[str, dict[pathlib.Path, str]] = {}
+    for run_dir in run_dirs:
+        path = pathlib.Path(run_dir) / RUN_MANIFEST
+        doc = yaml.safe_load(path.read_text()) if path.is_file() else None
+        commits = doc.get("commits") if isinstance(doc, dict) else None
+        if not isinstance(commits, dict):
+            _warn(f"{run_dir}: " + (f"no {RUN_MANIFEST}" if doc is None else f"its {RUN_MANIFEST} records no commits") + ", so its Arena and humansim commits are not compared")
+            continue
+        for name in SAME_COMMITS:
+            entry = commits.get(name) if isinstance(commits.get(name), dict) else {}
+            if not entry.get("commit"):
+                _warn(f"{run_dir}: no {name} commit recorded ({entry.get('reason') or 'not in the manifest'}), so it is not compared")
+                continue
+            if entry.get("dirty"):
+                _warn(f"{run_dir}: its {name} checkout ({entry.get('path')}) was dirty at {str(entry['commit'])[:12]}, so the commit does not pin the code that ran")
+            seen.setdefault(name, {})[pathlib.Path(run_dir)] = str(entry["commit"])
+    for name, found in seen.items():
+        if len(set(found.values())) > 1:
+            message = f"the run dirs ran different {name} commits: " + ", ".join(f"{d} {c[:12]}" for d, c in found.items()) + "; read only runs of one Arena release together"
+            if not allow_mixed:
+                raise ValueError(message + " (--allow-mixed-commits reads them anyway)")
+            _warn(message)
+
+
+def check_kept_times(run_dirs: typing.Sequence[pathlib.Path], warmup_s: float, *, allow_mixed: bool = False) -> None:
+    """Fail when the walker times kept in `run_dirs` for `warmup_s` (`walker_times`) were computed by different
+    arena_evaluation commits: each machine keeps its own runs' times, and they must come from one release.
+    `allow_mixed` warns instead. A dirty checkout is compared by its commit, with a warning, as in `check_commits`; times
+    whose commit git could not read are not compared, with a warning. The commit is the one that computed the times
+    from the tracks (`evaluation infra times` or the analysis), not the one that extracted the topics and built the
+    tracks, which can be older: the track store's version in the times' dir name covers that."""
+    found: dict[str, list[pathlib.Path]] = {}
+    for run_dir in run_dirs:
+        for path in pathlib.Path(run_dir).glob(f"episodes/*/{TOPICS_DIR}/.derived/{times_dir()}/*.w{_warmup_key(warmup_s)}.parquet"):
+            processing = (times_provenance(path) or {}).get("arena_evaluation") or {}
+            if not processing.get("commit"):
+                _warn(f"{run_dir}: walker times kept without a readable arena_evaluation commit ({processing.get('reason') or 'git could not read the checkout'}), so their code is not compared")
+                continue
+            commit = str(processing["commit"])
+            if processing.get("dirty"):
+                _warn(f"{run_dir}: walker times kept by a dirty arena_evaluation checkout at {commit[:12]}, so the commit does not pin the code that computed them")
+            found.setdefault(commit, []).append(pathlib.Path(run_dir))
+    if len(found) > 1:
+        message = "walker times kept by different arena_evaluation commits: " + ", ".join(f"{c[:12]} in {', '.join(sorted({str(d) for d in dirs}))}" for c, dirs in found.items()) + "; keep them again with one release: `evaluation infra times --recompute --benchmark <run dir>` where each run's tracks are"
+        if not allow_mixed:
+            raise ValueError(message + " (--allow-mixed-commits reads them anyway)")
+        _warn(message)
 
 
 def restricted_mean(times: typing.Sequence[float], completed: typing.Sequence[bool], tau_s: float) -> float | None:
@@ -261,7 +370,140 @@ def _times(tracks: pl.DataFrame, warmup_s: float) -> pl.DataFrame:
     cut = tracks.filter(pl.col("t") >= warmup_s) if len(tracks) else tracks
     done = _travel_times(cut)
     sources = cut.group_by("key").agg(pl.col("source_name").first()) if len(cut) else pl.DataFrame(schema={"key": pl.String, "source_name": pl.String})
-    return done.join(sources, on="key", how="left")
+    # by key: group_by keeps no order, and the cost sums floats in row order, so the same tracks give the same bits
+    return done.join(sources, on="key", how="left").sort("key")
+
+
+_TIMES_SCHEMA = {"key": pl.String, "agent_type": pl.String, "travel_s": pl.Float64, "source_name": pl.String}
+
+
+@functools.lru_cache(maxsize=1)
+def _times_code() -> str:
+    """A digest of the code the kept walker times come from (`_times`, `_travel_times`): changing it re-keys them."""
+    import hashlib
+    import inspect
+
+    from arena_evaluation.processing.metrics.social import paired_peds
+
+    try:
+        source = inspect.getsource(_times) + inspect.getsource(paired_peds._travel_times)
+    except (OSError, TypeError):
+        _warn("the source of _times and _travel_times cannot be read, so kept walker times are not re-keyed when that code changes")
+        return "nosource"
+    return hashlib.sha1(source.encode()).hexdigest()[:10]
+
+
+def times_dir() -> str:
+    """The dir name of the kept walker times: their layout's version, the track store's version and the code digest, so
+    times kept by other code are never read as current."""
+    return f"infra_times.v{TIMES_VERSION}.t{ped_track_store.TRACKS_VERSION}.{_times_code()}"
+
+
+def _warmup_key(warmup_s: float) -> str:
+    return repr(float(warmup_s))
+
+
+def times_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathlib.Path:
+    """Where the kept walker travel times of `env` in an episode lie for a warm-up of `warmup_s`, beside its tracks."""
+    return pathlib.Path(episode_dir) / TOPICS_DIR / ".derived" / times_dir() / f"{env}.w{_warmup_key(warmup_s)}.parquet"
+
+
+@functools.lru_cache(maxsize=1)
+def _processing() -> dict[str, typing.Any]:
+    """{path, commit, dirty} of the arena_evaluation checkout this code runs from, as the runner's manifests record
+    checkouts (`benchmark.state.commit_of`, not imported here: it needs ROS); commit None where git cannot tell."""
+    import subprocess
+
+    here = pathlib.Path(__file__).resolve()
+    checkout = next((d for d in here.parents if (d / ".git").exists()), None)
+    if checkout is None:
+        return {"path": None, "commit": None, "dirty": None, "reason": f"{here} lies in no git checkout"}
+
+    def git(*args: str) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    commit, status = git("rev-parse", "HEAD"), git("status", "--porcelain")
+    return {"path": str(checkout), "commit": commit, "dirty": None if status is None else bool(status)}
+
+
+def times_provenance(path: pathlib.Path) -> dict[str, typing.Any] | None:
+    """What a kept times file records of the code that computed it, None for a file without it."""
+    import pyarrow.parquet as pq
+
+    meta = pq.read_schema(path).metadata or {}
+    return json.loads(meta[TIMES_META]) if TIMES_META in meta else None
+
+
+#: the extracted tables the walker tracks are built from (`ped_track_store.TRACK_TOPICS`): one of them must be there
+_PED_TABLES = frozenset({"peds_physics", "peds"})
+
+
+def track_problem(episode_dir: pathlib.Path, env: str) -> str | None:
+    """Why an episode cannot give the walker tracks of `env`, None when it can: a current extraction of its recording
+    with that env and a pedestrian table. Without one, the track store would read the episode as one without walkers."""
+    topics = pathlib.Path(episode_dir) / TOPICS_DIR
+    if not (topics / TopicParquetStore.VERSION_FILE).is_file():
+        return "no extraction of its recording (a copy of the run dir); run `evaluation infra times --benchmark <its run dir> --warmup <s>` where the run's tracks are, and copy the run dir again"
+    if not TopicParquetStore.is_current(topics, frozenset()):
+        return "its extraction is of an older format; re-run `evaluation process` on the run dir"
+    cached = TopicParquetStore.cached_tables(topics)
+    if cached is not None and not (cached & _PED_TABLES):
+        return f"its extraction holds no pedestrian table ({', '.join(sorted(cached))}); re-run `evaluation process` with the pedestrian tables (e.g. --measures flow)"
+    bundle = episode_envs(TopicParquetStore.read(topics) or {}).get(env)
+    if bundle is None:
+        return f"its extraction holds no {env}; re-run `evaluation process` on the run dir"
+    if all(getattr(bundle, table, None) is None for table in _PED_TABLES):
+        return f"its extraction holds no pedestrian table for {env}; re-run `evaluation process` with the pedestrian tables (e.g. --measures flow)"
+    return None
+
+
+def has_tracks(episode_dir: pathlib.Path, env: str) -> bool:
+    """Whether an episode can give the walker tracks of `env` (`track_problem`)."""
+    return track_problem(episode_dir, env) is None
+
+
+def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame:
+    """`_times` of an episode's tracks of `env`, kept beside the tracks (`times_path`, with the computing code's
+    provenance) and read from there afterwards, so a copy of a run dir without its tracks reads the same; `recompute`
+    computes and keeps them again from the tracks. Raises FileNotFoundError when nothing is kept for this warm-up (or
+    `recompute`) and the episode cannot give its tracks (`track_problem`), and ValueError for empty tracks: every INFRA
+    episode has walkers, so an episode is never scored as one without them."""
+    path = times_path(episode_dir, env, warmup_s)
+    if path.is_file() and not recompute:
+        return pl.read_parquet(path)
+    if not has_tracks(episode_dir, env):
+        problem = (track_problem(episode_dir, env) or "no tracks").replace("--warmup <s>", f"--warmup {warmup_s:g}")
+        raise FileNotFoundError(f"{episode_dir}: no walker times of {env} kept for a warm-up of {warmup_s:g} s ({TOPICS_DIR}/.derived/{times_dir()}/) and no tracks to compute them from: {problem}")
+    tracks = tracks_for_episode(episode_dir, env)
+    if len(tracks) == 0:
+        raise ValueError(f"{episode_dir}: the tracks of {env} hold no walker; an INFRA episode always has them, re-run `evaluation process` on the run dir")
+    times = _times(tracks, warmup_s)
+    times = times.select([pl.col(c).cast(t) if c in times.columns else pl.lit(None, dtype=t).alias(c) for c, t in _TIMES_SCHEMA.items()])
+    _keep_times(path, times, warmup_s)
+    return times
+
+
+def _keep_times(path: pathlib.Path, times: pl.DataFrame, warmup_s: float) -> None:
+    """Write kept times with their provenance; a run dir it cannot write to (a read-only copy) keeps none, with a warning."""
+    import os
+
+    import pyarrow.parquet as pq
+
+    meta = {"times_version": TIMES_VERSION, "tracks_version": ped_track_store.TRACKS_VERSION, "code": _times_code(), "warmup_s": float(warmup_s), "arena_evaluation": _processing()}
+    table = times.to_arrow()
+    table = table.replace_schema_metadata({**(table.schema.metadata or {}), TIMES_META: json.dumps(meta).encode()})
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, temp)
+        temp.replace(path)
+    except OSError as e:
+        temp.unlink(missing_ok=True)
+        _warn(f"{path}: walker times not kept ({e}); they are computed again on the next read")
 
 
 def _group(agent_type: str, source_name: str | None) -> str:
@@ -275,14 +517,20 @@ def cost(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFrame | None,
     robots and (None for a premise or element-only check) the layout with robots: per group the paired through-walkers,
     the total, element and traffic parts of `C_g`, the absolute delay, and the drops; `C_worst` and its group; the locker
     visitors' walk without robots and their traffic part."""
+    return cost_from_times(_times(site, warmup_s), _times(without, warmup_s), _times(robots, warmup_s) if robots is not None else None, visitor_sources=visitor_sources)
+
+
+def cost_from_times(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = ()) -> dict[str, typing.Any]:
+    """`cost` from the walker travel times (`_times`, `walker_times`) of the three runs in place of their tracks."""
     visitors = set(visitor_sources)
-    ref = _times(site, warmup_s).filter(~pl.col("source_name").is_in(list(visitors)) & (pl.col("source_name") != ""))
-    off = _times(without, warmup_s)
-    on = _times(robots, warmup_s) if robots is not None else None
+    ref = site.filter(~pl.col("source_name").is_in(list(visitors)) & (pl.col("source_name") != ""))
+    off = without
+    on = robots
     walkers = ref.select("key", "agent_type", "source_name", pl.col("travel_s").alias("site_s"))
     joined = walkers.join(off.select("key", pl.col("travel_s").alias("off_s")), on="key", how="left")
     if on is not None:
         joined = joined.join(on.select("key", pl.col("travel_s").alias("on_s")), on="key", how="left")
+    joined = joined.sort("key")  # sums in one order, whatever order the inputs come in
     groups: dict[str, dict[str, typing.Any]] = {}
     for row in joined.iter_rows(named=True):
         group = _group(row["agent_type"], row["source_name"])
@@ -321,14 +569,14 @@ def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> 
     (with robots against without, over their own walk) where they finished both."""
     if not sources:
         return {}
-    mine = off.filter(pl.col("source_name").is_in(list(sources)))
+    mine = off.filter(pl.col("source_name").is_in(list(sources))).sort("key")  # sums in one order, as the cost's
     out: dict[str, typing.Any] = {}
     for row in mine.iter_rows(named=True):
         g = out.setdefault(_group(row["agent_type"], row["source_name"]), {"peds": 0, "walk_s": 0.0, "paired": 0, "off_s": 0.0, "on_s": 0.0})
         g["peds"] += 1
         g["walk_s"] += row["travel_s"]
     if on is not None and len(mine):
-        both = mine.select("key", "agent_type", "source_name", pl.col("travel_s").alias("off_s")).join(on.select("key", pl.col("travel_s").alias("on_s")), on="key")
+        both = mine.select("key", "agent_type", "source_name", pl.col("travel_s").alias("off_s")).join(on.select("key", pl.col("travel_s").alias("on_s")), on="key").sort("key")
         for row in both.iter_rows(named=True):
             g = out[_group(row["agent_type"], row["source_name"])]
             g["paired"] += 1
@@ -340,15 +588,20 @@ def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> 
 # --- tables ----------------------------------------------------------------------------------------------------------
 
 
-def layout_table(site_dir: pathlib.Path, layouts_dir: pathlib.Path, manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None) -> pl.DataFrame:
+def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts_dir: pathlib.Path | typing.Sequence[pathlib.Path], manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None, allow_mixed_commits: bool = False) -> pl.DataFrame:
     """One row per layout of `manifest` and seed: its roles, the service of its fleet run, its pedestrian cost against
     the site as is at that seed (`cost`), flattened (`C_<group>`, `C_<group>_element`, `C_<group>_traffic`,
-    `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`)."""
+    `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`). `site_dir` and
+    `layouts_dir` may each be several run dirs (a suite's parts recorded on several machines), read as one; all of them
+    must name the same commits (`check_commits`) and hold walker times kept by one release (`check_kept_times`)."""
     warmup = float(manifest.get("warmup_s", WARMUP_S) if warmup_s is None else warmup_s)
     episode_s = float(manifest.get("episode_s") or 0.0) or None
     visitor_sources = list(manifest.get("visitor_sources") or [])
-    site_runs = runs(site_dir)
-    layout_runs = runs(layouts_dir)
+    site_dirs, layout_dirs = _dirs(site_dir), _dirs(layouts_dir)
+    check_commits([*site_dirs, *layout_dirs], allow_mixed=allow_mixed_commits)
+    site_what, layouts_what = ", ".join(map(str, site_dirs)), ", ".join(map(str, layout_dirs))
+    site_runs = runs_of(site_dirs)
+    layout_runs = runs_of(layout_dirs)
     roles: dict[str, list[str]] = {}
     ranking: dict[str, float | None] = {}
     travel: dict[str, float | None] = {}
@@ -361,16 +614,17 @@ def layout_table(site_dir: pathlib.Path, layouts_dir: pathlib.Path, manifest: ty
     site_name = str(manifest["site"])
     for layout_id, world in world_of.items():
         for seed in manifest.get("seeds") or []:
-            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS], f"{layouts_dir} (without robots)")
-            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_dir} (with the fleet)")
-            ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_dir} (the site as is)")
+            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS], f"{layouts_what} (without robots)")
+            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_what} (with the fleet)")
+            ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_what} (the site as is)")
             row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": off is not None and on is not None and ref is not None}
             if on is not None:
                 row.update(service(fleet_log(on.episode_dir, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
             if off is not None and ref is not None:
-                measured = cost(tracks_for_episode(ref.episode_dir, ref.env), tracks_for_episode(off.episode_dir, off.env), None if on is None else tracks_for_episode(on.episode_dir, on.env), visitor_sources=visitor_sources, warmup_s=warmup)
+                measured = cost_from_times(walker_times(ref.episode_dir, ref.env, warmup), walker_times(off.episode_dir, off.env, warmup), None if on is None else walker_times(on.episode_dir, on.env, warmup), visitor_sources=visitor_sources)
                 row.update(_flatten(measured))
             rows.append(row)
+    check_kept_times([*site_dirs, *layout_dirs], warmup, allow_mixed=allow_mixed_commits)
     return pl.DataFrame(rows, infer_schema_length=None)
 
 
@@ -653,14 +907,38 @@ def _print_layouts(means: pl.DataFrame) -> None:
             print(f"{'':10s} {parts}")
 
 
+def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float, *, recompute: bool = False) -> int:
+    """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`, `recompute` computing
+    kept ones again from the tracks; the runs kept. Raises FileNotFoundError naming the runs it could not keep (no
+    times kept and no tracks), after keeping the others."""
+    kept, missing = 0, []
+    for run in runs_of(benchmark_dirs):
+        try:
+            walker_times(run.episode_dir, run.env, warmup_s, recompute=recompute)
+        except FileNotFoundError:
+            missing.append(f"{run.episode_dir} ({run.env})")
+            continue
+        kept += 1
+    if missing:
+        raise FileNotFoundError(f"kept the walker times of {kept} runs, but {len(missing)} have no tracks and none kept: " + ", ".join(missing[:5]) + (", ..." if len(missing) > 5 else "") + "; run `evaluation infra times` where their tracks are")
+    return kept
+
+
 def infra_command(args: typing.Any) -> int:
-    """`evaluation infra {table,premise,pick,compare}`; see `add_infra_parser`."""
+    """`evaluation infra {table,premise,pick,compare,times}`; see `add_infra_parser`."""
+    if args.infra == "times":
+        warmup = float(args.warmup if args.warmup is not None else (_manifest(args.manifest).get("warmup_s", WARMUP_S) if args.manifest else WARMUP_S))
+        kept = keep_times(args.benchmark, warmup, recompute=getattr(args, "recompute", False))
+        print(f"kept the walker travel times of {kept} runs (warm-up {warmup:g} s) in {', '.join(map(str, _dirs(args.benchmark)))}; a copy of each run dir now needs only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/{times_dir()}/")
+        return 0
     manifest = _manifest(args.manifest)
-    table = layout_table(args.site, args.layouts, manifest, warmup_s=args.warmup, tau_s=args.tau)
-    out_dir = pathlib.Path(args.output_dir or args.layouts)
+    layout_dirs = _dirs(args.layouts)
+    table = layout_table(args.site, layout_dirs, manifest, warmup_s=args.warmup, tau_s=args.tau, allow_mixed_commits=getattr(args, "allow_mixed_commits", False))
+    out_dir = pathlib.Path(args.output_dir or layout_dirs[0])
+    out_dir.mkdir(parents=True, exist_ok=True)
     table.write_parquet(out_dir / TABLE_FILE)
     means = layout_means(table)
-    print(f"{len(table)} (layout, seed) rows from {args.layouts} against the site as is in {args.site}; warm-up {args.warmup if args.warmup is not None else manifest.get('warmup_s', WARMUP_S):g} s; per seed in {out_dir / TABLE_FILE}")
+    print(f"{len(table)} (layout, seed) rows from {', '.join(map(str, layout_dirs))} against the site as is in {', '.join(map(str, _dirs(args.site)))}; warm-up {args.warmup if args.warmup is not None else manifest.get('warmup_s', WARMUP_S):g} s; per seed in {out_dir / TABLE_FILE}")
     incomplete = table.filter(~pl.col("complete")) if "complete" in table.columns else table.head(0)
     if len(incomplete):
         print(f"missing runs for {len(incomplete)} (layout, seed) rows: " + ", ".join(f"{r['layout_id']}@s{r['seed']}" for r in incomplete.to_dicts()))
@@ -708,15 +986,22 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     p = subparsers.add_parser("infra", help="INFRA (study design §6, §10, §12): robot service and pedestrian cost per layout, the premise check, the selection pick, the evaluation comparison")
     sub = p.add_subparsers(dest="infra", required=True)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--site", type=pathlib.Path, required=True, help="processed benchmark dir of the site as is (flowedit infra reference) on the same seeds")
-    common.add_argument("--layouts", type=pathlib.Path, required=True, help="processed benchmark dir of a layout suite (premise, selection or evaluation)")
+    several = "; repeatable: a suite's parts from several run dirs (e.g. recorded on two machines) are read as one, they must name the same Arena and humansim commits and share no stage"
+    common.add_argument("--site", type=pathlib.Path, action="append", required=True, help=f"processed benchmark dir of the site as is (flowedit infra reference) on the same seeds{several}")
+    common.add_argument("--layouts", type=pathlib.Path, action="append", required=True, help=f"processed benchmark dir of a layout suite (premise, selection or evaluation){several}")
     common.add_argument("--manifest", type=pathlib.Path, required=True, help="the suite's <suite>.layouts.json from flowedit infra")
     common.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g})")
     common.add_argument("--tau", type=float, default=None, help="horizon of the restricted mean task time T, s (default the episode minus the warm-up; one value for a whole study)")
-    common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default --layouts)")
+    common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default the first --layouts)")
+    common.add_argument("--allow-mixed-commits", action="store_true", help="read run dirs (site and layouts alike) whose manifests or kept walker times name different Arena, humansim or arena_evaluation commits, with a warning, instead of refusing them")
     common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
     sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
     sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the task rate at 75 %% of the wide layout's measured capacity")
     sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10 at equal service, the forecaster check, the T vs C_worst figure")
     q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick on the evaluation seeds, with bootstrap intervals and Holm")
     q.add_argument("--boot", type=int, default=10_000, help="bootstrap draws (default 10000)")
+    q = sub.add_parser("times", help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/infra_times.*/ reads like the original (run it where the tracks are, before copying, with the analysis' warm-up)")
+    q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir; repeatable")
+    q.add_argument("--manifest", type=pathlib.Path, default=None, help="the suite's <suite>.layouts.json, for its warm-up")
+    q.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g}); the analysis reads the times kept for its own warm-up")
+    q.add_argument("--recompute", action="store_true", help="compute kept times again from the tracks and replace them, e.g. to keep a run dir's times with one release")
