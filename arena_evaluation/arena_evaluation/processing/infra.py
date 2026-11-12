@@ -81,7 +81,7 @@ SAME_COMMITS = ("arena", "humansim", "arena_evaluation")
 RUN_MANIFEST = "manifest.yaml"
 #: version of the kept walker travel times' layout (`walker_times`); their dir also names the track store's version and a
 #: digest of the code that computes them (`times_dir`)
-TIMES_VERSION = 2
+TIMES_VERSION = 3
 #: the parquet metadata key of a kept times file's provenance
 TIMES_META = b"infra_times"
 _VISITOR = re.compile(r"_locker_(?P<group>.+)$")
@@ -617,12 +617,19 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
             off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS], f"{layouts_what} (without robots)")
             on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_what} (with the fleet)")
             ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_what} (the site as is)")
-            row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": off is not None and on is not None and ref is not None}
+            complete = off is not None and on is not None and ref is not None
+            row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": complete, "incomplete": None if complete else "missing runs: " + ", ".join(what for what, r in (("the site as is", ref), ("without robots", off), ("with the fleet", on)) if r is None)}
             if on is not None:
                 row.update(service(fleet_log(on.episode_dir, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
             if off is not None and ref is not None:
-                measured = cost_from_times(walker_times(ref.episode_dir, ref.env, warmup), walker_times(off.episode_dir, off.env, warmup), None if on is None else walker_times(on.episode_dir, on.env, warmup), visitor_sources=visitor_sources)
+                times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": walker_times(off.episode_dir, off.env, warmup), "with the fleet": None if on is None else walker_times(on.episode_dir, on.env, warmup)}
+                measured = cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)
                 row.update(_flatten(measured))
+                # a run without a walker that spawned after the warm-up and finished has no cost to give: not complete
+                empty = [what for what, t in times.items() if t is not None and len(t) == 0]
+                if empty:
+                    row["complete"] = False
+                    row["incomplete"] = f"no walker spawned after the {warmup:g} s warm-up and finished: " + ", ".join(empty)
             rows.append(row)
     check_kept_times([*site_dirs, *layout_dirs], warmup, allow_mixed=allow_mixed_commits)
     return pl.DataFrame(rows, infer_schema_length=None)
@@ -909,18 +916,24 @@ def _print_layouts(means: pl.DataFrame) -> None:
 
 def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float, *, recompute: bool = False) -> int:
     """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`, `recompute` computing
-    kept ones again from the tracks; the runs kept. Raises FileNotFoundError naming the runs it could not keep (no
-    times kept and no tracks), after keeping the others."""
-    kept, missing = 0, []
+    kept ones again from the tracks; the runs kept. Keeps going past a run it cannot keep (no tracks and none kept, or
+    tracks without a walker) and raises at the end naming each with its reason: FileNotFoundError when all lack tracks,
+    else ValueError."""
+    kept = 0
+    failed: list[tuple[str, Exception]] = []
     for run in runs_of(benchmark_dirs):
         try:
             walker_times(run.episode_dir, run.env, warmup_s, recompute=recompute)
-        except FileNotFoundError:
-            missing.append(f"{run.episode_dir} ({run.env})")
+        except (FileNotFoundError, ValueError) as e:
+            failed.append((f"{run.episode_dir} ({run.env})", e))
             continue
         kept += 1
-    if missing:
-        raise FileNotFoundError(f"kept the walker times of {kept} runs, but {len(missing)} have no tracks and none kept: " + ", ".join(missing[:5]) + (", ..." if len(missing) > 5 else "") + "; run `evaluation infra times` where their tracks are")
+    if failed:
+        listed = "; ".join(f"{where}: {str(e).split(': ', 1)[-1]}" for where, e in failed[:5]) + ("; ..." if len(failed) > 5 else "")
+        message = f"kept the walker times of {kept} runs, but could not keep {len(failed)}: {listed}"
+        if all(isinstance(e, FileNotFoundError) for _, e in failed):
+            raise FileNotFoundError(message)
+        raise ValueError(message)
     return kept
 
 
@@ -940,8 +953,11 @@ def infra_command(args: typing.Any) -> int:
     means = layout_means(table)
     print(f"{len(table)} (layout, seed) rows from {', '.join(map(str, layout_dirs))} against the site as is in {', '.join(map(str, _dirs(args.site)))}; warm-up {args.warmup if args.warmup is not None else manifest.get('warmup_s', WARMUP_S):g} s; per seed in {out_dir / TABLE_FILE}")
     incomplete = table.filter(~pl.col("complete")) if "complete" in table.columns else table.head(0)
-    if len(incomplete):
-        print(f"missing runs for {len(incomplete)} (layout, seed) rows: " + ", ".join(f"{r['layout_id']}@s{r['seed']}" for r in incomplete.to_dicts()))
+    reasons: dict[str, list[str]] = {}
+    for r in incomplete.to_dicts():
+        reasons.setdefault(str(r.get("incomplete") or "missing runs"), []).append(f"{r['layout_id']}@s{r['seed']}")
+    for reason, where in reasons.items():
+        print(f"{len(where)} (layout, seed) rows not complete ({reason}): " + ", ".join(where))
     _print_layouts(means)
     if args.infra == "premise":
         result = premise(table)
