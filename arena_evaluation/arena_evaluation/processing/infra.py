@@ -210,17 +210,23 @@ def check_commits(run_dirs: typing.Sequence[pathlib.Path], *, allow_mixed: bool 
 def check_kept_times(run_dirs: typing.Sequence[pathlib.Path], warmup_s: float, *, allow_mixed: bool = False) -> None:
     """Fail when the walker times kept in `run_dirs` for `warmup_s` (`walker_times`) were computed by different
     arena_evaluation commits: each machine keeps its own runs' times, and they must come from one release.
-    `allow_mixed` warns instead. A dirty checkout is compared by its commit, with a warning, as in `check_commits`."""
+    `allow_mixed` warns instead. A dirty checkout is compared by its commit, with a warning, as in `check_commits`; times
+    whose commit git could not read are not compared, with a warning. The commit is the one that computed the times
+    from the tracks (`evaluation infra times` or the analysis), not the one that extracted the topics and built the
+    tracks, which can be older: the track store's version in the times' dir name covers that."""
     found: dict[str, list[pathlib.Path]] = {}
     for run_dir in run_dirs:
         for path in pathlib.Path(run_dir).glob(f"episodes/*/{TOPICS_DIR}/.derived/{times_dir()}/*.w{_warmup_key(warmup_s)}.parquet"):
             processing = (times_provenance(path) or {}).get("arena_evaluation") or {}
-            commit = str(processing.get("commit") or "unknown")
+            if not processing.get("commit"):
+                _warn(f"{run_dir}: walker times kept without a readable arena_evaluation commit ({processing.get('reason') or 'git could not read the checkout'}), so their code is not compared")
+                continue
+            commit = str(processing["commit"])
             if processing.get("dirty"):
                 _warn(f"{run_dir}: walker times kept by a dirty arena_evaluation checkout at {commit[:12]}, so the commit does not pin the code that computed them")
             found.setdefault(commit, []).append(pathlib.Path(run_dir))
     if len(found) > 1:
-        message = "walker times kept by different arena_evaluation commits: " + ", ".join(f"{c[:12]} in {', '.join(sorted({str(d) for d in dirs}))}" for c, dirs in found.items()) + "; keep them again with one release (`evaluation infra times`)"
+        message = "walker times kept by different arena_evaluation commits: " + ", ".join(f"{c[:12]} in {', '.join(sorted({str(d) for d in dirs}))}" for c, dirs in found.items()) + "; keep them again with one release: `evaluation infra times --recompute --benchmark <run dir>` where each run's tracks are"
         if not allow_mixed:
             raise ValueError(message + " (--allow-mixed-commits reads them anyway)")
         _warn(message)
@@ -382,6 +388,7 @@ def _times_code() -> str:
     try:
         source = inspect.getsource(_times) + inspect.getsource(paired_peds._travel_times)
     except (OSError, TypeError):
+        _warn("the source of _times and _travel_times cannot be read, so kept walker times are not re-keyed when that code changes")
         return "nosource"
     return hashlib.sha1(source.encode()).hexdigest()[:10]
 
@@ -431,26 +438,50 @@ def times_provenance(path: pathlib.Path) -> dict[str, typing.Any] | None:
     return json.loads(meta[TIMES_META]) if TIMES_META in meta else None
 
 
-def has_tracks(episode_dir: pathlib.Path, env: str) -> bool:
-    """Whether an episode can give the tracks of `env`: a current extraction of its recording holding that env. A copy
-    of a run dir without its topics has none, and the track store would read it as an episode without pedestrians."""
+#: the extracted tables the walker tracks are built from (`ped_track_store.TRACK_TOPICS`): one of them must be there
+_PED_TABLES = frozenset({"peds_physics", "peds"})
+
+
+def track_problem(episode_dir: pathlib.Path, env: str) -> str | None:
+    """Why an episode cannot give the walker tracks of `env`, None when it can: a current extraction of its recording
+    with that env and a pedestrian table. Without one, the track store would read the episode as one without walkers."""
     topics = pathlib.Path(episode_dir) / TOPICS_DIR
+    if not (topics / TopicParquetStore.VERSION_FILE).is_file():
+        return "no extraction of its recording (a copy of the run dir); run `evaluation infra times --benchmark <its run dir> --warmup <s>` where the run's tracks are, and copy the run dir again"
     if not TopicParquetStore.is_current(topics, frozenset()):
-        return False
-    return env in episode_envs(TopicParquetStore.read(topics) or {})
+        return "its extraction is of an older format; re-run `evaluation process` on the run dir"
+    cached = TopicParquetStore.cached_tables(topics)
+    if cached is not None and not (cached & _PED_TABLES):
+        return f"its extraction holds no pedestrian table ({', '.join(sorted(cached))}); re-run `evaluation process` with the pedestrian tables (e.g. --measures flow)"
+    bundle = episode_envs(TopicParquetStore.read(topics) or {}).get(env)
+    if bundle is None:
+        return f"its extraction holds no {env}; re-run `evaluation process` on the run dir"
+    if all(getattr(bundle, table, None) is None for table in _PED_TABLES):
+        return f"its extraction holds no pedestrian table for {env}; re-run `evaluation process` with the pedestrian tables (e.g. --measures flow)"
+    return None
 
 
-def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pl.DataFrame:
+def has_tracks(episode_dir: pathlib.Path, env: str) -> bool:
+    """Whether an episode can give the walker tracks of `env` (`track_problem`)."""
+    return track_problem(episode_dir, env) is None
+
+
+def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame:
     """`_times` of an episode's tracks of `env`, kept beside the tracks (`times_path`, with the computing code's
-    provenance) and read from there afterwards, so a copy of a run dir without its tracks reads the same. Raises
-    FileNotFoundError when nothing is kept for this warm-up and the episode has no tracks (`has_tracks`): a copy is
-    never scored as an episode without walkers."""
+    provenance) and read from there afterwards, so a copy of a run dir without its tracks reads the same; `recompute`
+    computes and keeps them again from the tracks. Raises FileNotFoundError when nothing is kept for this warm-up (or
+    `recompute`) and the episode cannot give its tracks (`track_problem`), and ValueError for empty tracks: every INFRA
+    episode has walkers, so an episode is never scored as one without them."""
     path = times_path(episode_dir, env, warmup_s)
-    if path.is_file():
+    if path.is_file() and not recompute:
         return pl.read_parquet(path)
     if not has_tracks(episode_dir, env):
-        raise FileNotFoundError(f"{episode_dir}: no walker times of {env} kept for a warm-up of {warmup_s:g} s ({TOPICS_DIR}/.derived/{times_dir()}/) and no tracks to compute them from; run `evaluation infra times --benchmark <its run dir> --warmup {warmup_s:g}` where the run's tracks are, and copy the run dir again")
-    times = _times(tracks_for_episode(episode_dir, env), warmup_s)
+        problem = (track_problem(episode_dir, env) or "no tracks").replace("--warmup <s>", f"--warmup {warmup_s:g}")
+        raise FileNotFoundError(f"{episode_dir}: no walker times of {env} kept for a warm-up of {warmup_s:g} s ({TOPICS_DIR}/.derived/{times_dir()}/) and no tracks to compute them from: {problem}")
+    tracks = tracks_for_episode(episode_dir, env)
+    if len(tracks) == 0:
+        raise ValueError(f"{episode_dir}: the tracks of {env} hold no walker; an INFRA episode always has them, re-run `evaluation process` on the run dir")
+    times = _times(tracks, warmup_s)
     times = times.select([pl.col(c).cast(t) if c in times.columns else pl.lit(None, dtype=t).alias(c) for c, t in _TIMES_SCHEMA.items()])
     _keep_times(path, times, warmup_s)
     return times
@@ -538,14 +569,14 @@ def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> 
     (with robots against without, over their own walk) where they finished both."""
     if not sources:
         return {}
-    mine = off.filter(pl.col("source_name").is_in(list(sources)))
+    mine = off.filter(pl.col("source_name").is_in(list(sources))).sort("key")  # sums in one order, as the cost's
     out: dict[str, typing.Any] = {}
     for row in mine.iter_rows(named=True):
         g = out.setdefault(_group(row["agent_type"], row["source_name"]), {"peds": 0, "walk_s": 0.0, "paired": 0, "off_s": 0.0, "on_s": 0.0})
         g["peds"] += 1
         g["walk_s"] += row["travel_s"]
     if on is not None and len(mine):
-        both = mine.select("key", "agent_type", "source_name", pl.col("travel_s").alias("off_s")).join(on.select("key", pl.col("travel_s").alias("on_s")), on="key")
+        both = mine.select("key", "agent_type", "source_name", pl.col("travel_s").alias("off_s")).join(on.select("key", pl.col("travel_s").alias("on_s")), on="key").sort("key")
         for row in both.iter_rows(named=True):
             g = out[_group(row["agent_type"], row["source_name"])]
             g["paired"] += 1
@@ -876,13 +907,14 @@ def _print_layouts(means: pl.DataFrame) -> None:
             print(f"{'':10s} {parts}")
 
 
-def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float) -> int:
-    """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`; the runs kept. Raises
-    FileNotFoundError naming the runs it could not keep (no times kept and no tracks), after keeping the others."""
+def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float, *, recompute: bool = False) -> int:
+    """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`, `recompute` computing
+    kept ones again from the tracks; the runs kept. Raises FileNotFoundError naming the runs it could not keep (no
+    times kept and no tracks), after keeping the others."""
     kept, missing = 0, []
     for run in runs_of(benchmark_dirs):
         try:
-            walker_times(run.episode_dir, run.env, warmup_s)
+            walker_times(run.episode_dir, run.env, warmup_s, recompute=recompute)
         except FileNotFoundError:
             missing.append(f"{run.episode_dir} ({run.env})")
             continue
@@ -896,7 +928,7 @@ def infra_command(args: typing.Any) -> int:
     """`evaluation infra {table,premise,pick,compare,times}`; see `add_infra_parser`."""
     if args.infra == "times":
         warmup = float(args.warmup if args.warmup is not None else (_manifest(args.manifest).get("warmup_s", WARMUP_S) if args.manifest else WARMUP_S))
-        kept = keep_times(args.benchmark, warmup)
+        kept = keep_times(args.benchmark, warmup, recompute=getattr(args, "recompute", False))
         print(f"kept the walker travel times of {kept} runs (warm-up {warmup:g} s) in {', '.join(map(str, _dirs(args.benchmark)))}; a copy of each run dir now needs only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/{times_dir()}/")
         return 0
     manifest = _manifest(args.manifest)
@@ -972,3 +1004,4 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir; repeatable")
     q.add_argument("--manifest", type=pathlib.Path, default=None, help="the suite's <suite>.layouts.json, for its warm-up")
     q.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g}); the analysis reads the times kept for its own warm-up")
+    q.add_argument("--recompute", action="store_true", help="compute kept times again from the tracks and replace them, e.g. to keep a run dir's times with one release")

@@ -446,7 +446,7 @@ def test_a_copy_without_times_for_the_warm_up_raises_with_the_real_track_store(t
     monkeypatch.setattr(infra, "tracks_for_episode", ped_track_store.tracks_for_episode)
     monkeypatch.setattr(infra, "has_tracks", _real_has_tracks)
     assert infra.layout_table(copies[0], copies[1], doc).equals(original)
-    with pytest.raises(FileNotFoundError, match=r"episode_000: no walker times of env_0 kept for a warm-up of 300 s .*evaluation infra times --benchmark <its run dir> --warmup 300"):
+    with pytest.raises(FileNotFoundError, match=r"episode_000: no walker times of env_0 kept for a warm-up of 300 s .*no extraction of its recording .*evaluation infra times --benchmark <its run dir> --warmup 300"):
         infra.layout_table(copies[0], copies[1], doc, warmup_s=300.0)
     # nothing empty is kept for that warm-up
     assert not list(copies[1].rglob(f"*.w{300.0!r}.parquet")) and not list(copies[0].rglob(f"*.w{300.0!r}.parquet"))
@@ -496,4 +496,94 @@ def test_walker_times_and_the_cost_are_the_same_bits_in_any_row_order() -> None:
     base = infra.cost_from_times(site, off, on)
     for k in range(10):
         shuffled = infra.cost_from_times(site.sample(fraction=1.0, shuffle=True, seed=k), off.sample(fraction=1.0, shuffle=True, seed=k + 100), on)
+        assert shuffled == base
+
+
+def _extraction(episode_dir: pathlib.Path, tables: dict[str, pl.DataFrame]) -> pathlib.Path:
+    """A current extraction of an episode holding `tables` for robot env_0_jackal_0, as `evaluation process` writes it."""
+    from arena_evaluation.processing.parquet_store import TopicParquetStore
+    from arena_evaluation.storage.schemas import TopicBundle
+
+    bundle = TopicBundle()
+    for name, frame in tables.items():
+        setattr(bundle, name, frame)
+    topics = episode_dir / "topics"
+    TopicParquetStore.write({"env_0_jackal_0": bundle}, topics, tables=frozenset(tables))
+    return topics
+
+
+def test_an_extraction_without_pedestrian_tables_or_of_an_older_format_gives_no_times(tmp_path: pathlib.Path) -> None:
+    from arena_evaluation.processing.parquet_store import TopicParquetStore
+
+    episode = tmp_path / "run" / "episodes" / "episode_000"
+    topics = _extraction(episode, {"odom": pl.DataFrame({"time_ns": [1, 2], "pos_x": [0.0, 1.0]})})  # e.g. --measures with robot tables only
+    assert TopicParquetStore.is_current(topics, frozenset()) and not infra.has_tracks(episode, "env_0")
+    assert "no pedestrian table (odom)" in infra.track_problem(episode, "env_0")
+    with pytest.raises(FileNotFoundError, match=r"no tracks to compute them from: its extraction holds no pedestrian table .*re-run `evaluation process`"):
+        infra.walker_times(episode, "env_0", 420.0)
+    assert not infra.times_path(episode, "env_0", 420.0).exists()
+    (topics / TopicParquetStore.VERSION_FILE).write_text("0\n")
+    assert "older format; re-run `evaluation process`" in infra.track_problem(episode, "env_0")
+
+
+def test_empty_tracks_are_refused_and_not_kept(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing.ped_track_store import empty_tracks
+
+    episode = tmp_path / "run" / "episodes" / "episode_000"
+    (episode / "topics").mkdir(parents=True)
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: True)
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda d, e: empty_tracks())
+    with pytest.raises(ValueError, match="the tracks of env_0 hold no walker"):
+        infra.walker_times(episode, "env_0", 420.0)
+    assert not infra.times_path(episode, "env_0", 420.0).exists()
+
+
+def test_recompute_keeps_the_times_again_and_mends_mixed_commits(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"part1": ("aaaa",), "part2": ("bbbb",)})
+    doc = json.loads(manifest.read_text())
+
+    def at(commit: str | None) -> None:
+        monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": commit, "dirty": False})
+
+    at("a" * 40)
+    infra.keep_times([site, dirs["part1"]], 420.0)
+    at("b" * 40)
+    infra.keep_times(dirs["part2"], 420.0)
+    with pytest.raises(ValueError, match=r"different arena_evaluation commits.*evaluation infra times --recompute --benchmark <run dir>"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    infra.keep_times([site, dirs["part1"]], 420.0)  # without --recompute the kept times stay as they are
+    with pytest.raises(ValueError, match="different arena_evaluation commits"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    assert infra.keep_times([site, dirs["part1"]], 420.0, recompute=True) == 6
+    path = infra.times_path(dirs["part1"] / "episodes" / "episode_000", "env_0", 420.0)
+    assert infra.times_provenance(path)["arena_evaluation"]["commit"] == "b" * 40
+    assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)["complete"].all()
+    # times whose commit git could not read are not compared, with a warning
+    at(None)
+    infra.keep_times([site, dirs["part1"], dirs["part2"]], 420.0, recompute=True)
+    capsys.readouterr()
+    assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)["complete"].all()
+    assert "walker times kept without a readable arena_evaluation commit" in capsys.readouterr().err
+
+
+def test_an_unreadable_code_source_warns(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import inspect
+
+    def unreadable(obj: object) -> str:
+        raise OSError("no source")
+
+    monkeypatch.setattr(inspect, "getsource", unreadable)
+    assert infra._times_code.__wrapped__() == "nosource"
+    assert "kept walker times are not re-keyed when that code changes" in capsys.readouterr().err
+
+
+def test_the_visitors_are_the_same_bits_in_any_row_order() -> None:
+    rng = np.random.default_rng(1)
+    peds = [("south_locker_wheelchair" if i < 600 else ("south_adult" if i % 3 else "north_wheel"), str(i), "adult" if i % 3 else "wheelchair_manual", 430.0 + float(rng.uniform(0, 50)), 430.0 + float(rng.uniform(100, 900))) for i in range(1500)]
+    site = infra._times(_tracks(peds), 420.0)
+    off = site.with_columns(pl.col("travel_s") * 1.0373)
+    on = site.with_columns(pl.col("travel_s") * 1.0911)
+    base = infra.cost_from_times(site, off, on, visitor_sources=["south_locker_wheelchair"])["visitors"]
+    for k in range(10):
+        shuffled = infra.cost_from_times(site, off.sample(fraction=1.0, shuffle=True, seed=k), on.sample(fraction=1.0, shuffle=True, seed=k + 1), visitor_sources=["south_locker_wheelchair"])["visitors"]
         assert shuffled == base
