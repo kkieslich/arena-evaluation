@@ -1,7 +1,13 @@
 """INFRA measures (study design §6, §8, §10, §12) over processed benchmark runs of `flowedit infra`'s suites.
 
 Inputs are benchmark directories `evaluation process` has run on (their `combined_metrics.parquet`, each episode's
-extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite:
+extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite. One suite's
+runs may lie in several run dirs (its parts recorded on several machines): they are read as one, their manifests must
+name the same Arena and humansim commits (`check_commits`), and a stage two of them hold is refused like a stage run
+twice. What the measures read of an episode is small once `evaluation infra times` has kept each run's walker travel
+times beside its tracks (`walker_times`): the run dir's `combined_metrics.parquet` and `manifest.yaml`, and per episode
+`topics/semantic_snapshot.parquet` and `topics/.derived/infra_times.v*/`; such a copy of a run dir reads like the
+original without its recording or its tracks.
 
 - **Robot service** (§6), from the fleet mode's task log (the `fleet` semantic entity, schema in kkieslich/Arena's
   `task_generator/tasks/robots/README.md#fleet-task-log`): `T` = the restricted mean task time (release to
@@ -46,7 +52,7 @@ import polars as pl
 
 from arena_evaluation.processing.metrics.social.paired_peds import _travel_times
 from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group
-from arena_evaluation.processing.ped_track_store import tracks_for_episode
+from arena_evaluation.processing.ped_track_store import TOPICS_DIR, tracks_for_episode
 
 #: The warm-up the analysis leaves out and the episode length (Kolja, 9 Nov: 25 min with 7 min warm-up)
 WARMUP_S = 420.0
@@ -63,6 +69,12 @@ FLEET_KIND = "fleet"
 TABLE_FILE = "infra_layouts.parquet"
 FIGURE_FILE = "infra_service_cost.png"
 _STAGE = re.compile(r"^(?P<world>.+)__s(?P<seed>\d+)$")
+#: the checkouts whose commits the run dirs read together must share (`check_commits`): the code that recorded them
+SAME_COMMITS = ("arena", "humansim")
+#: the runner's manifest of a run dir
+RUN_MANIFEST = "manifest.yaml"
+#: version of the kept walker travel times (`walker_times`); a change of `_times` bumps it
+TIMES_VERSION = 1
 _VISITOR = re.compile(r"_locker_(?P<group>.+)$")
 
 
@@ -112,15 +124,73 @@ def runs(benchmark_dir: pathlib.Path) -> list[Run]:
     return sorted(out.values(), key=lambda r: (r.world, r.seed, r.planner, r.episode, r.env))
 
 
+def runs_of(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path]) -> list[Run]:
+    """Every usable run of one or several processed benchmark dirs (`runs`), in one list."""
+    out: list[Run] = []
+    for benchmark_dir in _dirs(benchmark_dirs):
+        out.extend(runs(benchmark_dir))
+    return sorted(out, key=lambda r: (r.world, r.seed, r.planner, str(r.episode_dir), r.env))
+
+
+def _dirs(value: pathlib.Path | str | typing.Sequence[pathlib.Path | str]) -> list[pathlib.Path]:
+    """One run dir or several, as a list of paths."""
+    if isinstance(value, (str, pathlib.Path)):
+        return [pathlib.Path(value)]
+    return [pathlib.Path(v) for v in value]
+
+
 def unique(candidates: typing.Sequence[Run], what: str) -> Run | None:
     """The one run of `candidates`, None without any; ValueError naming the stage and its episodes when a stage was
-    run more than once (a retried step whose failed attempt still has a recording): the analysis never guesses."""
+    run more than once (a retried step whose failed attempt still has a recording, or a stage two run dirs read
+    together both hold): the analysis never guesses."""
     if not candidates:
         return None
-    if len({(r.episode, r.env) for r in candidates}) > 1:
-        episodes = ", ".join(f"episode_{r.episode:03d} ({r.env})" for r in candidates)
-        raise ValueError(f"{what}: stage {candidates[0].stage} has more than one usable run ({episodes}); remove the failed attempt or re-process")
+    if len({(r.episode_dir, r.env) for r in candidates}) > 1:
+        several = len({r.episode_dir.parent.parent for r in candidates}) > 1
+        episodes = ", ".join(f"episode_{r.episode:03d} ({r.env})" + (f" in {r.episode_dir.parent.parent}" if several else "") for r in candidates)
+        raise ValueError(f"{what}: stage {candidates[0].stage} has more than one usable run ({episodes}); remove the failed attempt or re-process" + ("; run dirs read together must not share a stage" if several else ""))
     return candidates[0]
+
+
+_WARNED: set[str] = set()
+
+
+def _warn(message: str) -> None:
+    """A warning on stderr, once per process."""
+    import sys
+
+    if message not in _WARNED:
+        _WARNED.add(message)
+        print(f"warning: {message}", file=sys.stderr)
+
+
+def check_commits(run_dirs: typing.Sequence[pathlib.Path]) -> None:
+    """Fail when the manifests of `run_dirs` name different commits of a SAME_COMMITS checkout: their runs ran other
+    code and do not belong in one comparison.
+
+    A run dir without a manifest, or with one that records no commits or not this checkout's, is not compared, with a
+    warning. A dirty checkout is compared by its commit, with a warning that the commit does not pin the code that ran."""
+    import yaml
+
+    seen: dict[str, dict[pathlib.Path, str]] = {}
+    for run_dir in run_dirs:
+        path = pathlib.Path(run_dir) / RUN_MANIFEST
+        doc = yaml.safe_load(path.read_text()) if path.is_file() else None
+        commits = doc.get("commits") if isinstance(doc, dict) else None
+        if not isinstance(commits, dict):
+            _warn(f"{run_dir}: " + (f"no {RUN_MANIFEST}" if doc is None else f"its {RUN_MANIFEST} records no commits") + ", so its Arena and humansim commits are not compared")
+            continue
+        for name in SAME_COMMITS:
+            entry = commits.get(name) if isinstance(commits.get(name), dict) else {}
+            if not entry.get("commit"):
+                _warn(f"{run_dir}: no {name} commit recorded ({entry.get('reason') or 'not in the manifest'}), so it is not compared")
+                continue
+            if entry.get("dirty"):
+                _warn(f"{run_dir}: its {name} checkout ({entry.get('path')}) was dirty at {str(entry['commit'])[:12]}, so the commit does not pin the code that ran")
+            seen.setdefault(name, {})[pathlib.Path(run_dir)] = str(entry["commit"])
+    for name, found in seen.items():
+        if len(set(found.values())) > 1:
+            raise ValueError(f"the run dirs ran different {name} commits: " + ", ".join(f"{d} {c[:12]}" for d, c in found.items()) + "; read only runs of one Arena release together")
 
 
 def restricted_mean(times: typing.Sequence[float], completed: typing.Sequence[bool], tau_s: float) -> float | None:
@@ -264,6 +334,30 @@ def _times(tracks: pl.DataFrame, warmup_s: float) -> pl.DataFrame:
     return done.join(sources, on="key", how="left")
 
 
+_TIMES_SCHEMA = {"key": pl.String, "agent_type": pl.String, "travel_s": pl.Float64, "source_name": pl.String}
+
+
+def times_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathlib.Path:
+    """Where the kept walker travel times of `env` in an episode lie for a warm-up of `warmup_s`, beside its tracks."""
+    return pathlib.Path(episode_dir) / TOPICS_DIR / ".derived" / f"infra_times.v{TIMES_VERSION}" / f"{env}.w{warmup_s:g}.parquet"
+
+
+def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pl.DataFrame:
+    """`_times` of an episode's tracks of `env`: kept beside the tracks on first use (when the episode has a topics
+    dir), and read from there afterwards, so a copy of a run dir without its tracks reads the same."""
+    path = times_path(episode_dir, env, warmup_s)
+    if path.is_file():
+        return pl.read_parquet(path)
+    times = _times(tracks_for_episode(episode_dir, env), warmup_s)
+    times = times.select([pl.col(c).cast(t) if c in times.columns else pl.lit(None, dtype=t).alias(c) for c, t in _TIMES_SCHEMA.items()])
+    if (pathlib.Path(episode_dir) / TOPICS_DIR).is_dir():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(".parquet.tmp")
+        times.write_parquet(temp)
+        temp.rename(path)
+    return times
+
+
 def _group(agent_type: str, source_name: str | None) -> str:
     """A pedestrian's group: a locker visitor's from its source name (`<end>_locker_<group>`), else its agent type's."""
     match = _VISITOR.search(source_name or "")
@@ -275,10 +369,15 @@ def cost(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFrame | None,
     robots and (None for a premise or element-only check) the layout with robots: per group the paired through-walkers,
     the total, element and traffic parts of `C_g`, the absolute delay, and the drops; `C_worst` and its group; the locker
     visitors' walk without robots and their traffic part."""
+    return cost_from_times(_times(site, warmup_s), _times(without, warmup_s), _times(robots, warmup_s) if robots is not None else None, visitor_sources=visitor_sources)
+
+
+def cost_from_times(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = ()) -> dict[str, typing.Any]:
+    """`cost` from the walker travel times (`_times`, `walker_times`) of the three runs in place of their tracks."""
     visitors = set(visitor_sources)
-    ref = _times(site, warmup_s).filter(~pl.col("source_name").is_in(list(visitors)) & (pl.col("source_name") != ""))
-    off = _times(without, warmup_s)
-    on = _times(robots, warmup_s) if robots is not None else None
+    ref = site.filter(~pl.col("source_name").is_in(list(visitors)) & (pl.col("source_name") != ""))
+    off = without
+    on = robots
     walkers = ref.select("key", "agent_type", "source_name", pl.col("travel_s").alias("site_s"))
     joined = walkers.join(off.select("key", pl.col("travel_s").alias("off_s")), on="key", how="left")
     if on is not None:
@@ -340,15 +439,19 @@ def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> 
 # --- tables ----------------------------------------------------------------------------------------------------------
 
 
-def layout_table(site_dir: pathlib.Path, layouts_dir: pathlib.Path, manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None) -> pl.DataFrame:
+def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts_dir: pathlib.Path | typing.Sequence[pathlib.Path], manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None) -> pl.DataFrame:
     """One row per layout of `manifest` and seed: its roles, the service of its fleet run, its pedestrian cost against
     the site as is at that seed (`cost`), flattened (`C_<group>`, `C_<group>_element`, `C_<group>_traffic`,
-    `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`)."""
+    `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`). `site_dir` and
+    `layouts_dir` may each be several run dirs (a suite's parts recorded on several machines), read as one."""
     warmup = float(manifest.get("warmup_s", WARMUP_S) if warmup_s is None else warmup_s)
     episode_s = float(manifest.get("episode_s") or 0.0) or None
     visitor_sources = list(manifest.get("visitor_sources") or [])
-    site_runs = runs(site_dir)
-    layout_runs = runs(layouts_dir)
+    site_dirs, layout_dirs = _dirs(site_dir), _dirs(layouts_dir)
+    check_commits([*site_dirs, *layout_dirs])
+    site_what, layouts_what = ", ".join(map(str, site_dirs)), ", ".join(map(str, layout_dirs))
+    site_runs = runs_of(site_dirs)
+    layout_runs = runs_of(layout_dirs)
     roles: dict[str, list[str]] = {}
     ranking: dict[str, float | None] = {}
     travel: dict[str, float | None] = {}
@@ -361,14 +464,14 @@ def layout_table(site_dir: pathlib.Path, layouts_dir: pathlib.Path, manifest: ty
     site_name = str(manifest["site"])
     for layout_id, world in world_of.items():
         for seed in manifest.get("seeds") or []:
-            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS], f"{layouts_dir} (without robots)")
-            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_dir} (with the fleet)")
-            ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_dir} (the site as is)")
+            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS], f"{layouts_what} (without robots)")
+            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_what} (with the fleet)")
+            ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_what} (the site as is)")
             row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": off is not None and on is not None and ref is not None}
             if on is not None:
                 row.update(service(fleet_log(on.episode_dir, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
             if off is not None and ref is not None:
-                measured = cost(tracks_for_episode(ref.episode_dir, ref.env), tracks_for_episode(off.episode_dir, off.env), None if on is None else tracks_for_episode(on.episode_dir, on.env), visitor_sources=visitor_sources, warmup_s=warmup)
+                measured = cost_from_times(walker_times(ref.episode_dir, ref.env, warmup), walker_times(off.episode_dir, off.env, warmup), None if on is None else walker_times(on.episode_dir, on.env, warmup), visitor_sources=visitor_sources)
                 row.update(_flatten(measured))
             rows.append(row)
     return pl.DataFrame(rows, infer_schema_length=None)
@@ -653,14 +756,30 @@ def _print_layouts(means: pl.DataFrame) -> None:
             print(f"{'':10s} {parts}")
 
 
+def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float) -> int:
+    """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`; the runs kept."""
+    kept = 0
+    for run in runs_of(benchmark_dirs):
+        walker_times(run.episode_dir, run.env, warmup_s)
+        kept += 1
+    return kept
+
+
 def infra_command(args: typing.Any) -> int:
-    """`evaluation infra {table,premise,pick,compare}`; see `add_infra_parser`."""
+    """`evaluation infra {table,premise,pick,compare,times}`; see `add_infra_parser`."""
+    if args.infra == "times":
+        warmup = float(args.warmup if args.warmup is not None else (_manifest(args.manifest).get("warmup_s", WARMUP_S) if args.manifest else WARMUP_S))
+        kept = keep_times(args.benchmark, warmup)
+        print(f"kept the walker travel times of {kept} runs (warm-up {warmup:g} s) in {', '.join(map(str, _dirs(args.benchmark)))}; a copy of each run dir now needs only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/infra_times.v{TIMES_VERSION}/")
+        return 0
     manifest = _manifest(args.manifest)
-    table = layout_table(args.site, args.layouts, manifest, warmup_s=args.warmup, tau_s=args.tau)
-    out_dir = pathlib.Path(args.output_dir or args.layouts)
+    layout_dirs = _dirs(args.layouts)
+    table = layout_table(args.site, layout_dirs, manifest, warmup_s=args.warmup, tau_s=args.tau)
+    out_dir = pathlib.Path(args.output_dir or layout_dirs[0])
+    out_dir.mkdir(parents=True, exist_ok=True)
     table.write_parquet(out_dir / TABLE_FILE)
     means = layout_means(table)
-    print(f"{len(table)} (layout, seed) rows from {args.layouts} against the site as is in {args.site}; warm-up {args.warmup if args.warmup is not None else manifest.get('warmup_s', WARMUP_S):g} s; per seed in {out_dir / TABLE_FILE}")
+    print(f"{len(table)} (layout, seed) rows from {', '.join(map(str, layout_dirs))} against the site as is in {', '.join(map(str, _dirs(args.site)))}; warm-up {args.warmup if args.warmup is not None else manifest.get('warmup_s', WARMUP_S):g} s; per seed in {out_dir / TABLE_FILE}")
     incomplete = table.filter(~pl.col("complete")) if "complete" in table.columns else table.head(0)
     if len(incomplete):
         print(f"missing runs for {len(incomplete)} (layout, seed) rows: " + ", ".join(f"{r['layout_id']}@s{r['seed']}" for r in incomplete.to_dicts()))
@@ -708,15 +827,20 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     p = subparsers.add_parser("infra", help="INFRA (study design §6, §10, §12): robot service and pedestrian cost per layout, the premise check, the selection pick, the evaluation comparison")
     sub = p.add_subparsers(dest="infra", required=True)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--site", type=pathlib.Path, required=True, help="processed benchmark dir of the site as is (flowedit infra reference) on the same seeds")
-    common.add_argument("--layouts", type=pathlib.Path, required=True, help="processed benchmark dir of a layout suite (premise, selection or evaluation)")
+    several = "; repeatable: a suite's parts from several run dirs (e.g. recorded on two machines) are read as one, they must name the same Arena and humansim commits and share no stage"
+    common.add_argument("--site", type=pathlib.Path, action="append", required=True, help=f"processed benchmark dir of the site as is (flowedit infra reference) on the same seeds{several}")
+    common.add_argument("--layouts", type=pathlib.Path, action="append", required=True, help=f"processed benchmark dir of a layout suite (premise, selection or evaluation){several}")
     common.add_argument("--manifest", type=pathlib.Path, required=True, help="the suite's <suite>.layouts.json from flowedit infra")
     common.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g})")
     common.add_argument("--tau", type=float, default=None, help="horizon of the restricted mean task time T, s (default the episode minus the warm-up; one value for a whole study)")
-    common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default --layouts)")
+    common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default the first --layouts)")
     common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
     sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
     sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the task rate at 75 %% of the wide layout's measured capacity")
     sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10 at equal service, the forecaster check, the T vs C_worst figure")
     q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick on the evaluation seeds, with bootstrap intervals and Holm")
     q.add_argument("--boot", type=int, default=10_000, help="bootstrap draws (default 10000)")
+    q = sub.add_parser("times", help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/infra_times.v{TIMES_VERSION}/ reads like the original (run it where the tracks are, before copying)")
+    q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir; repeatable")
+    q.add_argument("--manifest", type=pathlib.Path, default=None, help="the suite's <suite>.layouts.json, for its warm-up")
+    q.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g}); the analysis reads the times kept for its own warm-up")

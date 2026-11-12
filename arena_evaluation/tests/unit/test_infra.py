@@ -302,3 +302,102 @@ def test_runs_leave_out_failed_attempts_and_robot_references_and_a_stage_run_twi
     assert infra.unique([], "here") is None
     with pytest.raises(ValueError, match=r"stage w__s2 has more than one usable run \(episode_004 \(env_0\), episode_005 \(env_0\)\)"):
         infra.unique([r for r in found if r.stage == "w__s2"], "here")
+
+
+def _selection(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: dict[str, tuple[str, ...]]) -> tuple[pathlib.Path, dict[str, pathlib.Path], pathlib.Path]:
+    """The site as is and a selection of layouts aaaa and bbbb, its runs split into run dirs by `parts` (dir name ->
+    layouts), with tracks from a monkeypatched store: a layout's walkers are slower by its shift, twice with the fleet."""
+    site = _benchmark(tmp_path / "site", [("peds_only", "site__s1", 1, None), ("peds_only", "site__s2", 2, None)])
+    shift = {"aaaa": 30.0, "bbbb": 10.0}
+    dirs: dict[str, pathlib.Path] = {}
+    layout_runs: dict[pathlib.Path, list[tuple[str, str, int, pl.DataFrame | None]]] = {}
+    for part, layouts in parts.items():
+        runs_here = []
+        for layout in layouts:
+            for seed in (1, 2):
+                runs_here.append(("fleet_dwb", f"site__layout_{layout}__s{seed}", seed, _log({**LOG, "job.3.reason": "no path"})))
+                runs_here.append(("unhindered_peds", f"site__layout_{layout}__s{seed}", seed, None))
+        dirs[part] = _benchmark(tmp_path / part, runs_here)
+        layout_runs[dirs[part]] = runs_here
+
+    def fake(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        bench = episode_dir.parent.parent
+        if bench == site:
+            return _tracks(SITE)
+        planner, stage = layout_runs[bench][int(episode_dir.name.split("_")[1])][:2]
+        extra = shift[stage.split("_layout_")[1][:4]] * (2 if planner == "fleet_dwb" else 1)
+        return _tracks([(s, k, a, start, end + extra) for s, k, a, start, end in SITE])
+
+    monkeypatch.setattr(infra, "tracks_for_episode", fake)
+    manifest = tmp_path / "infra_h1.layouts.json"
+    manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
+    return site, dirs, manifest
+
+
+def _commits(run_dir: pathlib.Path, arena: str, humansim: str = "h" * 40) -> None:
+    import yaml
+
+    (run_dir / "manifest.yaml").write_text(yaml.safe_dump({"run_id": run_dir.name, "commits": {"arena": {"path": "/a", "commit": arena, "dirty": False}, "humansim": {"path": "/h", "commit": humansim, "dirty": False}}}))
+
+
+def test_a_suite_split_over_two_run_dirs_reads_as_one(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, one, manifest = _selection(tmp_path / "one", monkeypatch, {"sel": ("aaaa", "bbbb")})
+    whole = infra.layout_table(site, one["sel"], json.loads(manifest.read_text()))
+    site2, two, manifest2 = _selection(tmp_path / "two", monkeypatch, {"part1": ("aaaa",), "part2": ("bbbb",)})
+    for run_dir in (site2, *two.values()):
+        _commits(run_dir, "a" * 40)
+    split = infra.layout_table([site2], [two["part1"], two["part2"]], json.loads(manifest2.read_text()))
+    assert split.drop("world").equals(whole.drop("world")) and split["complete"].all()
+    # the command takes them as repeated --layouts, the outputs go to the first
+    import argparse
+
+    args = argparse.Namespace(infra="pick", site=[site2], layouts=[two["part1"], two["part2"]], manifest=manifest2, warmup=None, tau=None, output_dir=None, out=None, boot=200)
+    assert infra.infra_command(args) == 0
+    assert json.loads((two["part1"] / "infra_pick.json").read_text())["joint_pick"] == "bbbb"
+
+
+def test_run_dirs_of_different_commits_or_sharing_a_stage_are_refused(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"part1": ("aaaa",), "part2": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    with pytest.raises(ValueError, match=r"stage site__layout_aaaa__s1 has more than one usable run .* in .*part1.*; run dirs read together must not share a stage"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    for run_dir in (site, dirs["part1"]):
+        _commits(run_dir, "a" * 40)
+    _commits(dirs["part2"], "b" * 40)
+    with pytest.raises(ValueError, match="the run dirs ran different arena commits"):
+        infra.check_commits([site, dirs["part1"], dirs["part2"]])
+    _commits(dirs["part2"], "a" * 40, humansim="c" * 40)
+    with pytest.raises(ValueError, match="different humansim commits"):
+        infra.check_commits([site, dirs["part2"]])
+    infra.check_commits([site, dirs["part1"]])
+
+
+def test_kept_walker_times_let_a_copy_without_tracks_read_the_same(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+    import shutil
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    assert infra.infra_command(argparse.Namespace(infra="times", benchmark=[site, dirs["sel"]], manifest=manifest, warmup=None)) == 0
+    assert "kept the walker travel times of 10 runs (warm-up 420 s)" in capsys.readouterr().out
+    original = infra.layout_table(site, dirs["sel"], doc)
+    # copy only the small files, as from another machine
+    copies = []
+    for run_dir in (site, dirs["sel"]):
+        copy = tmp_path / "copy" / run_dir.name
+        for path in run_dir.rglob("*"):
+            rel = path.relative_to(run_dir)
+            if path.is_file() and (rel.name in ("combined_metrics.parquet", "semantic_snapshot.parquet") or "infra_times.v" in str(rel)):
+                (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, copy / rel)
+        copies.append(copy)
+
+    def no_tracks(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        raise AssertionError(f"read the tracks of {episode_dir}")
+
+    monkeypatch.setattr(infra, "tracks_for_episode", no_tracks)
+    copied = infra.layout_table(copies[0], copies[1], doc)
+    assert copied.equals(original)
+    # another warm-up needs the tracks again
+    with pytest.raises(AssertionError, match="read the tracks"):
+        infra.layout_table(copies[0], copies[1], doc, warmup_s=300.0)
