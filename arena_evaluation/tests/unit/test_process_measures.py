@@ -9,9 +9,9 @@ import pytest
 pl = pytest.importorskip("polars")
 pytest.importorskip("mcap_ros2.writer")
 
-from test_mcap_reader_topics import AGENT_STATES, EPISODE_RECORD, ODOMETRY, PEDESTRIANS, SEC, TF_MESSAGE, _every_topic_bag, _header, _transform, _write_bag
+from test_mcap_reader_topics import AGENT_STATES, EPISODE_RECORD, ODOMETRY, PATH, PEDESTRIANS, SEC, TF_MESSAGE, _every_topic_bag, _header, _transform, _write_bag
 
-from arena_evaluation.processing.mcap_reader import MCAPReader, channel_tables, recorded_tables, tf_transforms
+from arena_evaluation.processing.mcap_reader import MCAPReader, channel_tables, path_poses, recorded_tables, tf_transforms
 from arena_evaluation.processing.metrics.registry import MetricRegistry, calculator_tables, select_calculators
 from arena_evaluation.processing.parquet_store import TopicParquetStore
 from arena_evaluation.processing.pipeline import PIPELINE_TABLES, ProcessingPipeline, resolve_tables
@@ -75,6 +75,56 @@ def test_the_tf_walker_reads_what_the_generic_decoder_reads(tmp_path: pathlib.Pa
             assert [t.child_frame_id for t in tf_transforms(message.data, lambda frame, child: child.endswith(b"base_link"))] == [t.child_frame_id for t in generic if t.child_frame_id.endswith("base_link")]
             # a big-endian payload is left to the generic decoder
             assert tf_transforms(b"\x00\x00" + bytes(message.data[2:])) is None
+
+
+def _plan(frames: list[str], header_frame: str = "map", n: int | None = None) -> dict:
+    """A nav_msgs/Path whose i-th pose has frame id frames[i % len(frames)] and distinct values."""
+    import math
+
+    count = len(frames) if n is None else n
+    poses = []
+    for i in range(count):
+        yaw = 0.01 * i - 1.0
+        poses.append({"header": _header(i, 3 * i, frames[i % len(frames)]), "pose": {"position": {"x": 0.5 * i + 0.1, "y": -0.25 * i, "z": 0.001 * i}, "orientation": {"x": 0.0, "y": 0.0, "z": math.sin(yaw / 2), "w": math.cos(yaw / 2)}}})
+    return {"header": _header(1, 2, header_frame), "poses": poses}
+
+
+def test_the_plan_walker_reads_what_the_generic_decoder_reads(tmp_path: pathlib.Path):
+    from mcap.reader import NonSeekingReader
+    from mcap_ros2.decoder import DecoderFactory
+
+    plans = [
+        _plan(["map"], n=4000),  # one frame id: one strided gather
+        _plan(["map"], header_frame="", n=50),  # the poses start at the other alignment
+        _plan(["m", "ma", "map", "map_", "env_0/map", "x" * 31]),  # frame ids of every length mod 8
+        _plan(["map"] * 5 + ["odom"] + ["map"] * 7),  # one odd frame id in a run of equal ones
+        _plan(["map"], n=1),
+        _plan(["map"], n=0),
+    ]
+    bag = _write_bag(tmp_path / "plan.mcap", [("/env_0/jackal/plan", PATH, plan, (i + 1) * SEC) for i, plan in enumerate(plans)])
+    seen = 0
+    with bag.open("rb") as f:
+        for schema, channel, message in NonSeekingReader(f).iter_messages():
+            generic = DecoderFactory().decoder_for(channel.message_encoding, schema)(message.data).poses
+            fast = path_poses(message.data)
+            assert fast.shape == (len(generic), 7)
+            assert fast.tolist() == [[p.pose.position.x, p.pose.position.y, p.pose.position.z, p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w] for p in generic]
+            # a big-endian payload is left to the generic decoder
+            assert path_poses(b"\x00\x00" + bytes(message.data[2:])) is None
+            seen += 1
+    assert seen == len(plans)
+
+
+def test_the_plan_table_is_the_same_with_the_plan_walker_and_the_generic_decoder(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+    from arena_evaluation.processing import mcap_reader
+
+    plans = [_plan(["map"], n=300), _plan(["m", "map", "env_0/map"]), _plan(["map"], n=0)]
+    bag = _write_bag(tmp_path / "plan.mcap", [("/env_0/jackal/plan", PATH, plan, (i + 1) * SEC) for i, plan in enumerate(plans)])
+    fast = MCAPReader(bag).read(tmp_path / "fast")["env_0_jackal"].plan.collect()
+    monkeypatch.setattr(mcap_reader, "path_poses", lambda data: None)
+    generic = MCAPReader(bag).read(tmp_path / "generic")["env_0_jackal"].plan.collect()
+    assert fast.height == 3 and fast.equals(generic)
+    assert len(fast["poses_x"][0]) == 300
 
 
 def test_without_the_tf_table_only_robot_poses_and_env_anchors_are_kept_from_tf(tmp_path: pathlib.Path):

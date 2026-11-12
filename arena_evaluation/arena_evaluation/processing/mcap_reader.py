@@ -392,6 +392,65 @@ def _tf_decoder(generic: typing.Callable[[bytes], typing.Any], keep: typing.Call
     return decode
 
 
+_PATH_SCHEMA = "nav_msgs/msg/Path"
+_POSE_BYTES = 56  # geometry_msgs/Pose: position x, y, z and orientation x, y, z, w, float64
+
+
+class _PathPoses(typing.NamedTuple):
+    """The poses of a nav_msgs/Path as an (n, 7) float64 array: position x, y, z, orientation x, y, z, w."""
+
+    values: np.ndarray
+
+
+def path_poses(data: bytes | memoryview) -> np.ndarray | None:
+    """The poses of a serialized nav_msgs/Path as an (n, 7) float64 array (position x, y, z, orientation x, y, z, w),
+    the values mcap_ros2 decodes; None unless the payload is little-endian plain CDR, the encoding ROS 2 records.
+
+    It walks the CDR layout directly: a robot's global plan holds thousands of PoseStamped, and the generic decoder
+    spends seconds per plan building them (most of a fleet episode's extraction). Poses whose header frame ids have one
+    length (always, in practice) are read with one strided gather, any others pose by pose."""
+    if len(data) < 8 or data[0] != 0 or data[1] != 1:
+        return None
+    o = 4
+    (k,) = _U32.unpack_from(data, o + 8)  # header: stamp, then frame_id
+    o = 4 + ((o + 12 + k - 1) & ~3)  # align 4 counted from the payload start
+    (n,) = _U32.unpack_from(data, o)
+    o += 4
+    out = np.empty((n, 7), dtype=np.float64)
+    if n == 0:
+        return out
+    buf = np.frombuffer(data, dtype=np.uint8)
+    i = 0
+    while i < n:
+        o = 4 + ((o - 1) & ~3)  # a PoseStamped starts 4-aligned: stamp, frame_id, then the pose 8-aligned
+        (k,) = _U32.unpack_from(data, o + 8)
+        q = 4 + ((o + 12 + k + 3) & ~7)
+        if (o - 4) % 8 == 0 and i + 1 < n:
+            # from an 8-aligned start every pose with a frame id of this length takes the same stride
+            stride = (q - o) + _POSE_BYTES
+            m = min(n - i, (len(data) - o) // stride)
+            starts = o + stride * np.arange(m)
+            lengths = buf[(starts + 8)[:, None] + np.arange(4)].view("<u4").ravel()
+            same = int(np.argmin(lengths == k)) if not (lengths == k).all() else m
+            if same > 1:
+                out[i : i + same] = buf[(starts[:same] + (q - o))[:, None] + np.arange(_POSE_BYTES)].view("<f8")
+                i += same
+                o = int(starts[same - 1]) + stride
+                continue
+        out[i] = struct.unpack_from("<7d", data, q)
+        i += 1
+        o = q + _POSE_BYTES
+    return out
+
+
+def _path_decoder(generic: typing.Callable[[bytes], typing.Any]) -> typing.Callable[[bytes], typing.Any]:
+    def decode(data: bytes) -> typing.Any:  # noqa: ANN401 - a decoded Path or its poses
+        poses = path_poses(data)
+        return generic(data) if poses is None else _PathPoses(poses)
+
+    return decode
+
+
 _ENV_MAP = re.compile(r"^env_\d+/map$")
 
 
@@ -671,6 +730,8 @@ class MCAPReader:
                                     if decoder is not None:
                                         if schema.name == _TF_SCHEMA and channel.message_encoding == "cdr":
                                             decoder = _tf_decoder(decoder, None if keep_tf or channel.topic in _TF_STATIC_TOPICS else _robot_or_anchor)
+                                        elif schema.name == _PATH_SCHEMA and channel.message_encoding == "cdr":
+                                            decoder = _path_decoder(decoder)
                                         decoders[message.channel_id] = decoder
                                         break
                             if decoder is None:
@@ -1077,13 +1138,19 @@ class MCAPReader:
                             robot_name = get_robot_name(parts, env_key)
                             target = robot_data[robot_name]["plan"]
                             target["time_ns"].append(ts_ns)
-                            poses_x = []
-                            poses_y = []
-                            poses_yaw = []
-                            for pose_stamped in ros_msg.poses:
-                                poses_x.append(pose_stamped.pose.position.x)
-                                poses_y.append(pose_stamped.pose.position.y)
-                                poses_yaw.append(self._quaternion_to_yaw(pose_stamped.pose.orientation.x, pose_stamped.pose.orientation.y, pose_stamped.pose.orientation.z, pose_stamped.pose.orientation.w))
+                            if isinstance(ros_msg, _PathPoses):
+                                v = ros_msg.values
+                                poses_x = v[:, 0].tolist()
+                                poses_y = v[:, 1].tolist()
+                                poses_yaw = [self._quaternion_to_yaw(x, y, z, w) for x, y, z, w in v[:, 3:7].tolist()]
+                            else:
+                                poses_x = []
+                                poses_y = []
+                                poses_yaw = []
+                                for pose_stamped in ros_msg.poses:
+                                    poses_x.append(pose_stamped.pose.position.x)
+                                    poses_y.append(pose_stamped.pose.position.y)
+                                    poses_yaw.append(self._quaternion_to_yaw(pose_stamped.pose.orientation.x, pose_stamped.pose.orientation.y, pose_stamped.pose.orientation.z, pose_stamped.pose.orientation.w))
                             target["poses_x"].append(poses_x)
                             target["poses_y"].append(poses_y)
                             target["poses_yaw"].append(poses_yaw)
