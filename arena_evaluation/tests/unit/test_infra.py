@@ -249,6 +249,7 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
         return _tracks([(s, k, a, start, end + extra) for s, k, a, start, end in SITE])
 
     monkeypatch.setattr(infra, "tracks_for_episode", fake)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
     manifest = tmp_path / "infra_h1.layouts.json"
     manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
     args = argparse.Namespace(infra="pick", site=site, layouts=layouts, manifest=manifest, warmup=None, tau=None, output_dir=None, out=None, boot=200)
@@ -329,15 +330,17 @@ def _selection(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: d
         return _tracks([(s, k, a, start, end + extra) for s, k, a, start, end in SITE])
 
     monkeypatch.setattr(infra, "tracks_for_episode", fake)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)  # the fake store holds every episode
     manifest = tmp_path / "infra_h1.layouts.json"
     manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
     return site, dirs, manifest
 
 
-def _commits(run_dir: pathlib.Path, arena: str, humansim: str = "h" * 40) -> None:
+def _commits(run_dir: pathlib.Path, arena: str, humansim: str = "h" * 40, evaluation: str = "e" * 40) -> None:
     import yaml
 
-    (run_dir / "manifest.yaml").write_text(yaml.safe_dump({"run_id": run_dir.name, "commits": {"arena": {"path": "/a", "commit": arena, "dirty": False}, "humansim": {"path": "/h", "commit": humansim, "dirty": False}}}))
+    commits = {"arena": {"path": "/a", "commit": arena, "dirty": False}, "humansim": {"path": "/h", "commit": humansim, "dirty": False}, "arena_evaluation": {"path": "/e", "commit": evaluation, "dirty": True}}
+    (run_dir / "manifest.yaml").write_text(yaml.safe_dump({"run_id": run_dir.name, "commits": commits}))
 
 
 def test_a_suite_split_over_two_run_dirs_reads_as_one(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -369,6 +372,12 @@ def test_run_dirs_of_different_commits_or_sharing_a_stage_are_refused(tmp_path: 
     _commits(dirs["part2"], "a" * 40, humansim="c" * 40)
     with pytest.raises(ValueError, match="different humansim commits"):
         infra.check_commits([site, dirs["part2"]])
+    # the runner (arena_evaluation) records the episodes: its commit is compared too
+    _commits(dirs["part2"], "a" * 40, evaluation="f" * 40)
+    with pytest.raises(ValueError, match=r"different arena_evaluation commits.*--allow-mixed-commits"):
+        infra.check_commits([site, dirs["part2"]])
+    infra.check_commits([site, dirs["part2"]], allow_mixed=True)  # warns
+    # a dirty checkout is compared by its commit (the manifests above record a dirty arena_evaluation)
     infra.check_commits([site, dirs["part1"]])
 
 
@@ -387,7 +396,7 @@ def test_kept_walker_times_let_a_copy_without_tracks_read_the_same(tmp_path: pat
         copy = tmp_path / "copy" / run_dir.name
         for path in run_dir.rglob("*"):
             rel = path.relative_to(run_dir)
-            if path.is_file() and (rel.name in ("combined_metrics.parquet", "semantic_snapshot.parquet") or "infra_times.v" in str(rel)):
+            if path.is_file() and (rel.name in ("combined_metrics.parquet", "semantic_snapshot.parquet") or "infra_times." in str(rel)):
                 (copy / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, copy / rel)
         copies.append(copy)
@@ -396,8 +405,95 @@ def test_kept_walker_times_let_a_copy_without_tracks_read_the_same(tmp_path: pat
         raise AssertionError(f"read the tracks of {episode_dir}")
 
     monkeypatch.setattr(infra, "tracks_for_episode", no_tracks)
+    monkeypatch.setattr(infra, "has_tracks", _real_has_tracks)  # the copy has no extraction
     copied = infra.layout_table(copies[0], copies[1], doc)
     assert copied.equals(original)
-    # another warm-up needs the tracks again
-    with pytest.raises(AssertionError, match="read the tracks"):
+    # another warm-up needs the tracks, which the copy does not have: it says so
+    with pytest.raises(FileNotFoundError, match="no walker times of env_0 kept for a warm-up of 300 s"):
         infra.layout_table(copies[0], copies[1], doc, warmup_s=300.0)
+
+
+_real_has_tracks = infra.has_tracks
+
+
+def _small_copy(tmp_path: pathlib.Path, run_dirs: list[pathlib.Path]) -> list[pathlib.Path]:
+    """The small files of each run dir, and every episode's (empty) topics dir, as a copy made elsewhere."""
+    import shutil
+
+    copies = []
+    for run_dir in run_dirs:
+        copy = tmp_path / "copy" / run_dir.name
+        for path in run_dir.rglob("*"):
+            rel = path.relative_to(run_dir)
+            if path.is_file() and (rel.name in ("combined_metrics.parquet", "semantic_snapshot.parquet", "manifest.yaml") or "infra_times." in str(rel)):
+                (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, copy / rel)
+        for episode in (run_dir / "episodes").iterdir():
+            (copy / "episodes" / episode.name / "topics").mkdir(parents=True, exist_ok=True)
+        copies.append(copy)
+    return copies
+
+
+def test_a_copy_without_times_for_the_warm_up_raises_with_the_real_track_store(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing import ped_track_store
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    assert infra.keep_times([site, dirs["sel"]], 420.0) == 10
+    original = infra.layout_table(site, dirs["sel"], doc)
+    copies = _small_copy(tmp_path, [site, dirs["sel"]])
+    # the reading machine's real track store: it reads a topics dir without an extraction as an episode without walkers
+    monkeypatch.setattr(infra, "tracks_for_episode", ped_track_store.tracks_for_episode)
+    monkeypatch.setattr(infra, "has_tracks", _real_has_tracks)
+    assert infra.layout_table(copies[0], copies[1], doc).equals(original)
+    with pytest.raises(FileNotFoundError, match=r"episode_000: no walker times of env_0 kept for a warm-up of 300 s .*evaluation infra times --benchmark <its run dir> --warmup 300"):
+        infra.layout_table(copies[0], copies[1], doc, warmup_s=300.0)
+    # nothing empty is kept for that warm-up
+    assert not list(copies[1].rglob(f"*.w{300.0!r}.parquet")) and not list(copies[0].rglob(f"*.w{300.0!r}.parquet"))
+    with pytest.raises(FileNotFoundError, match=r"kept the walker times of 0 runs, but 8 have no tracks and none kept"):
+        infra.keep_times(copies[1], 300.0)
+
+
+def test_kept_times_name_the_track_store_and_their_code_and_record_the_commit(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing import ped_track_store
+
+    _, dirs, _ = _selection(tmp_path, monkeypatch, {"sel": ("aaaa",)})
+    episode = dirs["sel"] / "episodes" / "episode_000"
+    first = infra.walker_times(episode, "env_0", 420.0)
+    path = infra.times_path(episode, "env_0", 420.0)
+    assert path.is_file() and f".t{ped_track_store.TRACKS_VERSION}." in path.parent.name and path.name == "env_0.w420.0.parquet"
+    provenance = infra.times_provenance(path)
+    assert provenance["tracks_version"] == ped_track_store.TRACKS_VERSION and provenance["times_version"] == infra.TIMES_VERSION and provenance["warmup_s"] == 420.0
+    assert set(provenance["arena_evaluation"]) >= {"path", "commit", "dirty"} and provenance["code"] == infra._times_code()
+    # new tracks after a track store bump are never read through the old kept times
+    monkeypatch.setattr(ped_track_store, "TRACKS_VERSION", ped_track_store.TRACKS_VERSION + 1)
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda d, e: _tracks([("south_adult", "1", "adult", 500.0, 1000.0)]))
+    assert infra.times_path(episode, "env_0", 420.0) != path
+    again = infra.walker_times(episode, "env_0", 420.0)
+    assert not again.equals(first) and again["travel_s"].to_list() == [500.0]
+
+
+def test_walker_times_kept_by_different_commits_are_refused(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"part1": ("aaaa",), "part2": ("bbbb",)})
+    doc = json.loads(manifest.read_text())
+    for run_dir, commit in ((site, "a" * 40), (dirs["part1"], "a" * 40), (dirs["part2"], "b" * 40)):
+        monkeypatch.setattr(infra, "_processing", lambda c=commit: {"path": "/e", "commit": c, "dirty": False})
+        infra.keep_times(run_dir, 420.0)
+    with pytest.raises(ValueError, match=r"walker times kept by different arena_evaluation commits: aaaaaaaaaaaa in .*bbbbbbbbbbbb in .*part2"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc, allow_mixed_commits=True)["complete"].all()
+
+
+def test_walker_times_and_the_cost_are_the_same_bits_in_any_row_order() -> None:
+    rng = np.random.default_rng(0)
+    peds = [("south_adult" if i % 3 else "north_wheel", str(i), "adult" if i % 3 else "wheelchair_manual", 430.0 + float(rng.uniform(0, 50)), 430.0 + float(rng.uniform(100, 900))) for i in range(1500)]
+    tracks = _tracks(peds)
+    orders = {tuple(infra._times(tracks, 420.0)["key"].to_list()) for _ in range(10)}
+    assert len(orders) == 1 and list(next(iter(orders))) == sorted(next(iter(orders)))
+    site = infra._times(tracks, 420.0)
+    off = site.with_columns(pl.col("travel_s") * 1.0373)
+    on = site.with_columns(pl.col("travel_s") * 1.0911)
+    base = infra.cost_from_times(site, off, on)
+    for k in range(10):
+        shuffled = infra.cost_from_times(site.sample(fraction=1.0, shuffle=True, seed=k), off.sample(fraction=1.0, shuffle=True, seed=k + 100), on)
+        assert shuffled == base
