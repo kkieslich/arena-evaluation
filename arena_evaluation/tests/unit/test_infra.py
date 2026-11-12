@@ -450,7 +450,7 @@ def test_a_copy_without_times_for_the_warm_up_raises_with_the_real_track_store(t
         infra.layout_table(copies[0], copies[1], doc, warmup_s=300.0)
     # nothing empty is kept for that warm-up
     assert not list(copies[1].rglob(f"*.w{300.0!r}.parquet")) and not list(copies[0].rglob(f"*.w{300.0!r}.parquet"))
-    with pytest.raises(FileNotFoundError, match=r"kept the walker times of 0 runs, but 8 have no tracks and none kept"):
+    with pytest.raises(FileNotFoundError, match=r"kept the walker times of 0 runs, but could not keep 8: .*episode_000 \(env_0\): no walker times of env_0 kept for a warm-up of 300 s"):
         infra.keep_times(copies[1], 300.0)
 
 
@@ -587,3 +587,42 @@ def test_the_visitors_are_the_same_bits_in_any_row_order() -> None:
     for k in range(10):
         shuffled = infra.cost_from_times(site, off.sample(fraction=1.0, shuffle=True, seed=k), on.sample(fraction=1.0, shuffle=True, seed=k + 1), visitor_sources=["south_locker_wheelchair"])["visitors"]
         assert shuffled == base
+
+
+def test_a_row_without_a_completing_walker_is_not_complete(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    # every walker spawns before a 1,500 s warm-up: tracks, but no walker times
+    late = infra.layout_table(site, dirs["sel"], doc, warmup_s=1500.0)
+    assert not late["complete"].any() and late["c_worst"].is_null().all()
+    assert set(late["incomplete"].to_list()) == {"no walker spawned after the 1500 s warm-up and finished: the site as is, without robots, with the fleet"}
+    # the command says why
+    args = argparse.Namespace(infra="table", site=site, layouts=dirs["sel"], manifest=manifest, warmup=1500.0, tau=None, output_dir=None, out=None)
+    assert infra.infra_command(args) == 0
+    assert "4 (layout, seed) rows not complete (no walker spawned after the 1500 s warm-up and finished" in capsys.readouterr().out
+    # a missing run says so too
+    rows = infra.layout_table(site, dirs["sel"], {**doc, "seeds": [1, 2, 3]})
+    assert rows.filter(pl.col("seed") == 3)["incomplete"].to_list() == ["missing runs: the site as is, without robots, with the fleet"] * 2
+
+
+def test_kept_times_of_the_layout_before_this_version_are_never_read() -> None:
+    assert infra.TIMES_VERSION == 3 and infra.times_dir().startswith("infra_times.v3.")
+
+
+def test_keep_times_keeps_going_past_a_run_without_walkers_and_names_it(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing.ped_track_store import empty_tracks
+
+    _, dirs, _ = _selection(tmp_path, monkeypatch, {"sel": ("aaaa",)})
+    real = infra.tracks_for_episode
+
+    def one_empty(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        return empty_tracks() if episode_dir.name == "episode_001" else real(episode_dir, env)
+
+    monkeypatch.setattr(infra, "tracks_for_episode", one_empty)
+    with pytest.raises(ValueError, match=r"kept the walker times of 3 runs, but could not keep 1: .*episode_001 \(env_0\): the tracks of env_0 hold no walker"):
+        infra.keep_times(dirs["sel"], 420.0)
+    kept = sorted(p.parent.parent.parent.parent.name for p in dirs["sel"].rglob("env_0.w420.0.parquet"))
+    assert kept == ["episode_000", "episode_002", "episode_003"]
