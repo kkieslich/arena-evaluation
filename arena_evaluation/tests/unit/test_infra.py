@@ -55,6 +55,19 @@ def test_the_fleet_log_is_the_last_value_of_each_field_of_the_fleet_entity() -> 
     assert infra.log_from_snapshot(pl.DataFrame()) == {}
 
 
+def test_the_fleet_log_leaves_out_the_previous_episodes_latched_log() -> None:
+    # a recording starts with the log its lane's previous episode left latched (another t0, at time 0), then this
+    # episode's reset publishes its own log: a field only the previous episode wrote must not survive
+    previous = {"t0": "98.635", "job.0.kind": "delivery", "job.0.released": "134.657", "job.0.ended": "1015.317", "job.0.outcome": "abandoned", "charge.3.robot": "r0", "charge.3.started": "314.252", "charge.3.ended": "571.062", "charge.3.outcome": "charged"}
+    own = {"t0": "1600.698", "job.0.kind": "delivery", "job.0.released": "28.179", "charge.3.robot": "r2", "charge.3.queued": "1006.060"}
+    latched = pl.DataFrame([{**row, "time_ns": 0} for row in _log(previous).filter(pl.col("kind") == "fleet").to_dicts()])
+    later = _log(own).filter(pl.col("kind") == "fleet").with_columns(pl.lit(1_600_764_300_000).alias("time_ns"))
+    update = _log({"t0": "1600.698", "job.0.assigned": "28.238"}).filter(pl.col("kind") == "fleet").with_columns(pl.lit(1_628_969_400_000).alias("time_ns"))
+    log = infra.log_from_snapshot(pl.concat([latched, later, update]))
+    assert log == {**own, "job.0.assigned": "28.238"}
+    assert infra.jobs(log)[0]["ended"] is None and infra.charges(log)[0]["started"] is None
+
+
 def test_service_scores_the_jobs_released_after_the_warm_up() -> None:
     s = infra.service(LOG, warmup_s=420.0, episode_s=1500.0)
     assert (s["jobs_released"], s["jobs_completed"], s["jobs_failed"], s["jobs_abandoned"], s["jobs_open"], s["jobs_jammed"]) == (5, 2, 1, 1, 1, 1)
