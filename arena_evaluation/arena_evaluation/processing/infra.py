@@ -261,8 +261,8 @@ def restricted_mean(times: typing.Sequence[float], completed: typing.Sequence[bo
 
 
 def fleet_log(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, str]:
-    """The fleet mode's task log of `env` in an extracted episode: the last value of each field of its `fleet` entity,
-    {} without one."""
+    """The fleet mode's task log of `env` in an extracted episode: the last value of each field of its `fleet` entity
+    since the episode's reset (`log_from_snapshot`), {} without one."""
     path = pathlib.Path(episode_dir) / "topics" / "semantic_snapshot.parquet"
     if not path.is_file():
         return {}
@@ -271,13 +271,20 @@ def fleet_log(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, str]:
 
 
 def log_from_snapshot(snapshot: pl.DataFrame, env: str = "env_0") -> dict[str, str]:
-    """The task log of `env`'s `fleet` entity in a semantic snapshot table (`mcap_reader` layout)."""
+    """The task log of `env`'s `fleet` entity in a semantic snapshot table (`mcap_reader` layout): the last value of each
+    field from the episode's reset on. A recording starts with the semantic state its lane's previous episode left
+    latched, that episode's whole task log; the fleet mode writes `t0` on every reset, so the rows before the first one
+    with the last `t0` belong to an earlier episode and are left out (else a field this episode never wrote, a charge's
+    `ended`, a job's `outcome`, would keep the earlier episode's value)."""
     if len(snapshot) == 0 or "kind" not in snapshot.columns:
         return {}
     rows = snapshot.filter(pl.col("kind") == FLEET_KIND)
     if "env_id" in rows.columns and rows["env_id"].n_unique() > 1:
         rows = rows.filter(pl.col("env_id") == int(env.rsplit("_", 1)[-1]))
-    rows = rows.filter(pl.col("field") != "members").sort("time_ns")
+    rows = rows.filter(pl.col("field") != "members").sort("time_ns", maintain_order=True)
+    t0 = rows.filter(pl.col("field") == "t0")
+    if len(t0):
+        rows = rows.filter(pl.col("time_ns") >= t0.filter(pl.col("value_str") == t0["value_str"][-1])["time_ns"].min())
     return {field: value for field, value in rows.select("field", pl.col("value_str").fill_null("")).iter_rows()}
 
 
