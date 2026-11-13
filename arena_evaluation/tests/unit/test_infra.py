@@ -80,9 +80,32 @@ def test_service_scores_the_jobs_released_after_the_warm_up() -> None:
     assert infra.jobs(LOG)[1]["timeout_0"] == 330.0
     assert s["success_rate"] == pytest.approx(2 / 4) and s["jam_share"] == pytest.approx(1 / 4)
     assert (s["charges"], s["charger_queue_s"], s["charge_s"]) == (1, pytest.approx(30.0), pytest.approx(470.0))
+    # a log without top-ups (before they existed) has none
+    assert (s["top_ups"], s["top_up_s"]) == (0, 0.0)
     assert s["tasks_per_h"] == pytest.approx(2 / ((1500.0 - 420.0) / 3600.0))
     assert s["empty_batteries"] == 1
     assert infra.service({}, warmup_s=420.0)["task_time_s"] is None
+
+
+TOP_UPS = {
+    # before the warm-up: not scored
+    "top_up.0.robot": "r2", "top_up.0.charger": "charger_1", "top_up.0.dispatched": "300.000", "top_up.0.started": "500.000", "top_up.0.ended": "500.000", "top_up.0.outcome": "docked",
+    # docked after a 360 s trip: free for jobs from then on, its charging there is no time out of service
+    "top_up.1.robot": "r0", "top_up.1.soc_dispatched": "47.60", "top_up.1.charger": "charger_1", "top_up.1.dispatched": "700.000", "top_up.1.started": "1060.000", "top_up.1.soc_start": "29.00", "top_up.1.ended": "1060.000", "top_up.1.outcome": "docked", "top_up.1.soc_end": "29.00",
+    # given up on its way after 100 s, to a robot queued to charge
+    "top_up.2.robot": "r1", "top_up.2.charger": "charger_2", "top_up.2.dispatched": "800.000", "top_up.2.ended": "900.000", "top_up.2.outcome": "abandoned", "top_up.2.reason": "yielded", "top_up.2.yielded_to": "r3",
+    # still on its way at the episode end
+    "top_up.3.robot": "r2", "top_up.3.charger": "charger_1", "top_up.3.dispatched": "1450.000",
+}
+
+
+def test_service_counts_each_top_up_trip_as_time_out_of_service() -> None:
+    s = infra.service({**LOG, **TOP_UPS}, warmup_s=420.0, episode_s=1500.0)
+    assert (s["top_ups"], s["top_up_s"]) == (3, pytest.approx(360.0 + 100.0))
+    assert [infra.top_up_trip_s(t) for t in infra.top_ups(TOP_UPS)] == [200.0, 360.0, 100.0, None]
+    # everything else as without the top-ups
+    plain = infra.service(LOG, warmup_s=420.0, episode_s=1500.0)
+    assert {**s, "top_ups": 0, "top_up_s": 0.0} == plain
 
 
 SITE = [("south_adult", "1", "adult", 500.0, 800.0), ("south_wheelchair", "2", "wheelchair_manual", 500.0, 900.0), ("north_long_cane", "3", "blind_white_cane", 600.0, 1100.0), ("south_adult", "9", "adult", 100.0, 300.0)]
@@ -188,6 +211,20 @@ def test_the_premise_check_compares_c_worst_with_the_seed_spread_and_measures_th
     assert result["layouts"]["w1"]["roles"] == ["wide"] and result["layouts"]["n1"]["roles"] == ["narrow"]
     close = [{**r, "c_worst": 0.2 + 0.05 * (r["seed"] % 2)} for r in rows]
     assert infra.premise(_table(close))["raise_density"]
+
+
+def test_the_premise_capacity_counts_top_up_trips_as_time_out_of_service() -> None:
+    narrow, wide = {"jobs_completed": 10, "busy_s_per_job": 400.0, "charge_s": 600.0}, {"jobs_completed": 10, "busy_s_per_job": 200.0, "charge_s": 300.0}
+    result = infra.premise(_table(_premise_rows({**narrow, "top_up_s": 0.0}, {**wide, "top_up_s": 450.0})))
+    # the wide layout: 200 s per job plus 900 s of charging and 1350 s of top-up trips over 30 jobs
+    assert result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (200.0 + (900.0 + 1350.0) / 30), 2))
+    assert (result["layouts"]["w1"]["charge_s"], result["layouts"]["w1"]["top_up_s"]) == (900.0, 1350.0)
+    # without top-ups, or on a table from before they existed, the rate is the old one to the bit
+    old = infra.premise(_table(_premise_rows(narrow, wide)))
+    zero = infra.premise(_table(_premise_rows({**narrow, "top_up_s": 0.0}, {**wide, "top_up_s": 0.0})))
+    assert old["rate_per_h"] == zero["rate_per_h"] == round(0.75 * 4 * 3600 / (200.0 + 900.0 / 30), 2)
+    assert old["layouts"]["w1"]["busy_s_per_job"] == zero["layouts"]["w1"]["busy_s_per_job"]
+    assert old["layouts"]["n1"]["top_up_s"] == 0.0
 
 
 def test_the_premise_rate_comes_from_the_wide_layout_by_its_role_whichever_is_faster() -> None:

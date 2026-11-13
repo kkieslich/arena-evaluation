@@ -29,7 +29,9 @@ times of other code are never read, and times of different commits are refused l
   without robots and their traffic part.
 - **The premise check** (§10) on the narrowest and the widest layout: their `C_worst` gap against the seed spread,
   over both layouts, and the task rate the selection runs at, 75 % of the fleet's measured capacity in the wide layout
-  (`RATE_ROLE`); the narrow layout's capacity is reported, its service and cost count as layout cost.
+  (`RATE_ROLE`); the narrow layout's capacity is reported, its service and cost count as layout cost. The capacity
+  counts a robot out of service while it charges (the `charge` table) and while it drives to a charger to top up (the
+  `top_up` table, which takes no job meanwhile).
 - **The pick** (§5, §6): among the joint top 10, the layout with the lowest `C_worst` whose `T` is at most 1.05 times
   the robot-only pick's, both as means over the selection seeds; a layout with more than 20 % of its tasks failed by
   jams is dropped (§8).
@@ -317,6 +319,18 @@ def charges(log: typing.Mapping[str, str]) -> list[dict[str, typing.Any]]:
     return [{**c, **{k: _f(c.get(k)) for k in ("queued", "dispatched", "started", "ended", "soc_start", "soc_end")}} for c in _table(log, "charge")]
 
 
+def top_ups(log: typing.Mapping[str, str]) -> list[dict[str, typing.Any]]:
+    """The top-ups of a task log (opportunistic charging trips, which no queue sends), times and charges as floats."""
+    return [{**t, **{k: _f(t.get(k)) for k in ("dispatched", "started", "ended", "soc_dispatched", "soc_start", "soc_end")}} for t in _table(log, "top_up")]
+
+
+def top_up_trip_s(top_up: typing.Mapping[str, typing.Any]) -> float | None:
+    """Seconds a top-up kept its robot out of service: from `dispatched` to `started` (docked: free for jobs from then
+    on, charging while parked), or to `ended` for one abandoned on its way; None while it is still on its way."""
+    end = top_up["started"] if top_up["started"] is not None else top_up["ended"]
+    return None if top_up["dispatched"] is None or end is None else end - top_up["dispatched"]
+
+
 def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episode_s: float | None = None, tau_s: float | None = None) -> dict[str, typing.Any]:
     """Robot service of one run (§6) over the jobs released after `warmup_s`.
 
@@ -326,8 +340,11 @@ def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episod
     episode end at `episode_s - released`. So the slow jobs an episode cuts off still count. The plain mean over the
     completed jobs is `task_time_completed_s`, and `completed_share` and `censored_share` say how many there were. Also:
     success rate (completed over those that ended), counts by outcome and of jam failures, the time a job waited for a
-    robot and for docks, the charger queue time of charges queued after the warm-up, and completed tasks per hour of the
-    scored time (`episode_s` - `warmup_s`). Without `episode_s` the open jobs are left out of T."""
+    robot and for docks, the charger queue time of charges queued after the warm-up, the seconds charged (`charge_s`,
+    `dispatched` to `ended` of the charges queued after the warm-up that `charged`) and on top-up trips (`top_up_s`,
+    `top_up_trip_s` of the top-ups dispatched after the warm-up that docked or were abandoned), which the premise's
+    capacity counts as time out of service, and completed tasks per hour of the scored time (`episode_s` - `warmup_s`).
+    Without `episode_s` the open jobs are left out of T."""
     scored = [j for j in jobs(log) if j["released"] is not None and j["released"] >= warmup_s]
     ended = [j for j in scored if j["ended"] is not None]
     completed = [j for j in ended if j.get("outcome") == "completed"]
@@ -338,6 +355,8 @@ def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episod
     assign_waits = [j["assigned"] - j["released"] for j in completed if j["assigned"] is not None]
     dock_waits = [j["wait_s"] for j in completed if j["wait_s"] is not None]
     charging = [c["ended"] - c["dispatched"] for c in queued if c["dispatched"] is not None and c["ended"] is not None and c.get("outcome") == "charged"]
+    topped = [t for t in top_ups(log) if t["dispatched"] is not None and t["dispatched"] >= warmup_s]
+    trips = [trip for trip in map(top_up_trip_s, topped) if trip is not None]
     hours = None if episode_s is None or episode_s <= warmup_s else (episode_s - warmup_s) / 3600.0
     tau = tau_s if tau_s is not None else (episode_s - warmup_s if episode_s is not None else None)
     observed = [(j["ended"] - j["released"], j.get("outcome") == "completed") for j in ended]
@@ -364,6 +383,8 @@ def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episod
         "charges": len(queued),
         "charger_queue_s": float(np.mean(waits)) if waits else None,
         "charge_s": float(np.sum(charging)) if charging else 0.0,
+        "top_ups": len(topped),
+        "top_up_s": float(np.sum(trips)) if trips else 0.0,
         "tasks_per_h": len(completed) / hours if hours else None,
         "empty_batteries": len(_table(log, "empty")),
     }
@@ -837,7 +858,8 @@ RATE_ROLE = "wide"
 def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4, rate_role: str = RATE_ROLE) -> dict[str, typing.Any]:
     """§10's premise check: the two layouts' mean `C_worst` against the seed spread (the larger of their per-seed
     standard deviations), and the task rate at `utilisation` of the fleet's measured capacity in the layout with role
-    `rate_role`, the wide one: robots x 3600 over (busy seconds per completed job + charging seconds per completed job).
+    `rate_role`, the wide one: robots x 3600 over (busy seconds per completed job + seconds out of service per completed
+    job: charging, `charge_s`, and top-up trips, `top_up_s`; a table without `top_up_s` counts none).
 
     Both layouts stay in the `C_worst` comparison, and each reports its own measured capacity; only the wide one sets the
     rate. The narrow one's crowd cost and failed jobs are layout cost (at the study density it may complete no job at
@@ -848,7 +870,8 @@ def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4, 
         completed = float(sub["jobs_completed"].sum()) if "jobs_completed" in sub.columns else 0.0
         busy = sub["busy_s_per_job"].cast(pl.Float64).drop_nulls().to_numpy() if "busy_s_per_job" in sub.columns else np.array([])
         charge = float(sub["charge_s"].sum()) if "charge_s" in sub.columns else 0.0
-        per_job = (float(np.mean(busy)) + (charge / completed if completed else 0.0)) if len(busy) else None
+        top_up = float(sub["top_up_s"].sum() or 0.0) if "top_up_s" in sub.columns else 0.0
+        per_job = (float(np.mean(busy)) + ((charge + top_up) / completed if completed else 0.0)) if len(busy) else None
         roles = sorted({role for value in sub["roles"].drop_nulls().to_list() for role in str(value).split(",") if role}) if "roles" in sub.columns else []
         out["layouts"][layout_id[0] if isinstance(layout_id, tuple) else layout_id] = {
             "roles": roles,
@@ -856,6 +879,8 @@ def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4, 
             "c_worst_sd": float(c.std(ddof=1)) if len(c) > 1 else None,
             "seeds": len(c),
             "jobs_completed": int(completed),
+            "charge_s": charge,
+            "top_up_s": top_up,
             "busy_s_per_job": per_job,
             "rate_per_h": round(utilisation * robots * 3600.0 / per_job, 2) if per_job else None,
         }
