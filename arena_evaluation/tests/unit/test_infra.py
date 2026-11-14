@@ -257,6 +257,9 @@ def test_conflict_exposure_counts_walkers_near_a_driving_robot() -> None:
     # within 1 m of a robot at 1 m/s: 2 s for a, none for b (5 m off), 2 s for c
     assert out["adult"]["walkers"] == 2 and out["adult"]["exposed_s"] == pytest.approx(2.0, abs=0.6) and out["adult"]["exposure_s"] == pytest.approx(1.0, abs=0.3)
     assert out["wheelchair"]["walkers"] == 1 and out["wheelchair"]["exposure_s"] == pytest.approx(2.0, abs=0.6)
+    # within the joint ranking's 2 m band: 4 s for a and c, still none for b
+    wide = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": robot}, 420.0, band_m=infra.PREDICTION_BAND_M).iter_rows(named=True)}
+    assert wide["adult"]["exposed_s"] == pytest.approx(4.0, abs=0.6) and wide["wheelchair"]["exposure_s"] == pytest.approx(4.0, abs=0.6)
     # a parked robot exposes nobody, and before the warm-up nothing counts
     parked = robot.with_columns(pl.lit(100.0).alias("x"))
     assert infra.conflict_exposure(tracks, {"jackal_0": parked}, 420.0)["exposed_s"].sum() == 0.0
@@ -418,6 +421,7 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     assert (chosen["robot_only"], chosen["joint_pick"]) == ("aaaa", "bbbb")
     assert chosen["score_check"]["layouts"] <= 2 and "groups" in chosen["score_check"]
     assert table.filter(pl.col("layout_id") == "aaaa")["exposure_adult_s"].to_list() == [None, None]  # no robot tracks: not measured
+    assert table.filter(pl.col("layout_id") == "aaaa")[f"exposure_adult_{infra.PREDICTION_BAND_TAG}_s"].to_list() == [None, None]
     assert (layouts / "plots" / infra.FIGURE_FILE).is_file()
     printed = capsys.readouterr().out
     assert "joint pick: bbbb" in printed and "C_adult" in printed
@@ -638,6 +642,118 @@ def test_walker_times_kept_by_different_commits_are_refused(tmp_path: pathlib.Pa
     with pytest.raises(ValueError, match=r"walker times kept by different arena_evaluation commits: aaaaaaaaaaaa in .*bbbbbbbbbbbb in .*part2"):
         infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
     assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc, allow_mixed_commits=True)["complete"].all()
+
+
+def test_kept_conflict_exposure_records_its_provenance_and_is_never_read_as_walker_times(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import pyarrow.parquet as pq
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "a" * 40, "dirty": False})
+    infra.keep_times([site, dirs["sel"]], 420.0)
+    episode = dirs["sel"] / "episodes" / "episode_000"  # the fleet run of aaaa at seed 1
+    path, times = infra.exposure_path(episode, "env_0", 420.0), infra.times_path(episode, "env_0", 420.0)
+    assert path.is_file() and path.parent == times.parent
+    provenance = infra.exposure_provenance(path)
+    assert provenance["exposure_version"] == infra.EXPOSURE_VERSION and provenance["warmup_s"] == 420.0 and provenance["band_m"] == infra.CONFLICT_BAND_M
+    assert provenance["code"] == infra._exposure_code() and provenance["arena_evaluation"]["commit"] == "a" * 40
+    assert provenance["prediction_band_m"] == infra.PREDICTION_BAND_M == 2.0 and infra.PREDICTION_BAND_TAG == "2m" and path.name == f"env_0.exposure{infra.EXPOSURE_VERSION}.w420.0.parquet"
+    assert {"exposed_s", "exposure_s", "exposed_2m_s", "exposure_2m_s"} <= set(pl.read_parquet(path).columns)
+    assert infra.times_provenance(path) is None and infra.exposure_provenance(times) is None
+    # the commit check reads the exposure file as exposure, so one release gives no warning about times without a commit
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    assert "without a readable" not in capsys.readouterr().err
+    # exposure kept by two releases is refused as mixed, by its kind; the times of one release are not called mixed
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "b" * 40, "dirty": False})
+    infra.run_exposure(episode, "env_0", 420.0, recompute=True)
+    with pytest.raises(ValueError, match=r"^conflict exposure kept by different arena_evaluation commits: \w{12} in .*sel, \w{12} in .*sel; keep them again") as raised:
+        infra.layout_table(site, dirs["sel"], doc)
+    assert "walker times kept by different" not in str(raised.value)
+    # an exposure file without provenance is not compared and, in a copy without tracks, not read, with warnings
+    pq.write_table(pq.read_table(path).replace_schema_metadata({}), path)
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: False)
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    err = capsys.readouterr().err
+    assert "conflict exposure kept without its provenance" in err and f"{path.name} was kept by other code (no provenance" in err
+
+
+def test_exposure_kept_later_by_a_newer_release_never_makes_the_times_mixed(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    # times kept by release a with an older exposure version beside them; the analysis at release b computes the
+    # current exposure on first read: times of a and exposure of b are each of one release
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "a" * 40, "dirty": False})
+    infra.keep_times([site, dirs["sel"]], 420.0)
+    for path in dirs["sel"].rglob(f"*.exposure{infra.EXPOSURE_VERSION}.w420.0.parquet"):
+        pl.read_parquet(path).select("group", "walkers", "exposed_s", "exposure_s").write_parquet(path.with_name(path.name.replace(f"exposure{infra.EXPOSURE_VERSION}", "exposure2")))
+        path.unlink()
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "b" * 40, "dirty": False})
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    episode = dirs["sel"] / "episodes" / "episode_000"
+    assert infra.exposure_provenance(infra.exposure_path(episode, "env_0", 420.0))["arena_evaluation"]["commit"] == "b" * 40
+    assert infra.times_provenance(infra.times_path(episode, "env_0", 420.0))["arena_evaluation"]["commit"] == "a" * 40
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()  # read again: still not mixed
+    assert "different arena_evaluation commits" not in capsys.readouterr().err
+
+
+def test_exposure_of_an_older_version_or_other_code_is_computed_again_or_left_out_with_a_warning(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import pyarrow.parquet as pq
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    infra.keep_times([site, dirs["sel"]], 420.0)
+    episode = dirs["sel"] / "episodes" / "episode_000"
+    path = infra.exposure_path(episode, "env_0", 420.0)
+    # a current-version file of other code (a change without a version bump) is computed again where the tracks are
+    table = pq.read_table(path)
+    meta = json.loads(table.schema.metadata[infra.EXPOSURE_META])
+    pq.write_table(table.replace_schema_metadata({infra.EXPOSURE_META: json.dumps({**meta, "code": "0" * 10}).encode()}), path)
+    assert infra.run_exposure(episode, "env_0", 420.0) is not None and infra.exposure_provenance(path)["code"] == infra._exposure_code()
+    # ... and without the tracks it is left out with a warning that names it, never read as current
+    pq.write_table(table.replace_schema_metadata({infra.EXPOSURE_META: json.dumps({**meta, "code": "0" * 10}).encode()}), path)
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: False)
+    capsys.readouterr()
+    assert infra.run_exposure(episode, "env_0", 420.0) is None
+    assert f"{path.name} was kept by other code (0000000000" in capsys.readouterr().err
+    # a copy that holds only an older exposure version gives no exposure columns, with a warning, not silently
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: True)
+    for kept in dirs["sel"].rglob(f"*.exposure{infra.EXPOSURE_VERSION}.w420.0.parquet"):
+        kept.rename(kept.with_name(kept.name.replace(f"exposure{infra.EXPOSURE_VERSION}", "exposure2")))
+    copies = _small_copy(tmp_path, [site, dirs["sel"]])
+    monkeypatch.setattr(infra, "has_tracks", _real_has_tracks)
+    capsys.readouterr()
+    copied = infra.layout_table(copies[0], copies[1], doc)
+    err = capsys.readouterr().err
+    assert copied["complete"].all() and not [c for c in copied.columns if c.startswith("exposure_")]
+    assert "is not measured: only an older version is kept (env_0.exposure2.w420.0.parquet)" in err
+
+
+def test_the_kept_exposure_measures_both_bands(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # a robot drives along y = 0 at 1 m/s from t 400 to 600 s, a second one stays parked at (100, 5.5); walkers: a on the
+    # line at x = 100, b 1.5 m off it at x = 120 (inside 2 m, outside 1 m), d 5 m off at x = 100 (0.5 m from the parked
+    # robot), c (wheelchair) on the line at x = 150 from 450 s; walkers read every 0.5 s, band edges included
+    rows = []
+    for t in np.arange(0.0, 1000.0, 0.5):
+        for i, (key, agent, x, y, start) in enumerate((("a", "adult", 100.0, 0.0, 0.0), ("b", "adult", 120.0, 1.5, 0.0), ("d", "adult", 100.0, 5.0, 0.0), ("c", "wheelchair_manual", 150.0, 0.0, 450.0))):
+            if t >= start:
+                rows.append({"episode_id": 0, "time_ns": int((t + 50.0) * 1e9), "t": float(t), "agent_id": i, "key": key, "name": "", "source_name": "s", "source_seq": i, "agent_type": agent, "x": x, "y": y, "vx": 0.0, "vy": 0.0, "radius": 0.25})
+    tracks = pl.DataFrame(rows, schema=TRACK_SCHEMA)
+    times = np.arange(0.0, 1000.0, 0.1)
+    episode = tmp_path / "run" / "episodes" / "episode_000"
+    for robot, (x, y) in {"jackal_0": (np.clip(times - 400.0, 0.0, 200.0), np.zeros_like(times)), "jackal_1": (np.full_like(times, 100.0), np.full_like(times, 5.5))}.items():
+        (episode / "topics" / f"env_0_{robot}").mkdir(parents=True)
+        pl.DataFrame({"time_ns": ((times + 50.0) * 1e9).astype(np.int64), "pos_x_gt": x, "pos_y_gt": y}).write_parquet(episode / "topics" / f"env_0_{robot}" / "tf_gt.parquet")
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda episode_dir, env: tracks)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
+    out = {r["group"]: r for r in infra.run_exposure(episode, "env_0", 420.0).iter_rows(named=True)}
+    # 1 m: a 2.5 s (x 99-101), b and d none; 2 m: a 4.5 s (x 98-102) + b 2.5 s (|x - 120| <= 1.32), d none (the parked robot)
+    assert out["adult"]["walkers"] == 3 and out["adult"]["exposed_s"] == pytest.approx(2.5) and out["adult"]["exposed_2m_s"] == pytest.approx(7.0)
+    assert out["adult"]["exposure_s"] == pytest.approx(2.5 / 3) and out["adult"]["exposure_2m_s"] == pytest.approx(7.0 / 3)
+    assert out["wheelchair"]["walkers"] == 1 and out["wheelchair"]["exposed_s"] == pytest.approx(2.5) and out["wheelchair"]["exposed_2m_s"] == pytest.approx(4.5)
+    assert pl.read_parquet(infra.exposure_path(episode, "env_0", 420.0)).sort("group").equals(infra.run_exposure(episode, "env_0", 420.0).sort("group"))
 
 
 def test_walker_times_and_the_cost_are_the_same_bits_in_any_row_order() -> None:
