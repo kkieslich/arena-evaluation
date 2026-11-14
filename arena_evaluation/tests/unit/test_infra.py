@@ -635,9 +635,39 @@ def test_walker_times_kept_by_different_commits_are_refused(tmp_path: pathlib.Pa
     for run_dir, commit in ((site, "a" * 40), (dirs["part1"], "a" * 40), (dirs["part2"], "b" * 40)):
         monkeypatch.setattr(infra, "_processing", lambda c=commit: {"path": "/e", "commit": c, "dirty": False})
         infra.keep_times(run_dir, 420.0)
-    with pytest.raises(ValueError, match=r"walker times kept by different arena_evaluation commits: aaaaaaaaaaaa in .*bbbbbbbbbbbb in .*part2"):
+    with pytest.raises(ValueError, match=r"walker times or conflict exposure kept by different arena_evaluation commits: aaaaaaaaaaaa in .*bbbbbbbbbbbb in .*part2"):
         infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
     assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc, allow_mixed_commits=True)["complete"].all()
+
+
+def test_kept_conflict_exposure_records_its_provenance_and_is_never_read_as_walker_times(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import pyarrow.parquet as pq
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "a" * 40, "dirty": False})
+    infra.keep_times([site, dirs["sel"]], 420.0)
+    episode = dirs["sel"] / "episodes" / "episode_000"  # the fleet run of aaaa at seed 1
+    path, times = infra.exposure_path(episode, "env_0", 420.0), infra.times_path(episode, "env_0", 420.0)
+    assert path.is_file() and path.parent == times.parent
+    provenance = infra.exposure_provenance(path)
+    assert provenance["exposure_version"] == infra.EXPOSURE_VERSION and provenance["warmup_s"] == 420.0 and provenance["band_m"] == infra.CONFLICT_BAND_M
+    assert provenance["code"] == infra._exposure_code() and provenance["arena_evaluation"]["commit"] == "a" * 40
+    assert infra.times_provenance(path) is None and infra.exposure_provenance(times) is None
+    # the commit check reads the exposure file as exposure, so one release gives no warning about times without a commit
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    assert "without a readable" not in capsys.readouterr().err
+    # exposure kept by another release than the times is refused as mixed times are
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "b" * 40, "dirty": False})
+    infra.run_exposure(episode, "env_0", 420.0, recompute=True)
+    with pytest.raises(ValueError, match=r"walker times or conflict exposure kept by different arena_evaluation commits: aaaaaaaaaaaa in .*bbbbbbbbbbbb in .*sel"):
+        infra.layout_table(site, dirs["sel"], doc)
+    # an exposure file without provenance (kept before the files recorded it) is not compared, with a warning
+    pq.write_table(pq.read_table(path).replace_schema_metadata({}), path)
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    assert "conflict exposure kept without its provenance" in capsys.readouterr().err
 
 
 def test_walker_times_and_the_cost_are_the_same_bits_in_any_row_order() -> None:
