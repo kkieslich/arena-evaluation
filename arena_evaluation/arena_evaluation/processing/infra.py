@@ -32,14 +32,27 @@ times of other code are never read, and times of different commits are refused l
   (`RATE_ROLE`); the narrow layout's capacity is reported, its service and cost count as layout cost. The capacity
   counts a robot out of service while it charges (the `charge` table) and while it drives to a charger to top up (the
   `top_up` table, which takes no job meanwhile).
-- **The pick** (§5, §6): among the joint top 10, the layout with the lowest `C_worst` whose `T` is at most 1.05 times
-  the robot-only pick's, both as means over the selection seeds; a layout with more than 20 % of its tasks failed by
-  jams is dropped (§8).
+- **The pick** (§5, §6): among the joint top 10, the layout with the lowest `C_worst` as the mean over the selection
+  seeds. Equal service is held by the search's travel pre-filter (modelled travel within 1.05 times the robot-only
+  pick's); a joint layout whose measured `T` exceeds 1.05 times the robot-only pick's beyond its 95 % seed interval is
+  flagged, not dropped (an episode completes about two jobs at the study rate, too few to decide on). A layout with more
+  than 20 % of its tasks failed by jams is dropped (§8).
 - **The comparison** (§12) on the evaluation seeds: per seed the difference joint pick - robot-only pick of `C_worst`,
-  `T` (relative to the robot-only pick's) and `C_aid - C_adult` per aid group, with 95 % bootstrap intervals over
-  seeds (`experiments.stats.cluster_bootstrap`, a seed per cluster) and Holm across the two aid groups.
-- **The forecaster check** (§12): the rank correlation (Spearman) between the ranking score and the full-episode
-  `C_worst` over the joint top 10 and the random layouts.
+  `T` (relative to the robot-only pick's) and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds
+  (`experiments.stats.cluster_bootstrap`, a seed per cluster) and Holm across the two aid groups. The decision has
+  three outcomes: `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies below 0, `equivalent` when
+  its 90 % interval lies within +-`DELTA` (the smallest cost of interest, 0.01), else `inconclusive`. With a guideline
+  layout among the picks, joint - guideline and robot-only - guideline get the same rule, Holm across the two.
+- **The score check** (§12): Spearman between the predicted worst-group conflict exposure (the joint ranking's score,
+  `ranking_score`) and the measured `C_worst` over the selection layouts (robot-only, joint top 10, random), one-sided
+  permutation p; per group, the predicted exposure against the measured traffic part. The older forecaster check
+  (joint top 10 and random only) is reported beside it.
+- **Conflict exposure** (§11), measured per fleet run: per walker group, the seconds a walker spends within
+  `CONFLICT_BAND_M` (1 m) of a driving robot after the warm-up, over the group's walkers seen after it
+  (`conflict_exposure`, kept beside the walker times by `evaluation infra times`).
+- **Group cells** (`evaluation infra occupancy`): per walker group, the walker-seconds per 0.5 m cell of a run dir's
+  runs (`infra_occupancy.parquet`), the per-group occupancy the joint ranking reads (`flowedit infra layouts
+  --group-occupancy`).
 """
 
 from __future__ import annotations
@@ -70,8 +83,9 @@ JAM_DROP = 0.20
 #: The groups (§9) and the aid groups the comparison contrasts with adults (§12)
 GROUPS = ("adult", "wheelchair", "long_cane")
 AID_GROUPS = ("wheelchair", "long_cane")
-#: The runner's contestant of the runs without robots
+#: The runner's contestant of the runs without robots, and the site-as-is suite's contestant
 NO_ROBOTS = "unhindered_peds"
+SITE_PLANNER = "peds_only"
 FLEET_KIND = "fleet"
 TABLE_FILE = "infra_layouts.parquet"
 FIGURE_FILE = "infra_service_cost.png"
@@ -86,6 +100,22 @@ RUN_MANIFEST = "manifest.yaml"
 TIMES_VERSION = 3
 #: the parquet metadata key of a kept times file's provenance
 TIMES_META = b"infra_times"
+#: §12: the smallest cost of interest, the equivalence margin of the C_worst difference (the wheelchair users' element
+#: cost of every element at the narrowest section, premise check), and the level of the equivalence interval
+DELTA = 0.01
+EQUIVALENCE_LEVEL = 0.90
+#: §12: permutations of the score check's one-sided p
+SCORE_PERMUTATIONS = 10_000
+#: §11: a walker within this distance of a driving robot (faster than `MOVING_MPS`) counts as exposed to it [m], [m/s]
+CONFLICT_BAND_M = 1.0
+MOVING_MPS = 0.1
+#: the conflict exposure reads the walkers every this many seconds [s]
+EXPOSURE_STEP_S = 0.5
+#: version of the kept conflict exposure's layout
+EXPOSURE_VERSION = 1
+#: group cells: the file `evaluation infra occupancy` writes into a run dir, and the cell size
+OCCUPANCY_FILE = "infra_occupancy.parquet"
+OCCUPANCY_CELL_M = 0.5
 _VISITOR = re.compile(r"_locker_(?P<group>.+)$")
 
 
@@ -515,6 +545,120 @@ def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recomp
     return times
 
 
+# --- conflict exposure and group cells ------------------------------------------------------------------------------
+
+
+def robot_tracks(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, pl.DataFrame]:
+    """Each robot's ground-truth track of `env` in an extracted episode (`topics/<env>_<robot>/tf_gt.parquet`): time_ns,
+    x, y, world frame, by robot name; {} without one."""
+    topics = pathlib.Path(episode_dir) / TOPICS_DIR
+    out = {}
+    for path in sorted(topics.glob(f"{env}_*/tf_gt.parquet")):
+        table = pl.read_parquet(path, columns=["time_ns", "pos_x_gt", "pos_y_gt"]).sort("time_ns")
+        out[path.parent.name.removeprefix(f"{env}_")] = table.rename({"pos_x_gt": "x", "pos_y_gt": "y"})
+    return out
+
+
+def conflict_exposure(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataFrame], warmup_s: float, *, band_m: float = CONFLICT_BAND_M, moving_mps: float = MOVING_MPS, step_s: float = EXPOSURE_STEP_S) -> pl.DataFrame:
+    """§11's conflict exposure: per walker group, the seconds a walker spends within `band_m` of a robot that drives
+    faster than `moving_mps`, from the warm-up on, over the group's walkers seen then (`walkers`); `exposed_s` is the
+    group's sum. Walker tracks (`ped_track_store`: t from the episode start, time_ns) are read every `step_s`, robot
+    positions interpolated at those times from their ground-truth tracks (the same sim clock). Columns group, walkers,
+    exposed_s, exposure_s."""
+    schema = {"group": pl.String, "walkers": pl.Int64, "exposed_s": pl.Float64, "exposure_s": pl.Float64}
+    cut = tracks.filter(pl.col("t") >= warmup_s) if len(tracks) else tracks
+    if len(cut) == 0:
+        return pl.DataFrame(schema=schema)
+    cut = cut.with_columns(pl.struct("agent_type", "source_name").map_elements(lambda r: _group(r["agent_type"], r["source_name"]), return_dtype=pl.String).alias("group"))
+    walkers = cut.group_by("group").agg(pl.col("key").n_unique().alias("walkers"))
+    t0 = float((cut["time_ns"][0] / 1e9) - cut["t"][0])
+    times = np.unique(cut["t"].to_numpy())
+    period = float(np.median(np.diff(times))) if len(times) > 1 else step_s
+    stride = max(1, round(step_s / period)) if period > 0 else 1
+    kept = times[::stride]
+    dt = period * stride
+    sample = cut.filter(pl.col("t").is_in(kept.tolist()))
+    exposed = {}
+    if robots and len(sample):
+        t = sample["t"].to_numpy()
+        x, y = sample["x"].to_numpy(), sample["y"].to_numpy()
+        near = np.zeros(len(sample), dtype=bool)
+        for track in robots.values():
+            if len(track) < 2:
+                continue
+            rt = track["time_ns"].to_numpy() / 1e9 - t0
+            rx, ry = track["x"].to_numpy(), track["y"].to_numpy()
+            speed = np.hypot(np.gradient(rx, rt), np.gradient(ry, rt)) if len(np.unique(rt)) == len(rt) else np.zeros(len(rt))
+            px, py, pv = np.interp(t, rt, rx), np.interp(t, rt, ry), np.interp(t, rt, speed)
+            inside = (t >= rt[0]) & (t <= rt[-1])
+            near |= inside & (pv > moving_mps) & (np.hypot(x - px, y - py) <= band_m)
+        groups = sample["group"].to_numpy()
+        for group in np.unique(groups):
+            exposed[str(group)] = float(near[groups == group].sum() * dt)
+    rows = [{"group": r["group"], "walkers": int(r["walkers"]), "exposed_s": exposed.get(r["group"], 0.0), "exposure_s": exposed.get(r["group"], 0.0) / r["walkers"] if r["walkers"] else None} for r in walkers.sort("group").iter_rows(named=True)]
+    return pl.DataFrame(rows, schema=schema)
+
+
+def exposure_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathlib.Path:
+    """Where the kept conflict exposure of `env` in an episode lies for a warm-up of `warmup_s`: beside the kept walker
+    times (`times_dir`), so a copy of a run dir with them carries it too."""
+    return pathlib.Path(episode_dir) / TOPICS_DIR / ".derived" / times_dir() / f"{env}.exposure{EXPOSURE_VERSION}.w{_warmup_key(warmup_s)}.parquet"
+
+
+def run_exposure(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame | None:
+    """`conflict_exposure` of an episode, kept beside its tracks and read from there afterwards; None when nothing is
+    kept and the episode cannot give its tracks (a copy of the run dir without them)."""
+    path = exposure_path(episode_dir, env, warmup_s)
+    if path.is_file() and not recompute:
+        return pl.read_parquet(path)
+    if not has_tracks(episode_dir, env):
+        return None
+    out = conflict_exposure(tracks_for_episode(episode_dir, env), robot_tracks(episode_dir, env), warmup_s)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        out.write_parquet(path)
+    except OSError as e:
+        _warn(f"{path}: conflict exposure not kept ({e})")
+    return out
+
+
+def group_cells(tracks: pl.DataFrame, cell_m: float = OCCUPANCY_CELL_M) -> pl.DataFrame:
+    """Per walker group and `cell_m` cell (centres x, y on a grid from the origin), the walker-seconds of `tracks`: each
+    sample counts the tracks' sample period. Columns group, x, y, cell_m, ped_seconds."""
+    schema = {"group": pl.String, "x": pl.Float64, "y": pl.Float64, "cell_m": pl.Float64, "ped_seconds": pl.Float64}
+    if len(tracks) == 0:
+        return pl.DataFrame(schema=schema)
+    times = np.unique(tracks["t"].to_numpy())
+    period = float(np.median(np.diff(times))) if len(times) > 1 else 0.0
+    grouped = tracks.with_columns(
+        pl.struct("agent_type", "source_name").map_elements(lambda r: _group(r["agent_type"], r["source_name"]), return_dtype=pl.String).alias("group"),
+        (pl.col("x") / cell_m).floor().cast(pl.Int64).alias("j"),
+        (pl.col("y") / cell_m).floor().cast(pl.Int64).alias("i"),
+    )
+    cells = grouped.group_by("group", "i", "j").agg(pl.len().alias("n")).sort("group", "i", "j")
+    return cells.select(
+        pl.col("group"),
+        ((pl.col("j").cast(pl.Float64) + 0.5) * cell_m).alias("x"),
+        ((pl.col("i").cast(pl.Float64) + 0.5) * cell_m).alias("y"),
+        pl.lit(float(cell_m)).alias("cell_m"),
+        (pl.col("n").cast(pl.Float64) * period).alias("ped_seconds"),
+    )
+
+
+def occupancy(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], cell_m: float = OCCUPANCY_CELL_M) -> pl.DataFrame:
+    """The group cells (`group_cells`) of every usable run of `benchmark_dirs` (the site as is), with its world, stage
+    and planner, warm-up included as in the flow cells: what `flowedit infra layouts --group-occupancy` reads."""
+    frames = []
+    for run in runs_of(benchmark_dirs):
+        if not has_tracks(run.episode_dir, run.env):
+            raise FileNotFoundError(f"{run.episode_dir}: no walker tracks of {run.env}: {track_problem(run.episode_dir, run.env)}")
+        cells = group_cells(tracks_for_episode(run.episode_dir, run.env), cell_m)
+        frames.append(cells.with_columns(pl.lit(run.world).alias("world"), pl.lit(run.stage).alias("stage"), pl.lit(run.planner).alias("planner")))
+    if not frames:
+        raise ValueError(f"{', '.join(map(str, _dirs(benchmark_dirs)))}: no usable run")
+    return pl.concat(frames).select("world", "stage", "planner", "group", "x", "y", "cell_m", "ped_seconds")
+
+
 def _keep_times(path: pathlib.Path, times: pl.DataFrame, warmup_s: float) -> None:
     """Write kept times with their provenance; a run dir it cannot write to (a read-only copy) keeps none, with a warning."""
     import os
@@ -633,10 +777,12 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
     roles: dict[str, list[str]] = {}
     ranking: dict[str, float | None] = {}
     travel: dict[str, float | None] = {}
+    predicted: dict[str, dict[str, float]] = {}
     for record in manifest.get("runs") or []:
         roles.setdefault(record["layout_id"], []).append(record["role"])
         ranking.setdefault(record["layout_id"], record.get("ranking_score"))
         travel.setdefault(record["layout_id"], record.get("travel_m"))
+        predicted.setdefault(record["layout_id"], dict(record.get("exposure") or {}))
     world_of = {layout_id: pathlib.Path(path).name for layout_id, path in (manifest.get("worlds") or {}).items()}
     rows = []
     site_name = str(manifest["site"])
@@ -647,8 +793,12 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
             ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_what} (the site as is)")
             complete = off is not None and on is not None and ref is not None
             row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": complete, "incomplete": None if complete else "missing runs: " + ", ".join(what for what, r in (("the site as is", ref), ("without robots", off), ("with the fleet", on)) if r is None)}
+            row.update({f"pred_{group}": value for group, value in predicted.get(layout_id, {}).items()})
             if on is not None:
                 row.update(service(fleet_log(on.episode_dir, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
+                measured_exposure = run_exposure(on.episode_dir, on.env, warmup)
+                if measured_exposure is not None:
+                    row.update({f"exposure_{r['group']}_s": r["exposure_s"] for r in measured_exposure.iter_rows(named=True)})
             if off is not None and ref is not None:
                 times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": walker_times(off.episode_dir, off.env, warmup), "with the fleet": None if on is None else walker_times(on.episode_dir, on.env, warmup)}
                 measured = cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)
@@ -705,39 +855,41 @@ def layout_means(table: pl.DataFrame) -> pl.DataFrame:
 
 
 def pick(means: pl.DataFrame, *, slack: float = SERVICE_SLACK, jam_drop: float = JAM_DROP) -> dict[str, typing.Any]:
-    """The selection pick (§5, §6): the robot-only pick's mean `T`, and among the joint top 10 that are not dropped for
-    jams and whose mean `T` is within `slack` of it, the one with the lowest `C_worst` (the max over the groups' means).
-    ValueError without a robot-only run or a joint layout."""
+    """The selection pick (§5, §6): among the joint top 10 not dropped for jams, the one with the lowest `C_worst` (the
+    max over the groups' means). Equal service is held by the search's travel pre-filter, so measured `T` drops no
+    layout; a joint layout whose `T` exceeds `slack` times the robot-only pick's beyond its 95 % seed interval (`T_lo`
+    above the cap) is flagged (`t_over`). ValueError without a robot-only run or a joint layout."""
     rows = means.to_dicts()
     robot = next((r for r in rows if "robot_only" in str(r["roles"]).split(",")), None)
-    if robot is None or robot.get("task_time_s") is None:
-        raise ValueError("no robot-only layout with a task time among the runs")
-    t_cap = slack * float(robot["task_time_s"])
+    if robot is None:
+        raise ValueError("no robot-only layout among the runs")
+    t_robot = robot.get("task_time_s")
+    t_cap = None if t_robot is None else slack * float(t_robot)
     considered = []
     for r in rows:
         if "joint" not in str(r["roles"]).split(","):
             continue
         reasons = []
-        if r.get("task_time_s") is None or r.get("c_worst_of_means") is None:
+        if r.get("c_worst_of_means") is None:
             reasons.append("not measured")
-        else:
-            if r["task_time_s"] > t_cap:
-                reasons.append(f"T {r['task_time_s']:.1f} s over {t_cap:.1f} s")
-            if (r.get("jam_share") or 0.0) > jam_drop:
-                reasons.append(f"jams {r['jam_share']:.0%} of tasks")
-        considered.append({"layout_id": r["layout_id"], "task_time_s": r.get("task_time_s"), "c_worst": r.get("c_worst_of_means"), "worst_group": r.get("worst_group_of_means"), "excluded": "; ".join(reasons) or None})
+        elif (r.get("jam_share") or 0.0) > jam_drop:
+            reasons.append(f"jams {r['jam_share']:.0%} of tasks")
+        t_lo = r.get("T_lo")
+        t_over = bool(t_cap is not None and t_lo is not None and math.isfinite(t_lo) and t_lo > t_cap)
+        considered.append({"layout_id": r["layout_id"], "task_time_s": r.get("task_time_s"), "T_lo": t_lo, "T_hi": r.get("T_hi"), "t_over": t_over, "c_worst": r.get("c_worst_of_means"), "worst_group": r.get("worst_group_of_means"), "excluded": "; ".join(reasons) or None})
     eligible = [c for c in considered if c["excluded"] is None]
     if not considered:
         raise ValueError("no joint layout among the runs")
     best = min(eligible, key=lambda c: (c["c_worst"], c["layout_id"])) if eligible else None
     return {
         "robot_only": robot["layout_id"],
-        "robot_only_task_time_s": robot["task_time_s"],
+        "robot_only_task_time_s": t_robot,
         "robot_only_c_worst": robot.get("c_worst_of_means"),
         "task_time_cap_s": t_cap,
         "joint_pick": None if best is None else best["layout_id"],
         "joint_pick_task_time_s": None if best is None else best["task_time_s"],
         "joint_pick_c_worst": None if best is None else best["c_worst"],
+        "joint_pick_t_over": None if best is None else best["t_over"],
         "joint": considered,
     }
 
@@ -774,38 +926,91 @@ def forecaster_check(means: pl.DataFrame) -> dict[str, typing.Any]:
     return {"layouts": len(rows), "spearman": spearman([r.get("ranking_score") for r in rows], [r.get("c_worst_of_means") for r in rows])}
 
 
-def compare(table: pl.DataFrame, picks: typing.Mapping[str, str], *, slack: float = SERVICE_SLACK, n_boot: int = 10_000, seed: int = 0) -> dict[str, typing.Any]:
-    """§12 on the evaluation seeds: per seed joint pick - robot-only pick of `c_worst`, of `T` over the robot-only
-    pick's `T`, and of `C_aid - C_adult` per aid group; 95 % bootstrap intervals over seeds, Holm across the aid groups;
-    H1 holds when the interval of the `C_worst` difference lies below 0 and the relative `T` difference stays within
-    `slack` - 1, "most for aid users" when an aid group's Holm-adjusted p < 0.05 with its interval below 0."""
+def permutation_p(x: typing.Sequence[float | None], y: typing.Sequence[float | None], *, n_perm: int = SCORE_PERMUTATIONS, seed: int = 0) -> tuple[float, float, int]:
+    """Spearman's rho of the finite pairs of `x` and `y`, the one-sided permutation p of a rho at least as large
+    ((1 + permutations reaching it) / (1 + n_perm), y shuffled), and the pairs used; (nan, nan, n) below 3 pairs."""
+    pairs = [(float(a), float(b)) for a, b in zip(x, y, strict=True) if a is not None and b is not None and math.isfinite(a) and math.isfinite(b)]
+    rho = spearman([p[0] for p in pairs], [p[1] for p in pairs])
+    if not math.isfinite(rho):
+        return math.nan, math.nan, len(pairs)
+    rng = np.random.default_rng(seed)
+    xs, ys = [p[0] for p in pairs], np.array([p[1] for p in pairs])
+    reached = sum(1 for _ in range(n_perm) if spearman(xs, rng.permutation(ys).tolist()) >= rho - 1e-12)
+    return rho, (1 + reached) / (1 + n_perm), len(pairs)
+
+
+def score_check(means: pl.DataFrame, *, n_perm: int = SCORE_PERMUTATIONS, seed: int = 0) -> dict[str, typing.Any]:
+    """§12's score check over the selection layouts (robot-only, joint, random): Spearman between the joint ranking's
+    predicted worst-group conflict exposure (`ranking_score`) and the measured `C_worst` (the max over the groups'
+    means), one-sided permutation p; it holds when p < 0.05. Per group: the predicted exposure (`pred_<group>`, or the
+    one prediction of all walkers, `pred_all`) against the group's measured traffic part `C_<group>_traffic`."""
+    rows = [r for r in means.to_dicts() if {"robot_only", "joint", "random"} & set(str(r["roles"]).split(","))]
+    rho, p, n = permutation_p([r.get("ranking_score") for r in rows], [r.get("c_worst_of_means") for r in rows], n_perm=n_perm, seed=seed)
+    out: dict[str, typing.Any] = {"layouts": n, "spearman": rho, "p": p, "holds": bool(math.isfinite(p) and p < 0.05), "groups": {}}
+    for group in GROUPS:
+        key = f"pred_{group}" if any(r.get(f"pred_{group}") is not None for r in rows) else "pred_all"
+        g_rho, g_p, g_n = permutation_p([r.get(key) for r in rows], [r.get(f"C_{group}_traffic") for r in rows], n_perm=n_perm, seed=seed)
+        out["groups"][group] = {"predicted": key, "layouts": g_n, "spearman": g_rho, "p": g_p}
+    return out
+
+
+def _verdict(d95: typing.Mapping[str, typing.Any], d90: typing.Mapping[str, typing.Any], delta: float) -> str:
+    """§12's three outcomes of a C_worst difference: `lower` when its 95 % interval lies below 0, `equivalent` when its
+    90 % interval lies within +-`delta`, else `inconclusive`."""
+    if math.isfinite(d95["ci_high"]) and d95["ci_high"] < 0:
+        return "lower"
+    if math.isfinite(d90["ci_low"]) and math.isfinite(d90["ci_high"]) and d90["ci_low"] > -delta and d90["ci_high"] < delta:
+        return "equivalent"
+    return "inconclusive"
+
+
+def compare(table: pl.DataFrame, picks: typing.Mapping[str, str], *, slack: float = SERVICE_SLACK, delta: float = DELTA, n_boot: int = 10_000, seed: int = 0) -> dict[str, typing.Any]:
+    """§12 on the evaluation seeds. The primary contrast joint pick - robot-only pick, per seed: `c_worst`, `T` over the
+    robot-only pick's `T`, and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds and Holm across the
+    aid groups. Its verdict (`_verdict`): `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies
+    below 0, `equivalent` when the 90 % interval lies within +-`delta`, else `inconclusive`; the relative `T` difference
+    is reported (equal service is the search's travel pre-filter). With a `guideline` pick, joint - guideline and
+    robot-only - guideline get the same verdict, `lower` only where the Holm-adjusted p (across the two) is below 0.05
+    too. "Most for aid users" holds for an aid group whose Holm-adjusted p < 0.05 with its interval below 0."""
     from arena_evaluation.experiments.stats import cluster_bootstrap, holm
 
-    joint, robot = table.filter(pl.col("layout_id") == picks["joint"]), table.filter(pl.col("layout_id") == picks["robot_only"])
-    pairs = joint.join(robot, on="seed", suffix="_ro")
     rng = np.random.default_rng(seed)
 
-    def boot(values: np.ndarray) -> dict[str, typing.Any]:
+    def boot(values: np.ndarray, level: float = 0.95) -> dict[str, typing.Any]:
         values = values[np.isfinite(values)]
-        res = cluster_bootstrap([np.array([v]) for v in values], n_boot=n_boot, rng=rng)
+        res = cluster_bootstrap([np.array([v]) for v in values], n_boot=n_boot, rng=rng, level=level)
         return {"estimate": res.estimate, "ci_low": res.ci_low, "ci_high": res.ci_high, "p": res.p, "seeds": res.n_pairs}
 
-    def col(name: str) -> np.ndarray:
-        return pairs[name].cast(pl.Float64).fill_null(float("nan")).to_numpy() if name in pairs.columns else np.full(len(pairs), np.nan)
+    def contrast(a: str, b: str) -> tuple[dict[str, typing.Any], pl.DataFrame]:
+        pairs = table.filter(pl.col("layout_id") == picks[a]).join(table.filter(pl.col("layout_id") == picks[b]), on="seed", suffix="_b")
 
-    out: dict[str, typing.Any] = {"picks": dict(picks), "seeds": pairs["seed"].to_list()}
-    out["delta_c_worst"] = boot(col("c_worst") - col("c_worst_ro"))
-    out["delta_t_rel"] = boot((col("task_time_s") - col("task_time_s_ro")) / col("task_time_s_ro"))
-    aid = {}
-    for group in AID_GROUPS:
-        aid[group] = boot((col(f"C_{group}") - col(f"C_{group}_ro")) - (col("C_adult") - col("C_adult_ro")))
+        def col(name: str) -> np.ndarray:
+            return pairs[name].cast(pl.Float64).fill_null(float("nan")).to_numpy() if name in pairs.columns else np.full(len(pairs), np.nan)
+
+        d = col("c_worst") - col("c_worst_b")
+        d95, d90 = boot(d), boot(d, EQUIVALENCE_LEVEL)
+        out = {"a": picks[a], "b": picks[b], "seeds": pairs["seed"].to_list(), "delta_c_worst": d95, "delta_c_worst_90": d90, "delta_t_rel": boot((col("task_time_s") - col("task_time_s_b")) / col("task_time_s_b")), "verdict": _verdict(d95, d90, delta)}
+        for group in AID_GROUPS:
+            out.setdefault("delta_aid_minus_adult", {})[group] = boot((col(f"C_{group}") - col(f"C_{group}_b")) - (col("C_adult") - col("C_adult_b")))
+        return out, pairs
+
+    main, pairs = contrast("joint", "robot_only")
+    aid = main["delta_aid_minus_adult"]
     adjusted = holm([aid[g]["p"] for g in AID_GROUPS])
     for group, p in zip(AID_GROUPS, adjusted, strict=True):
         aid[group]["p_holm"] = p
         aid[group]["holds"] = bool(aid[group]["ci_high"] < 0 and p < 0.05) if math.isfinite(aid[group]["ci_high"]) and math.isfinite(p) else False
-    out["delta_aid_minus_adult"] = aid
-    d, t = out["delta_c_worst"], out["delta_t_rel"]
-    out["h1_holds"] = bool(math.isfinite(d["ci_high"]) and d["ci_high"] < 0 and math.isfinite(t["estimate"]) and abs(t["estimate"]) <= slack - 1.0)
+    out: dict[str, typing.Any] = {"picks": dict(picks), "seeds": main["seeds"], "delta": delta, **{k: main[k] for k in ("delta_c_worst", "delta_c_worst_90", "delta_t_rel", "delta_aid_minus_adult", "verdict")}}
+    out["h1_holds"] = main["verdict"] == "lower"
+    if picks.get("guideline"):
+        secondary = {f"{a}_minus_guideline": contrast(a, "guideline")[0] for a in ("joint", "robot_only")}
+        adjusted = holm([c["delta_c_worst"]["p"] for c in secondary.values()])
+        for c, p in zip(secondary.values(), adjusted, strict=True):
+            c["p_holm"] = p
+            if c["verdict"] == "lower" and not (math.isfinite(p) and p < 0.05):
+                d90 = c["delta_c_worst_90"]
+                c["verdict"] = "equivalent" if math.isfinite(d90["ci_low"]) and math.isfinite(d90["ci_high"]) and -delta < d90["ci_low"] and d90["ci_high"] < delta else "inconclusive"
+        out["guideline"] = secondary
     return out
 
 
@@ -947,8 +1152,9 @@ def _print_layouts(means: pl.DataFrame) -> None:
 
 
 def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float, *, recompute: bool = False) -> int:
-    """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`, `recompute` computing
-    kept ones again from the tracks; the runs kept. Keeps going past a run it cannot keep (no tracks and none kept, or
+    """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`, and of every run but those
+    without robots the conflict exposure (`run_exposure`), `recompute` computing kept ones again from the tracks; the
+    runs kept. Keeps going past a run it cannot keep (no tracks and none kept, or
     tracks without a walker) and raises at the end naming each with its reason: FileNotFoundError when all lack tracks,
     else ValueError."""
     kept = 0
@@ -959,6 +1165,8 @@ def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], war
         except (FileNotFoundError, ValueError) as e:
             failed.append((f"{run.episode_dir} ({run.env})", e))
             continue
+        if run.planner not in (NO_ROBOTS, SITE_PLANNER):
+            run_exposure(run.episode_dir, run.env, warmup_s, recompute=recompute)
         kept += 1
     if failed:
         listed = "; ".join(f"{where}: {str(e).split(': ', 1)[-1]}" for where, e in failed[:5]) + ("; ..." if len(failed) > 5 else "")
@@ -970,7 +1178,14 @@ def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], war
 
 
 def infra_command(args: typing.Any) -> int:
-    """`evaluation infra {table,premise,pick,compare,times}`; see `add_infra_parser`."""
+    """`evaluation infra {table,premise,pick,compare,times,occupancy}`; see `add_infra_parser`."""
+    if args.infra == "occupancy":
+        cells = occupancy(args.benchmark, args.cell)
+        out = pathlib.Path(args.out or _dirs(args.benchmark)[0] / OCCUPANCY_FILE)
+        cells.write_parquet(out)
+        summary = cells.group_by("group").agg(pl.col("ped_seconds").sum()).sort("group")
+        print(f"wrote {out}: {len(cells)} group cells of {cells.select('planner', 'stage').unique().height} runs ({', '.join(f'{r[0]} {r[1]:.0f} walker-s' for r in summary.iter_rows())}); next: flowedit infra layouts --group-occupancy {out}")
+        return 0
     if args.infra == "times":
         warmup = float(args.warmup if args.warmup is not None else (_manifest(args.manifest).get("warmup_s", WARMUP_S) if args.manifest else WARMUP_S))
         kept = keep_times(args.benchmark, warmup, recompute=getattr(args, "recompute", False))
@@ -1003,24 +1218,31 @@ def infra_command(args: typing.Any) -> int:
         write_json(result, out_dir / "infra_premise.json")
     elif args.infra == "pick":
         chosen = pick(means)
+        chosen["score_check"] = score_check(means)
         chosen["forecaster_check"] = forecaster_check(means)
         out = pathlib.Path(args.out or out_dir / "infra_pick.json")
         write_json(chosen, out)
         png = figure(means, chosen, out_dir / "plots" / FIGURE_FILE)
         print(f"robot-only {chosen['robot_only']}: T {_fmt(chosen['robot_only_task_time_s'], '.1f')} s (cap {_fmt(chosen['task_time_cap_s'], '.1f')} s), C_worst {_fmt(chosen['robot_only_c_worst'])}")
         for c in chosen["joint"]:
-            print(f"  joint {c['layout_id']}: T {_fmt(c['task_time_s'], '.1f')} s, C_worst {_fmt(c['c_worst'])} ({c['worst_group'] or '-'}){'' if c['excluded'] is None else ' - excluded: ' + c['excluded']}")
-        print(f"joint pick: {chosen['joint_pick'] or 'none (no joint layout meets the service constraint)'}; forecaster check: Spearman {_fmt(chosen['forecaster_check']['spearman'])} over {chosen['forecaster_check']['layouts']} layouts")
+            print(f"  joint {c['layout_id']}: T {_fmt(c['task_time_s'], '.1f')} s, C_worst {_fmt(c['c_worst'])} ({c['worst_group'] or '-'}){' - T over the cap beyond its interval' if c['t_over'] else ''}{'' if c['excluded'] is None else ' - excluded: ' + c['excluded']}")
+        sc = chosen["score_check"]
+        print(f"joint pick: {chosen['joint_pick'] or 'none (every joint layout dropped)'}; score check: Spearman {_fmt(sc['spearman'])} over {sc['layouts']} layouts, one-sided p {_fmt(sc['p'])} -> {'holds' if sc['holds'] else 'not shown'}; forecaster check: Spearman {_fmt(chosen['forecaster_check']['spearman'])} over {chosen['forecaster_check']['layouts']} layouts")
+        for group, g in sc["groups"].items():
+            print(f"  {group}: {g['predicted']} vs C_{group}_traffic, Spearman {_fmt(g['spearman'])}, p {_fmt(g['p'])} over {g['layouts']} layouts")
         print(f"wrote {out} and {png}; next: flowedit infra evaluation --pick {out}")
         return 0 if chosen["joint_pick"] else 1
     elif args.infra == "compare":
         picks = manifest.get("picks") or {}
         if not picks.get("joint") or not picks.get("robot_only"):
             raise ValueError(f"{args.manifest}: no picks; compare reads the evaluation manifest `flowedit infra evaluation` writes")
-        result = compare(table, {"joint": picks["joint"], "robot_only": picks["robot_only"]}, n_boot=args.boot)
+        result = compare(table, {role: picks[role] for role in ("joint", "robot_only", "guideline") if picks.get(role)}, n_boot=args.boot)
         out = write_json(result, pathlib.Path(args.out or out_dir / "infra_compare.json"))
-        d, t = result["delta_c_worst"], result["delta_t_rel"]
-        print(f"joint {picks['joint']} - robot-only {picks['robot_only']} over {d['seeds']} seeds: dC_worst {_fmt(d['estimate'])} [{_fmt(d['ci_low'])}, {_fmt(d['ci_high'])}], dT/T {_fmt(t['estimate'])} [{_fmt(t['ci_low'])}, {_fmt(t['ci_high'])}] -> H1 {'holds' if result['h1_holds'] else 'does not hold'}")
+        d, d90, t = result["delta_c_worst"], result["delta_c_worst_90"], result["delta_t_rel"]
+        print(f"joint {picks['joint']} - robot-only {picks['robot_only']} over {d['seeds']} seeds: dC_worst {_fmt(d['estimate'])} 95 % [{_fmt(d['ci_low'])}, {_fmt(d['ci_high'])}], 90 % [{_fmt(d90['ci_low'])}, {_fmt(d90['ci_high'])}], dT/T {_fmt(t['estimate'])} [{_fmt(t['ci_low'])}, {_fmt(t['ci_high'])}] -> {result['verdict']} (H1 {'holds' if result['h1_holds'] else 'does not hold'}; equivalence margin +-{result['delta']:g})")
+        for name, c in (result.get("guideline") or {}).items():
+            cd, c90 = c["delta_c_worst"], c["delta_c_worst_90"]
+            print(f"  {name}: dC_worst {_fmt(cd['estimate'])} 95 % [{_fmt(cd['ci_low'])}, {_fmt(cd['ci_high'])}], 90 % [{_fmt(c90['ci_low'])}, {_fmt(c90['ci_high'])}], Holm p {_fmt(c['p_holm'])} -> {c['verdict']}")
         for group, r in result["delta_aid_minus_adult"].items():
             print(f"  d(C_{group} - C_adult) {_fmt(r['estimate'])} [{_fmt(r['ci_low'])}, {_fmt(r['ci_high'])}], Holm p {_fmt(r['p_holm'])} -> {'most for ' + group if r['holds'] else 'not shown'}")
         print(f"wrote {out}")
@@ -1045,11 +1267,15 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
     sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
     sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the task rate at 75 %% of the wide layout's measured capacity")
-    sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10 at equal service, the forecaster check, the T vs C_worst figure")
-    q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick on the evaluation seeds, with bootstrap intervals and Holm")
+    sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10, the score check, the forecaster check, the T vs C_worst figure")
+    q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick (and each against the guideline layout) on the evaluation seeds: lower, equivalent or inconclusive")
     q.add_argument("--boot", type=int, default=10_000, help="bootstrap draws (default 10000)")
     q = sub.add_parser("times", help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/infra_times.*/ reads like the original (run it where the tracks are, before copying, with the analysis' warm-up)")
     q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir; repeatable")
     q.add_argument("--manifest", type=pathlib.Path, default=None, help="the suite's <suite>.layouts.json, for its warm-up")
     q.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g}); the analysis reads the times kept for its own warm-up")
     q.add_argument("--recompute", action="store_true", help="compute kept times again from the tracks and replace them, e.g. to keep a run dir's times with one release")
+    q = sub.add_parser("occupancy", help=f"per walker group, the walker-seconds per cell of a run dir's runs (the site as is): {OCCUPANCY_FILE}, the occupancy `flowedit infra layouts --group-occupancy` ranks by")
+    q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir of the site as is, with its tracks; repeatable, read as one")
+    q.add_argument("--cell", type=float, default=OCCUPANCY_CELL_M, help=f"cell size, m (default {OCCUPANCY_CELL_M:g})")
+    q.add_argument("--out", type=pathlib.Path, default=None, help=f"the parquet file (default <first benchmark dir>/{OCCUPANCY_FILE})")
