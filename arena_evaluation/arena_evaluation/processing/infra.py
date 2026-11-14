@@ -41,8 +41,9 @@ times of other code are never read, and times of different commits are refused l
   `T` (relative to the robot-only pick's) and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds
   (`experiments.stats.cluster_bootstrap`, a seed per cluster) and Holm across the two aid groups. The decision has
   three outcomes: `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies below 0, `equivalent` when
-  its 90 % interval lies within +-`DELTA` (the smallest cost of interest, 0.01), else `inconclusive`. With a guideline
-  layout among the picks, joint - guideline and robot-only - guideline get the same rule, Holm across the two.
+  its 90 % interval lies within +-`DELTA` (the smallest cost of interest, 0.01), else `inconclusive`. With the guideline
+  layout among the picks (a practice-based baseline, not held to the travel margin), the secondary contrasts joint -
+  guideline and robot-only - guideline get the same rule, Holm across the two.
 - **The score check** (§12): Spearman between the predicted worst-group conflict exposure (the joint ranking's score,
   `ranking_score`) and the measured `C_worst` over the selection layouts (robot-only, joint top 10, random), one-sided
   permutation p; per group, the predicted exposure against the measured traffic part. The older forecaster check
