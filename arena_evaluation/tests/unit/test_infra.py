@@ -257,6 +257,9 @@ def test_conflict_exposure_counts_walkers_near_a_driving_robot() -> None:
     # within 1 m of a robot at 1 m/s: 2 s for a, none for b (5 m off), 2 s for c
     assert out["adult"]["walkers"] == 2 and out["adult"]["exposed_s"] == pytest.approx(2.0, abs=0.6) and out["adult"]["exposure_s"] == pytest.approx(1.0, abs=0.3)
     assert out["wheelchair"]["walkers"] == 1 and out["wheelchair"]["exposure_s"] == pytest.approx(2.0, abs=0.6)
+    # within the joint ranking's 2 m band: 4 s for a and c, still none for b
+    wide = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": robot}, 420.0, band_m=infra.PREDICTION_BAND_M).iter_rows(named=True)}
+    assert wide["adult"]["exposed_s"] == pytest.approx(4.0, abs=0.6) and wide["wheelchair"]["exposure_s"] == pytest.approx(4.0, abs=0.6)
     # a parked robot exposes nobody, and before the warm-up nothing counts
     parked = robot.with_columns(pl.lit(100.0).alias("x"))
     assert infra.conflict_exposure(tracks, {"jackal_0": parked}, 420.0)["exposed_s"].sum() == 0.0
@@ -418,6 +421,7 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     assert (chosen["robot_only"], chosen["joint_pick"]) == ("aaaa", "bbbb")
     assert chosen["score_check"]["layouts"] <= 2 and "groups" in chosen["score_check"]
     assert table.filter(pl.col("layout_id") == "aaaa")["exposure_adult_s"].to_list() == [None, None]  # no robot tracks: not measured
+    assert table.filter(pl.col("layout_id") == "aaaa")[f"exposure_adult_{infra.PREDICTION_BAND_TAG}_s"].to_list() == [None, None]
     assert (layouts / "plots" / infra.FIGURE_FILE).is_file()
     printed = capsys.readouterr().out
     assert "joint pick: bbbb" in printed and "C_adult" in printed
@@ -653,6 +657,8 @@ def test_kept_conflict_exposure_records_its_provenance_and_is_never_read_as_walk
     provenance = infra.exposure_provenance(path)
     assert provenance["exposure_version"] == infra.EXPOSURE_VERSION and provenance["warmup_s"] == 420.0 and provenance["band_m"] == infra.CONFLICT_BAND_M
     assert provenance["code"] == infra._exposure_code() and provenance["arena_evaluation"]["commit"] == "a" * 40
+    assert provenance["prediction_band_m"] == infra.PREDICTION_BAND_M == 2.0 and infra.PREDICTION_BAND_TAG == "2m" and path.name == f"env_0.exposure{infra.EXPOSURE_VERSION}.w420.0.parquet"
+    assert {"exposed_s", "exposure_s", "exposed_2m_s", "exposure_2m_s"} <= set(pl.read_parquet(path).columns)
     assert infra.times_provenance(path) is None and infra.exposure_provenance(times) is None
     # the commit check reads the exposure file as exposure, so one release gives no warning about times without a commit
     capsys.readouterr()

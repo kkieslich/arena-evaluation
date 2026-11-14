@@ -51,7 +51,8 @@ times of other code are never read, and times of different commits are refused l
   part. The older forecaster check (joint top 10 and random only) is reported beside it.
 - **Conflict exposure** (§11), measured per fleet run: per walker group, the seconds a walker spends within
   `CONFLICT_BAND_M` (1 m) of a driving robot after the warm-up, over the group's walkers seen after it
-  (`conflict_exposure`, kept beside the walker times by `evaluation infra times`).
+  (`conflict_exposure`, kept beside the walker times by `evaluation infra times`); beside it the same measure within
+  `PREDICTION_BAND_M` (2 m, the joint ranking's band), for the predicted-vs-measured figure.
 - **Group cells** (`evaluation infra occupancy`): per walker group, the walker-seconds per 0.5 m cell of a run dir's
   runs (`infra_occupancy.parquet`), the per-group occupancy the joint ranking reads (`flowedit infra layouts
   --group-occupancy`).
@@ -113,8 +114,13 @@ CONFLICT_BAND_M = 1.0
 MOVING_MPS = 0.1
 #: the conflict exposure reads the walkers every this many seconds [s]
 EXPOSURE_STEP_S = 0.5
-#: version of the kept conflict exposure's layout (2: robot tracks deduplicated by stamp, no robot tracks gives None)
-EXPOSURE_VERSION = 2
+#: the joint ranking's conflict band (flowedit search `CONFLICT_BAND_M`) [m]: the exposure measured within it is kept
+#: beside §11's, as `exposed_<tag>_s` / `exposure_<tag>_s` (tag `PREDICTION_BAND_TAG`), for the predicted-vs-measured figure
+PREDICTION_BAND_M = 2.0
+PREDICTION_BAND_TAG = f"{PREDICTION_BAND_M:g}m".replace(".", "p")
+#: version of the kept conflict exposure's layout (2: robot tracks deduplicated by stamp, no robot tracks gives None;
+#: 3: also the exposure within `PREDICTION_BAND_M`)
+EXPOSURE_VERSION = 3
 #: the parquet metadata key of a kept conflict exposure file's provenance
 EXPOSURE_META = b"infra_exposure"
 #: group cells: the file `evaluation infra occupancy` writes into a run dir, and the cell size
@@ -645,14 +651,19 @@ def exposure_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathl
 
 def run_exposure(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame | None:
     """`conflict_exposure` of an episode, kept beside its tracks and read from there afterwards; None when nothing is
-    kept and the episode cannot give its tracks (a copy of the run dir without them)."""
+    kept and the episode cannot give its tracks (a copy of the run dir without them). Beside §11's columns it holds the
+    same measure within `PREDICTION_BAND_M`: `exposed_<tag>_s`, `exposure_<tag>_s` (tag `PREDICTION_BAND_TAG`)."""
     path = exposure_path(episode_dir, env, warmup_s)
     if path.is_file() and not recompute:
         return pl.read_parquet(path)
     if not has_tracks(episode_dir, env):
         return None
-    out = conflict_exposure(tracks_for_episode(episode_dir, env), robot_tracks(episode_dir, env), warmup_s)
-    meta = {"exposure_version": EXPOSURE_VERSION, "tracks_version": ped_track_store.TRACKS_VERSION, "code": _exposure_code(), "warmup_s": float(warmup_s), "band_m": CONFLICT_BAND_M, "moving_mps": MOVING_MPS, "step_s": EXPOSURE_STEP_S, "arena_evaluation": _processing()}
+    tracks, robots = tracks_for_episode(episode_dir, env), robot_tracks(episode_dir, env)
+    out = conflict_exposure(tracks, robots, warmup_s)
+    wide = conflict_exposure(tracks, robots, warmup_s, band_m=PREDICTION_BAND_M)
+    tag = PREDICTION_BAND_TAG
+    out = out.join(wide.select("group", pl.col("exposed_s").alias(f"exposed_{tag}_s"), pl.col("exposure_s").alias(f"exposure_{tag}_s")), on="group", how="left").sort("group")
+    meta = {"exposure_version": EXPOSURE_VERSION, "tracks_version": ped_track_store.TRACKS_VERSION, "code": _exposure_code(), "warmup_s": float(warmup_s), "band_m": CONFLICT_BAND_M, "prediction_band_m": PREDICTION_BAND_M, "moving_mps": MOVING_MPS, "step_s": EXPOSURE_STEP_S, "arena_evaluation": _processing()}
     _write_kept(path, out, EXPOSURE_META, meta, "conflict exposure")
     return out
 
@@ -856,6 +867,7 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
                 measured_exposure = run_exposure(on.episode_dir, on.env, warmup)
                 if measured_exposure is not None:
                     row.update({f"exposure_{r['group']}_s": r["exposure_s"] for r in measured_exposure.iter_rows(named=True)})
+                    row.update({f"exposure_{r['group']}_{PREDICTION_BAND_TAG}_s": r.get(f"exposure_{PREDICTION_BAND_TAG}_s") for r in measured_exposure.iter_rows(named=True)})
             if off is not None and ref is not None:
                 times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": walker_times(off.episode_dir, off.env, warmup), "with the fleet": None if on is None else walker_times(on.episode_dir, on.env, warmup)}
                 measured = cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)
