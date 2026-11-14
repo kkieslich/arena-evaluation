@@ -250,17 +250,21 @@ def check_commits(run_dirs: typing.Sequence[pathlib.Path], *, allow_mixed: bool 
 
 
 def check_kept_times(run_dirs: typing.Sequence[pathlib.Path], warmup_s: float, *, allow_mixed: bool = False) -> None:
-    """Fail when the walker times and the conflict exposure kept in `run_dirs` for `warmup_s` (`walker_times`,
-    `run_exposure`) were computed by different arena_evaluation commits: each machine keeps its own runs' times and
-    exposure, and they must come from one release. `allow_mixed` warns instead. A dirty checkout is compared by its
-    commit, with a warning, as in `check_commits`; a kept file whose commit git could not read, or which records none
-    (exposure kept before its files recorded their provenance), is not compared, with a warning. The commit is the one
-    that computed the times or the exposure from the tracks (`evaluation infra times` or the analysis), not the one that
-    extracted the topics and built the tracks, which can be older: the track store's version in the times' dir name
-    covers that. The times files are `<env>.w<warm-up>.parquet` only; the exposure files beside them
-    (`<env>.exposure<version>.w<warm-up>.parquet`) are read as exposure, never as times."""
-    found: dict[str, list[pathlib.Path]] = {}
+    """Fail when the walker times kept in `run_dirs` for `warmup_s` (`walker_times`) were computed by different
+    arena_evaluation commits, or the conflict exposure kept there (`run_exposure`) was: each machine keeps its own runs'
+    times and exposure, and each kind must come from one release. The two kinds are compared separately: exposure kept
+    later by a newer release (it is computed on first read where the tracks are) never makes the times mixed.
+    `allow_mixed` warns instead. A dirty checkout is compared by its commit, with a warning, as in `check_commits`; a
+    kept file whose commit git could not read, or an exposure file that records no provenance, is not compared, with a
+    warning; an exposure file of other code (`_exposure_code`) is not read as current (`run_exposure` computes it again
+    or leaves it out), so it is not compared either. The commit is the one that computed the times or the exposure from
+    the tracks (`evaluation infra times` or the analysis), not the one that extracted the topics and built the tracks,
+    which can be older: the track store's version in the times' dir name covers that. The times files are
+    `<env>.w<warm-up>.parquet` only; the exposure files beside them (`<env>.exposure<version>.w<warm-up>.parquet`) are
+    read as exposure, never as times."""
+    found: dict[str, dict[str, list[pathlib.Path]]] = {"walker times": {}, "conflict exposure": {}}
     key = _warmup_key(warmup_s)
+    code = _exposure_code()
     for run_dir in run_dirs:
         kept = pathlib.Path(run_dir).glob(f"episodes/*/{TOPICS_DIR}/.derived/{times_dir()}/*.w{key}.parquet")
         for path in sorted(kept):
@@ -270,7 +274,9 @@ def check_kept_times(run_dirs: typing.Sequence[pathlib.Path], warmup_s: float, *
             elif path.name == f"{env}.exposure{EXPOSURE_VERSION}.w{key}.parquet":
                 provenance = exposure_provenance(path)
                 if provenance is None:
-                    _warn(f"{run_dir}: conflict exposure kept without its provenance (kept before the exposure files recorded it), so its code is not compared")
+                    _warn(f"{run_dir}: conflict exposure kept without its provenance, so its code is not compared")
+                    continue
+                if provenance.get("code") != code:
                     continue
                 what, processing = "conflict exposure", provenance.get("arena_evaluation") or {}
             else:
@@ -281,9 +287,10 @@ def check_kept_times(run_dirs: typing.Sequence[pathlib.Path], warmup_s: float, *
             commit = str(processing["commit"])
             if processing.get("dirty"):
                 _warn(f"{run_dir}: {what} kept by a dirty arena_evaluation checkout at {commit[:12]}, so the commit does not pin the code that computed them")
-            found.setdefault(commit, []).append(pathlib.Path(run_dir))
-    if len(found) > 1:
-        message = "walker times or conflict exposure kept by different arena_evaluation commits: " + ", ".join(f"{c[:12]} in {', '.join(sorted({str(d) for d in dirs}))}" for c, dirs in found.items()) + "; keep them again with one release: `evaluation infra times --recompute --benchmark <run dir>` where each run's tracks are"
+            found[what].setdefault(commit, []).append(pathlib.Path(run_dir))
+    mixed = [f"{what} kept by different arena_evaluation commits: " + ", ".join(f"{c[:12]} in {', '.join(sorted({str(d) for d in dirs}))}" for c, dirs in commits.items()) for what, commits in found.items() if len(commits) > 1]
+    if mixed:
+        message = "; ".join(mixed) + "; keep them again with one release: `evaluation infra times --recompute --benchmark <run dir>` where each run's tracks are"
         if not allow_mixed:
             raise ValueError(message + " (--allow-mixed-commits reads them anyway)")
         _warn(message)
@@ -650,35 +657,55 @@ def exposure_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathl
 
 
 def run_exposure(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame | None:
-    """`conflict_exposure` of an episode, kept beside its tracks and read from there afterwards; None when nothing is
-    kept and the episode cannot give its tracks (a copy of the run dir without them). Beside §11's columns it holds the
-    same measure within `PREDICTION_BAND_M`: `exposed_<tag>_s`, `exposure_<tag>_s` (tag `PREDICTION_BAND_TAG`)."""
+    """`conflict_exposure` of an episode, kept beside its tracks and read from there afterwards; None when nothing
+    current is kept and the episode cannot give its tracks (a copy of the run dir without them). Beside §11's columns
+    it holds the same measure within `PREDICTION_BAND_M`: `exposed_<tag>_s`, `exposure_<tag>_s` (tag
+    `PREDICTION_BAND_TAG`). A kept file is current when its version (`EXPOSURE_VERSION`, in its name) and its code
+    digest (`_exposure_code`, in its provenance) are this code's; any other is computed again from the tracks, and
+    without them it is left out with a warning that names it, never read as current."""
     path = exposure_path(episode_dir, env, warmup_s)
+    stale = None
     if path.is_file() and not recompute:
-        return pl.read_parquet(path)
+        provenance = exposure_provenance(path)
+        if provenance is not None and provenance.get("code") == _exposure_code():
+            return pl.read_parquet(path)
+        stale = f"{path.name} was kept by other code ({(provenance or {}).get('code') or 'no provenance'}, this code {_exposure_code()})"
     if not has_tracks(episode_dir, env):
+        key = _warmup_key(warmup_s)
+        older = [p.name for p in sorted(path.parent.glob(f"{env}.exposure*.w{key}.parquet")) if p != path and p.name.removeprefix(f"{env}.exposure").removesuffix(f".w{key}.parquet").isdigit()]
+        why = stale or (f"only an older version is kept ({', '.join(older)})" if older else None)
+        if why is not None:
+            _warn(f"{episode_dir}: the conflict exposure of {env} is not measured: {why}, and the episode has no tracks to compute it again, so its columns are left out; keep it again with `evaluation infra times --recompute --benchmark <run dir>` where the tracks are")
         return None
-    tracks, robots = tracks_for_episode(episode_dir, env), robot_tracks(episode_dir, env)
-    out = conflict_exposure(tracks, robots, warmup_s)
-    wide = conflict_exposure(tracks, robots, warmup_s, band_m=PREDICTION_BAND_M)
-    tag = PREDICTION_BAND_TAG
-    out = out.join(wide.select("group", pl.col("exposed_s").alias(f"exposed_{tag}_s"), pl.col("exposure_s").alias(f"exposure_{tag}_s")), on="group", how="left").sort("group")
+    out = _exposure_table(tracks_for_episode(episode_dir, env), robot_tracks(episode_dir, env), warmup_s)
     meta = {"exposure_version": EXPOSURE_VERSION, "tracks_version": ped_track_store.TRACKS_VERSION, "code": _exposure_code(), "warmup_s": float(warmup_s), "band_m": CONFLICT_BAND_M, "prediction_band_m": PREDICTION_BAND_M, "moving_mps": MOVING_MPS, "step_s": EXPOSURE_STEP_S, "arena_evaluation": _processing()}
     _write_kept(path, out, EXPOSURE_META, meta, "conflict exposure")
     return out
 
 
+def _exposure_table(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataFrame], warmup_s: float) -> pl.DataFrame:
+    """The kept conflict exposure of one episode: §11's measure within `CONFLICT_BAND_M` (group, walkers, exposed_s,
+    exposure_s) and the same within `PREDICTION_BAND_M` (`exposed_<tag>_s`, `exposure_<tag>_s`), by group."""
+    out = conflict_exposure(tracks, robots, warmup_s, band_m=CONFLICT_BAND_M)
+    wide = conflict_exposure(tracks, robots, warmup_s, band_m=PREDICTION_BAND_M)
+    tag = PREDICTION_BAND_TAG
+    return out.join(wide.select("group", pl.col("exposed_s").alias(f"exposed_{tag}_s"), pl.col("exposure_s").alias(f"exposure_{tag}_s")), on="group", how="left").sort("group")
+
+
 def _exposure_code() -> str:
-    """A digest of the code the kept conflict exposure comes from (`conflict_exposure`, `robot_tracks`, `_dedupe`)."""
+    """A digest of the code the kept conflict exposure comes from (`conflict_exposure`, `robot_tracks`, `_dedupe`,
+    `_exposure_table`) and of the constants it reads (the two bands, the moving speed, the step), so a kept file of
+    other code is never read as current (`run_exposure`)."""
     import hashlib
     import inspect
 
     try:
-        source = inspect.getsource(conflict_exposure) + inspect.getsource(robot_tracks) + inspect.getsource(_dedupe)
+        source = "".join(inspect.getsource(f) for f in (conflict_exposure, robot_tracks, _dedupe, _exposure_table))
     except (OSError, TypeError):
-        _warn("the source of conflict_exposure cannot be read, so the kept conflict exposure records no code digest")
+        _warn("the source of conflict_exposure cannot be read, so kept conflict exposure is not re-keyed when that code changes")
         return "nosource"
-    return hashlib.sha1(source.encode()).hexdigest()[:10]
+    constants = f"{CONFLICT_BAND_M!r}|{PREDICTION_BAND_M!r}|{PREDICTION_BAND_TAG}|{MOVING_MPS!r}|{EXPOSURE_STEP_S!r}"
+    return hashlib.sha1((source + constants).encode()).hexdigest()[:10]
 
 
 def group_cells(tracks: pl.DataFrame, cell_m: float = OCCUPANCY_CELL_M) -> pl.DataFrame:
