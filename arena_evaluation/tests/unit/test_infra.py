@@ -227,18 +227,18 @@ def test_the_score_check_ranks_the_selection_layouts_by_predicted_exposure() -> 
         for i, (layout, roles) in enumerate([("robot", "robot_only"), *((f"j{k}", "joint") for k in range(10)), *((f"r{k}", "random") for k in range(5))]):
             c = 0.01 * (i + 1)
             row = _row(layout, roles, seed, 300.0, {"adult": c / 2, "wheelchair": c, "long_cane": c / 3}, ranking=float(i))
-            row |= {"pred_adult": float(i), "pred_wheelchair": float(-i), "pred_long_cane": float(i), **{f"C_{g}_traffic": c for g in ("adult", "wheelchair", "long_cane")}}
+            row |= {"pred_adult": 99.0, "pred_traffic_adult": float(i), "pred_traffic_wheelchair": float(-i), "pred_traffic_long_cane": float(i), **{f"C_{g}_traffic": c for g in ("adult", "wheelchair", "long_cane")}}
             rows.append(row)
     means = infra.layout_means(_table(rows))
     check = infra.score_check(means, n_perm=2000)
     assert check["layouts"] == 16 and check["spearman"] == pytest.approx(1.0) and check["p"] < 0.01 and check["holds"]
     assert check["groups"]["adult"]["spearman"] == pytest.approx(1.0) and check["groups"]["wheelchair"]["spearman"] == pytest.approx(-1.0)
-    assert check["groups"]["wheelchair"]["p"] > 0.9
+    assert check["groups"]["wheelchair"]["p"] > 0.9 and check["groups"]["adult"]["predicted"] == "pred_traffic_adult"  # the traffic term, not the total
     rho, p, n = infra.permutation_p([1.0, 2.0], [1.0, 2.0])
     assert math.isnan(rho) and math.isnan(p) and n == 2
     # one prediction of all walkers serves every group
-    rows = [{k: v for k, v in r.items() if not k.startswith("pred_")} | {"pred_all": r["ranking_score"]} for r in rows]
-    assert infra.score_check(infra.layout_means(_table(rows)), n_perm=200)["groups"]["long_cane"]["predicted"] == "pred_all"
+    rows = [{k: v for k, v in r.items() if not k.startswith("pred_")} | {"pred_traffic_all": r["ranking_score"]} for r in rows]
+    assert infra.score_check(infra.layout_means(_table(rows)), n_perm=200)["groups"]["long_cane"]["predicted"] == "pred_traffic_all"
 
 
 def test_conflict_exposure_counts_walkers_near_a_driving_robot() -> None:
@@ -262,6 +262,14 @@ def test_conflict_exposure_counts_walkers_near_a_driving_robot() -> None:
     assert infra.conflict_exposure(tracks, {"jackal_0": parked}, 420.0)["exposed_s"].sum() == 0.0
     assert infra.conflict_exposure(tracks, {"jackal_0": robot}, 700.0)["exposed_s"].sum() == 0.0
     assert infra.conflict_exposure(tracks.head(0), {"jackal_0": robot}, 420.0).is_empty()
+    # a repeated stamp in a robot track changes nothing (deduplicated before the speed)
+    repeated = robot.with_columns(pl.when(pl.int_range(pl.len()) == 5001).then(pl.col("time_ns").shift(1)).otherwise(pl.col("time_ns")).alias("time_ns"))
+    assert repeated["time_ns"].n_unique() == len(repeated) - 1
+    again = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": repeated}, 420.0).iter_rows(named=True)}
+    assert again["adult"]["exposed_s"] == pytest.approx(out["adult"]["exposed_s"], abs=0.6)
+    # without robot tracks nothing is measured: None, not 0
+    none = infra.conflict_exposure(tracks, {}, 420.0)
+    assert none["exposed_s"].null_count() == len(none) and none["exposure_s"].null_count() == len(none) and none["walkers"].to_list() == [2, 1]
 
 
 def test_group_cells_sum_the_walker_seconds_per_group_and_cell(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -409,7 +417,7 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     chosen = json.loads((layouts / "infra_pick.json").read_text())
     assert (chosen["robot_only"], chosen["joint_pick"]) == ("aaaa", "bbbb")
     assert chosen["score_check"]["layouts"] <= 2 and "groups" in chosen["score_check"]
-    assert table.filter(pl.col("layout_id") == "aaaa")["exposure_adult_s"].to_list() == [0.0, 0.0]  # no robot tracks: nobody exposed
+    assert table.filter(pl.col("layout_id") == "aaaa")["exposure_adult_s"].to_list() == [None, None]  # no robot tracks: not measured
     assert (layouts / "plots" / infra.FIGURE_FILE).is_file()
     printed = capsys.readouterr().out
     assert "joint pick: bbbb" in printed and "C_adult" in printed

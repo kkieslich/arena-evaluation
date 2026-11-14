@@ -43,11 +43,12 @@ times of other code are never read, and times of different commits are refused l
   three outcomes: `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies below 0, `equivalent` when
   its 90 % interval lies within +-`DELTA` (the smallest cost of interest, 0.01), else `inconclusive`. With the guideline
   layout among the picks (a practice-based baseline, not held to the travel margin), the secondary contrasts joint -
-  guideline and robot-only - guideline get the same rule, Holm across the two.
+  guideline and robot-only - guideline get the same rule; Holm across the two applies to their `lower` claims, and
+  `equivalent` uses each one's unadjusted 90 % interval. Both intervals come from one set of bootstrap draws.
 - **The score check** (§12): Spearman between the predicted worst-group conflict exposure (the joint ranking's score,
   `ranking_score`) and the measured `C_worst` over the selection layouts (robot-only, joint top 10, random), one-sided
-  permutation p; per group, the predicted exposure against the measured traffic part. The older forecaster check
-  (joint top 10 and random only) is reported beside it.
+  permutation p; per group, the predicted traffic term (the time near driving robots) against the measured traffic
+  part. The older forecaster check (joint top 10 and random only) is reported beside it.
 - **Conflict exposure** (§11), measured per fleet run: per walker group, the seconds a walker spends within
   `CONFLICT_BAND_M` (1 m) of a driving robot after the warm-up, over the group's walkers seen after it
   (`conflict_exposure`, kept beside the walker times by `evaluation infra times`).
@@ -112,8 +113,8 @@ CONFLICT_BAND_M = 1.0
 MOVING_MPS = 0.1
 #: the conflict exposure reads the walkers every this many seconds [s]
 EXPOSURE_STEP_S = 0.5
-#: version of the kept conflict exposure's layout
-EXPOSURE_VERSION = 1
+#: version of the kept conflict exposure's layout (2: robot tracks deduplicated by stamp, no robot tracks gives None)
+EXPOSURE_VERSION = 2
 #: group cells: the file `evaluation infra occupancy` writes into a run dir, and the cell size
 OCCUPANCY_FILE = "infra_occupancy.parquet"
 OCCUPANCY_CELL_M = 0.5
@@ -560,12 +561,18 @@ def robot_tracks(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, pl.
     return out
 
 
+def _dedupe(track: pl.DataFrame) -> pl.DataFrame:
+    """A robot track with one row per stamp (the first), sorted: a repeated stamp would make its speed undefined."""
+    return track.sort("time_ns").unique(subset="time_ns", keep="first", maintain_order=True)
+
+
 def conflict_exposure(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataFrame], warmup_s: float, *, band_m: float = CONFLICT_BAND_M, moving_mps: float = MOVING_MPS, step_s: float = EXPOSURE_STEP_S) -> pl.DataFrame:
     """§11's conflict exposure: per walker group, the seconds a walker spends within `band_m` of a robot that drives
     faster than `moving_mps`, from the warm-up on, over the group's walkers seen then (`walkers`); `exposed_s` is the
     group's sum. Walker tracks (`ped_track_store`: t from the episode start, time_ns) are read every `step_s`, robot
-    positions interpolated at those times from their ground-truth tracks (the same sim clock). Columns group, walkers,
-    exposed_s, exposure_s."""
+    positions interpolated at those times from their ground-truth tracks (the same sim clock; one row per stamp).
+    Without any robot track, exposed_s and exposure_s are None (not measured), not 0. Columns group, walkers, exposed_s,
+    exposure_s."""
     schema = {"group": pl.String, "walkers": pl.Int64, "exposed_s": pl.Float64, "exposure_s": pl.Float64}
     cut = tracks.filter(pl.col("t") >= warmup_s) if len(tracks) else tracks
     if len(cut) == 0:
@@ -579,24 +586,29 @@ def conflict_exposure(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataF
     kept = times[::stride]
     dt = period * stride
     sample = cut.filter(pl.col("t").is_in(kept.tolist()))
-    exposed = {}
-    if robots and len(sample):
+    exposed: dict[str, float] = {}
+    measured = any(len(track) >= 2 for track in robots.values())
+    if measured and len(sample):
         t = sample["t"].to_numpy()
         x, y = sample["x"].to_numpy(), sample["y"].to_numpy()
         near = np.zeros(len(sample), dtype=bool)
         for track in robots.values():
+            track = _dedupe(track)
             if len(track) < 2:
                 continue
             rt = track["time_ns"].to_numpy() / 1e9 - t0
             rx, ry = track["x"].to_numpy(), track["y"].to_numpy()
-            speed = np.hypot(np.gradient(rx, rt), np.gradient(ry, rt)) if len(np.unique(rt)) == len(rt) else np.zeros(len(rt))
+            speed = np.hypot(np.gradient(rx, rt), np.gradient(ry, rt))
             px, py, pv = np.interp(t, rt, rx), np.interp(t, rt, ry), np.interp(t, rt, speed)
             inside = (t >= rt[0]) & (t <= rt[-1])
             near |= inside & (pv > moving_mps) & (np.hypot(x - px, y - py) <= band_m)
         groups = sample["group"].to_numpy()
         for group in np.unique(groups):
             exposed[str(group)] = float(near[groups == group].sum() * dt)
-    rows = [{"group": r["group"], "walkers": int(r["walkers"]), "exposed_s": exposed.get(r["group"], 0.0), "exposure_s": exposed.get(r["group"], 0.0) / r["walkers"] if r["walkers"] else None} for r in walkers.sort("group").iter_rows(named=True)]
+    rows = []
+    for r in walkers.sort("group").iter_rows(named=True):
+        value = exposed.get(r["group"], 0.0) if measured else None
+        rows.append({"group": r["group"], "walkers": int(r["walkers"]), "exposed_s": value, "exposure_s": None if value is None or not r["walkers"] else value / r["walkers"]})
     return pl.DataFrame(rows, schema=schema)
 
 
@@ -779,11 +791,13 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
     ranking: dict[str, float | None] = {}
     travel: dict[str, float | None] = {}
     predicted: dict[str, dict[str, float]] = {}
+    predicted_traffic: dict[str, dict[str, float]] = {}
     for record in manifest.get("runs") or []:
         roles.setdefault(record["layout_id"], []).append(record["role"])
         ranking.setdefault(record["layout_id"], record.get("ranking_score"))
         travel.setdefault(record["layout_id"], record.get("travel_m"))
         predicted.setdefault(record["layout_id"], dict(record.get("exposure") or {}))
+        predicted_traffic.setdefault(record["layout_id"], dict(record.get("exposure_traffic") or {}))
     world_of = {layout_id: pathlib.Path(path).name for layout_id, path in (manifest.get("worlds") or {}).items()}
     rows = []
     site_name = str(manifest["site"])
@@ -795,6 +809,7 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
             complete = off is not None and on is not None and ref is not None
             row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": complete, "incomplete": None if complete else "missing runs: " + ", ".join(what for what, r in (("the site as is", ref), ("without robots", off), ("with the fleet", on)) if r is None)}
             row.update({f"pred_{group}": value for group, value in predicted.get(layout_id, {}).items()})
+            row.update({f"pred_traffic_{group}": value for group, value in predicted_traffic.get(layout_id, {}).items()})
             if on is not None:
                 row.update(service(fleet_log(on.episode_dir, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
                 measured_exposure = run_exposure(on.episode_dir, on.env, warmup)
@@ -943,13 +958,14 @@ def permutation_p(x: typing.Sequence[float | None], y: typing.Sequence[float | N
 def score_check(means: pl.DataFrame, *, n_perm: int = SCORE_PERMUTATIONS, seed: int = 0) -> dict[str, typing.Any]:
     """§12's score check over the selection layouts (robot-only, joint, random): Spearman between the joint ranking's
     predicted worst-group conflict exposure (`ranking_score`) and the measured `C_worst` (the max over the groups'
-    means), one-sided permutation p; it holds when p < 0.05. Per group: the predicted exposure (`pred_<group>`, or the
-    one prediction of all walkers, `pred_all`) against the group's measured traffic part `C_<group>_traffic`."""
+    means), one-sided permutation p; it holds when p < 0.05. Per group: the predicted traffic term (`pred_traffic_<group>`,
+    the time near driving robots, or the one prediction of all walkers, `pred_traffic_all`) against the group's measured
+    traffic part `C_<group>_traffic`."""
     rows = [r for r in means.to_dicts() if {"robot_only", "joint", "random"} & set(str(r["roles"]).split(","))]
     rho, p, n = permutation_p([r.get("ranking_score") for r in rows], [r.get("c_worst_of_means") for r in rows], n_perm=n_perm, seed=seed)
     out: dict[str, typing.Any] = {"layouts": n, "spearman": rho, "p": p, "holds": bool(math.isfinite(p) and p < 0.05), "groups": {}}
     for group in GROUPS:
-        key = f"pred_{group}" if any(r.get(f"pred_{group}") is not None for r in rows) else "pred_all"
+        key = f"pred_traffic_{group}" if any(r.get(f"pred_traffic_{group}") is not None for r in rows) else "pred_traffic_all"
         g_rho, g_p, g_n = permutation_p([r.get(key) for r in rows], [r.get(f"C_{group}_traffic") for r in rows], n_perm=n_perm, seed=seed)
         out["groups"][group] = {"predicted": key, "layouts": g_n, "spearman": g_rho, "p": g_p}
     return out
@@ -970,9 +986,11 @@ def compare(table: pl.DataFrame, picks: typing.Mapping[str, str], *, slack: floa
     robot-only pick's `T`, and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds and Holm across the
     aid groups. Its verdict (`_verdict`): `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies
     below 0, `equivalent` when the 90 % interval lies within +-`delta`, else `inconclusive`; the relative `T` difference
-    is reported (equal service is the search's travel pre-filter). With a `guideline` pick, joint - guideline and
-    robot-only - guideline get the same verdict, `lower` only where the Holm-adjusted p (across the two) is below 0.05
-    too. "Most for aid users" holds for an aid group whose Holm-adjusted p < 0.05 with its interval below 0."""
+    is reported (equal service is the search's travel pre-filter). Both intervals come from one set of bootstrap draws,
+    so the 90 % one lies inside the 95 % one. With a `guideline` pick, the secondary contrasts joint - guideline and
+    robot-only - guideline get the same rule: Holm (across the two) applies to their `lower` claims, which also need a
+    Holm-adjusted p below 0.05; `equivalent` uses each one's unadjusted 90 % interval. "Most for aid users" holds for an
+    aid group whose Holm-adjusted p < 0.05 with its interval below 0."""
     from arena_evaluation.experiments.stats import cluster_bootstrap, holm
 
     rng = np.random.default_rng(seed)
@@ -982,14 +1000,20 @@ def compare(table: pl.DataFrame, picks: typing.Mapping[str, str], *, slack: floa
         res = cluster_bootstrap([np.array([v]) for v in values], n_boot=n_boot, rng=rng, level=level)
         return {"estimate": res.estimate, "ci_low": res.ci_low, "ci_high": res.ci_high, "p": res.p, "seeds": res.n_pairs}
 
+    def boot_both(values: np.ndarray) -> tuple[dict[str, typing.Any], dict[str, typing.Any]]:
+        """The 95 % and the `EQUIVALENCE_LEVEL` interval from one set of draws, so the narrower lies inside the wider."""
+        state = rng.bit_generator.state
+        wide = boot(values, 0.95)
+        rng.bit_generator.state = state
+        return wide, boot(values, EQUIVALENCE_LEVEL)
+
     def contrast(a: str, b: str) -> tuple[dict[str, typing.Any], pl.DataFrame]:
         pairs = table.filter(pl.col("layout_id") == picks[a]).join(table.filter(pl.col("layout_id") == picks[b]), on="seed", suffix="_b")
 
         def col(name: str) -> np.ndarray:
             return pairs[name].cast(pl.Float64).fill_null(float("nan")).to_numpy() if name in pairs.columns else np.full(len(pairs), np.nan)
 
-        d = col("c_worst") - col("c_worst_b")
-        d95, d90 = boot(d), boot(d, EQUIVALENCE_LEVEL)
+        d95, d90 = boot_both(col("c_worst") - col("c_worst_b"))
         out = {"a": picks[a], "b": picks[b], "seeds": pairs["seed"].to_list(), "delta_c_worst": d95, "delta_c_worst_90": d90, "delta_t_rel": boot((col("task_time_s") - col("task_time_s_b")) / col("task_time_s_b")), "verdict": _verdict(d95, d90, delta)}
         for group in AID_GROUPS:
             out.setdefault("delta_aid_minus_adult", {})[group] = boot((col(f"C_{group}") - col(f"C_{group}_b")) - (col("C_adult") - col("C_adult_b")))
