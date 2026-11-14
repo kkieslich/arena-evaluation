@@ -140,7 +140,7 @@ def _row(layout: str, roles: str, seed: int, t: float, c: dict[str, float], rank
     return {"layout_id": layout, "world": f"site__layout_{layout}", "seed": seed, "roles": roles, "ranking_score": ranking, "travel_m": 10.0, "complete": True, "task_time_s": t, "jam_share": jam, "success_rate": 1.0, **{f"C_{g}": v for g, v in c.items()}, "c_worst": max(c.values())}
 
 
-def test_the_pick_is_the_lowest_c_worst_joint_layout_at_equal_service() -> None:
+def test_the_pick_is_the_lowest_c_worst_joint_layout_and_flags_a_slow_one() -> None:
     rows = []
     for seed in (1, 2, 3):
         rows += [
@@ -158,9 +158,13 @@ def test_the_pick_is_the_lowest_c_worst_joint_layout_at_equal_service() -> None:
     assert by["robot"]["T_lo"] <= 302.0 <= by["robot"]["T_hi"]
     chosen = infra.pick(means)
     assert chosen["robot_only"] == "robot" and chosen["task_time_cap_s"] == pytest.approx(1.05 * 302.0)
-    assert chosen["joint_pick"] == "best"
-    excluded = {c["layout_id"]: c["excluded"] for c in chosen["joint"]}
-    assert excluded["slow"].startswith("T 400.0 s over") and excluded["jammed"].startswith("jams 30%") and excluded["best"] is None
+    # equal service is the search's travel pre-filter: a slow layout is flagged, not dropped; jams still drop one
+    assert chosen["joint_pick"] == "slow" and chosen["joint_pick_t_over"] is True
+    by_id = {c["layout_id"]: c for c in chosen["joint"]}
+    assert by_id["jammed"]["excluded"].startswith("jams 30%") and by_id["slow"]["excluded"] is None and by_id["best"]["excluded"] is None
+    assert by_id["slow"]["t_over"] and not by_id["best"]["t_over"] and not by_id["fast"]["t_over"]
+    rows = [r for r in rows if r["layout_id"] != "slow"]
+    assert infra.pick(infra.layout_means(_table(rows)))["joint_pick"] == "best"
     check = infra.forecaster_check(means)
     assert check["layouts"] == 5 and check["spearman"] == pytest.approx(infra.spearman([1.0, 2.0, 3.0, 4.0, 8.0], [0.2, 0.12, 0.01, 0.0, 0.6]))
 
@@ -186,9 +190,109 @@ def test_compare_takes_per_seed_differences_with_intervals_and_holm() -> None:
     wheel, cane = result["delta_aid_minus_adult"]["wheelchair"], result["delta_aid_minus_adult"]["long_cane"]
     assert wheel["holds"] and wheel["ci_high"] < 0
     assert not cane["holds"]
-    # worse service breaks H1 even with a lower cost
+    assert result["verdict"] == "lower" and result["delta"] == infra.DELTA
+    # equal service is the search's travel pre-filter: measured T is reported, it does not decide H1
     slow = [{**r, "task_time_s": r["task_time_s"] * 1.2} if r["layout_id"] == "joint" else r for r in rows]
-    assert not infra.compare(_table(slow), {"joint": "joint", "robot_only": "robot"}, n_boot=500)["h1_holds"]
+    slowed = infra.compare(_table(slow), {"joint": "joint", "robot_only": "robot"}, n_boot=500)
+    assert slowed["h1_holds"] and slowed["delta_t_rel"]["estimate"] == pytest.approx(0.2, abs=0.02)
+
+
+def test_compare_calls_a_difference_within_the_margin_equivalent_and_a_wide_one_inconclusive() -> None:
+    rng = np.random.default_rng(2)
+    rows = []
+    for seed in range(11, 21):
+        base = {"adult": 0.10, "wheelchair": 0.20, "long_cane": 0.15}
+        rows.append(_row("robot", "robot_only", seed, 300.0, base))
+        rows.append(_row("joint", "joint", seed, 300.0, {g: v + rng.normal(0, 0.002) for g, v in base.items()}))
+        rows.append(_row("guide", "guideline", seed, 330.0, {g: v + 0.05 + rng.normal(0, 0.002) for g, v in base.items()}))
+        rows.append(_row("noisy", "joint", seed, 300.0, {g: v + rng.normal(0, 0.05) for g, v in base.items()}))
+    table = _table(rows)
+    same = infra.compare(table, {"joint": "joint", "robot_only": "robot", "guideline": "guide"}, n_boot=2000)
+    assert same["verdict"] == "equivalent" and not same["h1_holds"]
+    d90 = same["delta_c_worst_90"]
+    assert -infra.DELTA < d90["ci_low"] <= d90["ci_high"] < infra.DELTA
+    assert same["delta_c_worst"]["ci_low"] <= d90["ci_low"] and d90["ci_high"] <= same["delta_c_worst"]["ci_high"]  # 90 % inside 95 %
+    guide = same["guideline"]
+    assert set(guide) == {"joint_minus_guideline", "robot_only_minus_guideline"}
+    for c in guide.values():
+        assert c["verdict"] == "lower" and c["delta_c_worst"]["ci_high"] < 0 and c["p_holm"] < 0.05 and c["b"] == "guide"
+    assert guide["joint_minus_guideline"]["delta_t_rel"]["estimate"] == pytest.approx(-30.0 / 330.0, abs=1e-6)
+    wide = infra.compare(table, {"joint": "noisy", "robot_only": "robot"}, n_boot=2000)
+    assert wide["verdict"] == "inconclusive" and "guideline" not in wide
+
+
+def test_the_score_check_ranks_the_selection_layouts_by_predicted_exposure() -> None:
+    rows = []
+    for seed in (1, 2):
+        for i, (layout, roles) in enumerate([("robot", "robot_only"), *((f"j{k}", "joint") for k in range(10)), *((f"r{k}", "random") for k in range(5))]):
+            c = 0.01 * (i + 1)
+            row = _row(layout, roles, seed, 300.0, {"adult": c / 2, "wheelchair": c, "long_cane": c / 3}, ranking=float(i))
+            row |= {"pred_adult": 99.0, "pred_traffic_adult": float(i), "pred_traffic_wheelchair": float(-i), "pred_traffic_long_cane": float(i), **{f"C_{g}_traffic": c for g in ("adult", "wheelchair", "long_cane")}}
+            rows.append(row)
+    means = infra.layout_means(_table(rows))
+    check = infra.score_check(means, n_perm=2000)
+    assert check["layouts"] == 16 and check["spearman"] == pytest.approx(1.0) and check["p"] < 0.01 and check["holds"]
+    assert check["groups"]["adult"]["spearman"] == pytest.approx(1.0) and check["groups"]["wheelchair"]["spearman"] == pytest.approx(-1.0)
+    assert check["groups"]["wheelchair"]["p"] > 0.9 and check["groups"]["adult"]["predicted"] == "pred_traffic_adult"  # the traffic term, not the total
+    rho, p, n = infra.permutation_p([1.0, 2.0], [1.0, 2.0])
+    assert math.isnan(rho) and math.isnan(p) and n == 2
+    # one prediction of all walkers serves every group
+    rows = [{k: v for k, v in r.items() if not k.startswith("pred_")} | {"pred_traffic_all": r["ranking_score"]} for r in rows]
+    assert infra.score_check(infra.layout_means(_table(rows)), n_perm=200)["groups"]["long_cane"]["predicted"] == "pred_traffic_all"
+
+
+def test_conflict_exposure_counts_walkers_near_a_driving_robot() -> None:
+    # a robot drives along y = 0 at 1 m/s from t 400 to 600 s; walker a stands on its line at x = 100 (passed at 500 s),
+    # walker b stands 5 m off it, walker c (wheelchair) on the line at x = 150, spawned after the warm-up
+    rows = []
+    for t in np.arange(0.0, 1000.0, 0.5):
+        for i, (key, agent, x, y, start) in enumerate((("a", "adult", 100.0, 0.0, 0.0), ("b", "adult", 100.0, 5.0, 0.0), ("c", "wheelchair_manual", 150.0, 0.0, 450.0))):
+            if t >= start:
+                rows.append({"episode_id": 0, "time_ns": int((t + 50.0) * 1e9), "t": float(t), "agent_id": i, "key": key, "name": "", "source_name": "s", "source_seq": i, "agent_type": agent, "x": x, "y": y, "vx": 0.0, "vy": 0.0, "radius": 0.25})
+    tracks = pl.DataFrame(rows, schema=TRACK_SCHEMA)
+    times = np.arange(0.0, 1000.0, 0.1)
+    rx = np.clip(times - 400.0, 0.0, 200.0)
+    robot = pl.DataFrame({"time_ns": ((times + 50.0) * 1e9).astype(np.int64), "x": rx, "y": np.zeros_like(times)})
+    out = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": robot}, 420.0).iter_rows(named=True)}
+    # within 1 m of a robot at 1 m/s: 2 s for a, none for b (5 m off), 2 s for c
+    assert out["adult"]["walkers"] == 2 and out["adult"]["exposed_s"] == pytest.approx(2.0, abs=0.6) and out["adult"]["exposure_s"] == pytest.approx(1.0, abs=0.3)
+    assert out["wheelchair"]["walkers"] == 1 and out["wheelchair"]["exposure_s"] == pytest.approx(2.0, abs=0.6)
+    # a parked robot exposes nobody, and before the warm-up nothing counts
+    parked = robot.with_columns(pl.lit(100.0).alias("x"))
+    assert infra.conflict_exposure(tracks, {"jackal_0": parked}, 420.0)["exposed_s"].sum() == 0.0
+    assert infra.conflict_exposure(tracks, {"jackal_0": robot}, 700.0)["exposed_s"].sum() == 0.0
+    assert infra.conflict_exposure(tracks.head(0), {"jackal_0": robot}, 420.0).is_empty()
+    # a repeated stamp in a robot track changes nothing (deduplicated before the speed)
+    repeated = robot.with_columns(pl.when(pl.int_range(pl.len()) == 5001).then(pl.col("time_ns").shift(1)).otherwise(pl.col("time_ns")).alias("time_ns"))
+    assert repeated["time_ns"].n_unique() == len(repeated) - 1
+    again = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": repeated}, 420.0).iter_rows(named=True)}
+    assert again["adult"]["exposed_s"] == pytest.approx(out["adult"]["exposed_s"], abs=0.6)
+    # without robot tracks nothing is measured: None, not 0
+    none = infra.conflict_exposure(tracks, {}, 420.0)
+    assert none["exposed_s"].null_count() == len(none) and none["exposure_s"].null_count() == len(none) and none["walkers"].to_list() == [2, 1]
+
+
+def test_group_cells_sum_the_walker_seconds_per_group_and_cell(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = []
+    for t in np.arange(0.0, 10.0, 0.5):
+        rows.append({"episode_id": 0, "time_ns": int(t * 1e9), "t": float(t), "agent_id": 0, "key": "a", "name": "", "source_name": "s", "source_seq": 0, "agent_type": "adult", "x": 1.1, "y": 2.2, "vx": 0.0, "vy": 0.0, "radius": 0.25})
+        rows.append({"episode_id": 0, "time_ns": int(t * 1e9), "t": float(t), "agent_id": 1, "key": "w", "name": "", "source_name": "s", "source_seq": 1, "agent_type": "wheelchair_manual", "x": 1.4, "y": 2.4, "vx": 0.0, "vy": 0.0, "radius": 0.3})
+    tracks = pl.DataFrame(rows, schema=TRACK_SCHEMA)
+    cells = infra.group_cells(tracks, 0.5)
+    assert cells.sort("group").to_dicts() == [
+        {"group": "adult", "x": 1.25, "y": 2.25, "cell_m": 0.5, "ped_seconds": pytest.approx(10.0)},
+        {"group": "wheelchair", "x": 1.25, "y": 2.25, "cell_m": 0.5, "ped_seconds": pytest.approx(10.0)},
+    ]
+    site = _benchmark(tmp_path / "site", [("peds_only", "site__s1", 1, None), ("peds_only", "site__s2", 2, None)])
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda episode_dir, env: tracks)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
+    occ = infra.occupancy(site)
+    assert occ.columns == ["world", "stage", "planner", "group", "x", "y", "cell_m", "ped_seconds"]
+    assert sorted(set(occ["stage"])) == ["site__s1", "site__s2"] and set(occ["world"]) == {"site"} and occ["ped_seconds"].sum() == pytest.approx(40.0)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: False)
+    monkeypatch.setattr(infra, "track_problem", lambda episode_dir, env: "a copy")
+    with pytest.raises(FileNotFoundError, match="no walker tracks"):
+        infra.occupancy(site)
 
 
 def _premise_rows(narrow: dict, wide: dict) -> list[dict]:
@@ -312,6 +416,8 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     assert table["task_time_s"].to_list() == pytest.approx([560.0] * 4)
     chosen = json.loads((layouts / "infra_pick.json").read_text())
     assert (chosen["robot_only"], chosen["joint_pick"]) == ("aaaa", "bbbb")
+    assert chosen["score_check"]["layouts"] <= 2 and "groups" in chosen["score_check"]
+    assert table.filter(pl.col("layout_id") == "aaaa")["exposure_adult_s"].to_list() == [None, None]  # no robot tracks: not measured
     assert (layouts / "plots" / infra.FIGURE_FILE).is_file()
     printed = capsys.readouterr().out
     assert "joint pick: bbbb" in printed and "C_adult" in printed
