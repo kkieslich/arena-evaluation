@@ -339,16 +339,25 @@ def log_from_snapshot(snapshot: pl.DataFrame, env: str = "env_0") -> dict[str, s
     field from the episode's reset on. A recording starts with the semantic state its lane's previous episode left
     latched, that episode's whole task log; the fleet mode writes `t0` on every reset, so the rows before the first one
     with the last `t0` belong to an earlier episode and are left out (else a field this episode never wrote, a charge's
-    `ended`, a job's `outcome`, would keep the earlier episode's value)."""
+    `ended`, a job's `outcome`, would keep the earlier episode's value).
+
+    The boundary lies in recording order, not at a stamp: the latched copy and the reset message can carry one stamp,
+    and the latched copy comes first. Each message's rows of an entity end with its `members` row, so the boundary is
+    the first row of the message that holds the first row with the last `t0` (in a table without `members` rows, that
+    row itself)."""
     if len(snapshot) == 0 or "kind" not in snapshot.columns:
         return {}
     rows = snapshot.filter(pl.col("kind") == FLEET_KIND)
     if "env_id" in rows.columns and rows["env_id"].n_unique() > 1:
         rows = rows.filter(pl.col("env_id") == int(env.rsplit("_", 1)[-1]))
+    members = rows["field"] == "members"
+    rows = rows.with_row_index("_row").with_columns(_message=members.cast(pl.Int64).cum_sum().shift(1, fill_value=0))
     rows = rows.filter(pl.col("field") != "members").sort("time_ns", maintain_order=True)
     t0 = rows.filter(pl.col("field") == "t0")
     if len(t0):
-        rows = rows.filter(pl.col("time_ns") >= t0.filter(pl.col("value_str") == t0["value_str"][-1])["time_ns"].min())
+        first = t0.filter(pl.col("value_str") == t0["value_str"][-1]).row(0, named=True)
+        start = rows.filter(pl.col("_message") == first["_message"])["_row"].min() if members.any() else first["_row"]
+        rows = rows.filter((pl.col("time_ns") > first["time_ns"]) | ((pl.col("time_ns") == first["time_ns"]) & (pl.col("_row") >= start)))
     return {field: value for field, value in rows.select("field", pl.col("value_str").fill_null("")).iter_rows()}
 
 

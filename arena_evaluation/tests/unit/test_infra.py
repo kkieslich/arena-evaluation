@@ -68,6 +68,35 @@ def test_the_fleet_log_leaves_out_the_previous_episodes_latched_log() -> None:
     assert infra.jobs(log)[0]["ended"] is None and infra.charges(log)[0]["started"] is None
 
 
+def _message(fields: dict[str, str], time_ns: int, members: bool = True) -> pl.DataFrame:
+    """One semantic message's rows of the fleet entity as mcap_reader writes them: a row per field, then `members`."""
+    rows = _log(fields).filter(pl.col("kind") == "fleet").with_columns(pl.lit(time_ns).alias("time_ns"))
+    if members:
+        rows = pl.concat([rows, rows.head(1).with_columns(pl.lit("members").alias("field"), pl.lit("members").alias("field_kind"), pl.lit(None, pl.String).alias("value_str"))])
+    return rows
+
+
+def test_the_fleet_log_leaves_out_a_latched_log_that_shares_the_reset_messages_stamp() -> None:
+    # the latched copy of the previous episode's log and this episode's reset message can carry one stamp; the latched
+    # copy comes first in the recording, so its jobs, jam and top-ups must not survive (infra_eval_x_i2 episode_002)
+    previous = {"t0": "1595.303", **{f"job.{j}.{k}": v for j in range(1, 5) for k, v in (("kind", "delivery"), ("released", f"{100 * j}.000"), ("outcome", "failed"), ("reason", "jam"))},
+                "jam.0.job": "3", "jam.0.target": "locker_0", "top_up.0.dispatched": "900.000", "top_up.0.started": "950.000", "top_up.1.dispatched": "1200.000", "top_up.1.ended": "1300.000"}
+    own = {"t0": "3096.401", "job.0.kind": "delivery", "job.0.released": "174.891"}
+    stamp, later = 3_096_400_500_000, 3_271_292_100_000
+    for members in (True, False):
+        snapshot = pl.concat([_message(previous, stamp, members), _message({"t0": "3096.401"}, stamp, members), _message(own, later, members)])
+        log = infra.log_from_snapshot(snapshot)
+        assert log == own, members
+        assert len(infra.jobs(log)) == 1 and infra.top_ups(log) == [] and not any(k.startswith("jam.") for k in log)
+    # with the messages delimited, the boundary is the reset message's first row, wherever its t0 lies in it
+    reset = {"job.0.kind": "delivery", "t0": "3096.401", "job.0.released": "0.500"}
+    log = infra.log_from_snapshot(pl.concat([_message(previous, stamp), _message(reset, stamp)]))
+    assert log == reset
+    # a later message of the same stamp still counts
+    log = infra.log_from_snapshot(pl.concat([_message(previous, stamp), _message({"t0": "3096.401"}, stamp), _message(own, stamp)]))
+    assert log == own
+
+
 def test_service_scores_the_jobs_released_after_the_warm_up() -> None:
     s = infra.service(LOG, warmup_s=420.0, episode_s=1500.0)
     assert (s["jobs_released"], s["jobs_completed"], s["jobs_failed"], s["jobs_abandoned"], s["jobs_open"], s["jobs_jammed"]) == (5, 2, 1, 1, 1, 1)
