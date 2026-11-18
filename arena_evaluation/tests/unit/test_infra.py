@@ -407,7 +407,8 @@ def _benchmark(root: pathlib.Path, runs: list[tuple[str, str, int, pl.DataFrame 
         topics = root / "episodes" / f"episode_{episode:03d}" / "topics"
         topics.mkdir(parents=True)
         if snapshot is not None:
-            snapshot.write_parquet(topics / "semantic_snapshot.parquet")
+            # stamped on the sim clock, where the log's t0 (100 s in LOG) lies
+            snapshot.with_columns(pl.col("time_ns") + 100_000_000_000).write_parquet(topics / "semantic_snapshot.parquet")
     pl.DataFrame(rows).write_parquet(root / "combined_metrics.parquet")
     return root
 
@@ -1142,6 +1143,9 @@ def test_the_fleet_mode_ran_where_its_log_was_reset_in_the_episode() -> None:
     # the log an earlier fleet episode left latched is all a later run without robots records: not a fleet run,
     # though the log reads as full
     assert not infra.fleet_ran_in(latched) and infra.log_from_snapshot(latched)["job.0.outcome"] == "completed"
+    # the latched copy can come without a stamp (infra_eval_s2_h1 episode_010: every fleet row at 0, t0 13569.550)
+    assert not infra.fleet_ran_in(_message({"t0": "13569.550", "job.0.kind": "delivery"}, 0)) and not infra.fleet_ran_in(_message({"t0": "5.200"}, 0))
+    assert infra.fleet_ran_in(pl.concat([_message({"t0": "13569.550"}, 0), _message({"t0": "15071.300"}, 15_071_200_000_000)], how="vertical_relaxed"))
     assert not infra.fleet_ran_in(pl.DataFrame()) and not infra.fleet_ran_in(_log({}))
     # a fleet log without t0 cannot be told apart and counts as a fleet run
     assert infra.fleet_ran_in(_message({"job.0.kind": "delivery"}, episode_ns))
@@ -1155,7 +1159,7 @@ def test_a_run_without_robots_is_never_the_fleet_run_whatever_its_contestant_is_
         assert not alone["complete"].any() and "C_adult" not in alone.columns and "jobs_released" not in alone.columns
         assert all("with the fleet" in reason and "the run under crowd_only (episode_00" in reason and "is not read as the fleet run" in reason for reason in alone["incomplete"].to_list())
     # the same with the log of the lane's earlier fleet episode still latched in the recording
-    latched = _message({"t0": "100.000", "job.0.kind": "delivery", "job.0.released": "500.000", "job.0.ended": "700.000", "job.0.outcome": "completed"}, 1_600_000_000_000)
+    latched = _message({"t0": "100.000", "job.0.kind": "delivery", "job.0.released": "500.000", "job.0.ended": "700.000", "job.0.outcome": "completed"}, 1_500_000_000_000)
     site, dirs, doc = _layout_runs(tmp_path / "latched", monkeypatch, {"crowd": [("crowd_only", 1), ("unhindered_peds", 1)]}, logs={"crowd_only": latched, "unhindered_peds": latched})
     row = infra.layout_table(site, dirs["crowd"], {**doc, "seeds": [1]}).to_dicts()[0]
     assert row["complete"] is False and row["incomplete"].startswith("missing runs: with the fleet; the run under crowd_only") and "jobs_released" not in row

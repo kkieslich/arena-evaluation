@@ -142,8 +142,9 @@ left out. A layout's run without robots is the `unhindered_peds` reference of it
 recorded on its own with the crowd-only contestant `peds_only` (no robot stack); both kinds of one stage are refused as
 a stage run twice. Before this, a `peds_only` run of a layout stage was read as a fleet run, or refused beside one; that
 changes also where nothing names the seeds. A run is the fleet run only if the fleet mode reset its task log in the
-episode (the message that first carries the log's last `t0` is stamped within 60 s of it; recorded fleet runs: under
-0.14 s; the log an earlier fleet episode left latched in a later run without robots: an episode length). A run under
+episode (the first stamped message that carries the log's last `t0` is stamped within 60 s of it; recorded fleet runs:
+under 0.14 s; the log an earlier fleet episode left latched in a later run without robots: an episode length, or a
+message without a stamp). A run under
 any other contestant without that is not read as the fleet run, and a `peds_only` or `unhindered_peds` run with it is
 not read as a run without robots: the row is then not complete and names the run.
 

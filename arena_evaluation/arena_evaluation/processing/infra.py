@@ -101,9 +101,10 @@ SITE_PLANNER = "peds_only"
 WITHOUT_ROBOTS = (NO_ROBOTS, SITE_PLANNER)
 #: The manifest key naming the seeds that have a run without robots; without it every seed has one
 WITHOUT_ROBOTS_SEEDS = "without_robots_seeds"
-#: A fleet task log was reset in an episode when the message that first carries its last `t0` is stamped within this
-#: many seconds of that `t0` [s]. Recorded fleet runs: 0.00 to 0.13 s. The copy a lane's earlier fleet episode left
-#: latched, which a later run without robots records at its start: an episode length, about 1500 s
+#: A fleet task log was reset in an episode when the first stamped message that carries its last `t0` is stamped
+#: within this many seconds of that `t0` [s]. Recorded fleet runs: 0.00 to 0.13 s. The copy a lane's earlier fleet
+#: episode left latched, which a later run without robots records at its start: an episode length (about 1500 s), or a
+#: message without a stamp
 FLEET_RESET_SLACK_S = 60.0
 #: The most seeds a seed list may name (`_seed_list`)
 MAX_SEEDS = 10_000
@@ -361,10 +362,11 @@ def fleet_ran(episode_dir: pathlib.Path, env: str = "env_0") -> bool:
 def fleet_ran_in(snapshot: pl.DataFrame, env: str = "env_0") -> bool:
     """Whether the fleet mode ran in the episode of a semantic snapshot table: it holds rows of `env`'s `fleet` entity,
     and the task log was reset in this episode. The fleet mode writes `t0`, the reset's time, on every reset, so the
-    message that first carries the last `t0` is stamped at about that time (`FLEET_RESET_SLACK_S`). A run without
-    robots recorded after a fleet episode of its lane starts with that episode's log still latched: its only `t0` is
-    an episode older than its stamp, and that is not a fleet run. A table without any fleet row is not one either. A
-    fleet log without a `t0` row cannot be told apart this way and counts as a fleet run, as it always did."""
+    first stamped message that carries the last `t0` is stamped at about that time (`FLEET_RESET_SLACK_S`, either
+    way). A run without robots recorded after a fleet episode of its lane starts with that episode's log still latched,
+    and that is not a fleet run: its only `t0` is an episode older than the message's stamp, or the message has no
+    stamp at all (0; both occur in recorded runs). A table without any fleet row is not one either. A fleet log without
+    a `t0` row cannot be told apart this way and counts as a fleet run, as it always did."""
     if len(snapshot) == 0 or "kind" not in snapshot.columns:
         return False
     rows = snapshot.filter(pl.col("kind") == FLEET_KIND)
@@ -378,8 +380,8 @@ def fleet_ran_in(snapshot: pl.DataFrame, env: str = "env_0") -> bool:
         return True
     last = t0["value_str"][-1]
     reset_s = _f(last)
-    carried_ns = t0.filter(pl.col("value_str") == last)["time_ns"][0]
-    return reset_s is not None and reset_s >= carried_ns / 1e9 - FLEET_RESET_SLACK_S
+    carried = t0.filter((pl.col("value_str") == last) & (pl.col("time_ns") > 0))
+    return reset_s is not None and len(carried) > 0 and abs(reset_s - carried["time_ns"][0] / 1e9) <= FLEET_RESET_SLACK_S
 
 
 def log_from_snapshot(snapshot: pl.DataFrame, env: str = "env_0") -> dict[str, str]:
