@@ -949,28 +949,42 @@ def test_the_cost_without_the_run_without_robots_pairs_the_site_as_is_and_the_fl
         infra.cost(site, None, None)
 
 
-def _layout_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: dict[str, list[tuple[str, int]]], lost: tuple[str, ...] = ()) -> tuple[pathlib.Path, dict[str, pathlib.Path], dict]:
-    """The site as is on seeds 1 and 2 and runs of layout aaaa in run dirs by `parts` (dir name -> (contestant, seed)),
-    with tracks from a monkeypatched store: the walkers are 30 s slower without robots and 60 s with the fleet, and the
-    walkers with a key in `lost` do not finish the runs without robots. The manifest names no seeds without robots."""
+VISITOR = ("south_locker_wheelchair", "7", "./types/locker_visitor__south_wheelchair.yaml", 450.0, 850.0)
+
+
+def _layout_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: dict[str, list[tuple]], lost: tuple[str, ...] = (), *, walkers: list[tuple[str, str, str, float, float]] = SITE, logs: dict[str, pl.DataFrame | None] | None = None, visitor: bool = False) -> tuple[pathlib.Path, dict[str, pathlib.Path], dict]:
+    """The site as is on seeds 1 and 2 and layout runs in run dirs by `parts` (dir name -> (contestant, seed) of layout
+    aaaa, or (contestant, seed, layout) with layout bbbb), with tracks from a monkeypatched store: in aaaa the `walkers`
+    are 30 s slower without robots and 60 s with the fleet (`fleet_dwb`), in bbbb 10 and 20 s, and the walkers with a
+    key in `lost` do not finish the runs without the fleet. A `fleet_dwb` run records a fleet log, any other contestant
+    none, unless `logs` gives the contestant's semantic snapshot. With `visitor`, a locker visitor walks in the layout
+    runs. The manifest names no seeds without robots."""
     site = _benchmark(tmp_path / "site", [("peds_only", "site__s1", 1, None), ("peds_only", "site__s2", 2, None)])
+    shift = {"aaaa": 30.0, "bbbb": 10.0}
     dirs: dict[str, pathlib.Path] = {}
     recorded: dict[pathlib.Path, list[tuple[str, str, int, pl.DataFrame | None]]] = {}
     for part, runs_here in parts.items():
-        listed = [(planner, f"site__layout_aaaa__s{seed}", seed, _log(LOG) if planner == "fleet_dwb" else None) for planner, seed in runs_here]
+        listed = []
+        for planner, seed, *layout in runs_here:
+            snapshot = (logs or {}).get(planner, _log(LOG) if planner == "fleet_dwb" else None)
+            listed.append((planner, f"site__layout_{layout[0] if layout else 'aaaa'}__s{seed}", seed, snapshot))
         dirs[part] = _benchmark(tmp_path / part, listed)
         recorded[dirs[part]] = listed
 
     def fake(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
         bench = episode_dir.parent.parent
         if bench == site:
-            return _tracks(SITE)
-        fleet = recorded[bench][int(episode_dir.name.split("_")[1])][0] == "fleet_dwb"
-        return _tracks([(s, k, a, start, end + (60.0 if fleet else 30.0)) for s, k, a, start, end in SITE if fleet or k not in lost])
+            return _tracks(walkers)
+        planner, stage = recorded[bench][int(episode_dir.name.split("_")[1])][:2]
+        fleet = planner == "fleet_dwb"
+        extra = shift[stage.split("_layout_")[1][:4]] * (2 if fleet else 1)
+        return _tracks([(s, k, a, start, end + extra) for s, k, a, start, end in [*walkers, *([VISITOR] if visitor else [])] if fleet or k not in lost])
 
     monkeypatch.setattr(infra, "tracks_for_episode", fake)
     monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
-    doc = {"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}], "worlds": {"aaaa": "/x/site__layout_aaaa"}}
+    layouts = sorted({layout[0] if layout else "aaaa" for runs_here in parts.values() for _, _, *layout in runs_here})
+    roles = {"aaaa": "robot_only", "bbbb": "joint"}
+    doc = {"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [VISITOR[0]] if visitor else [], "runs": [{"role": roles[layout], "layout_id": layout, "travel_m": 10.0} for layout in layouts], "worlds": {layout: f"/x/site__layout_{layout}" for layout in layouts}}
     return site, dirs, doc
 
 
@@ -1009,7 +1023,7 @@ def test_the_run_without_robots_is_optional_on_the_seeds_that_are_not_named(tmp_
     assert infra.infra_command(args) == 0
     assert pl.read_parquet(tmp_path / "out" / infra.TABLE_FILE).equals(new)
     printed = capsys.readouterr().out
-    assert "element and traffic over the 1 seeds with a run without robots" in printed and "not complete" not in printed
+    assert "element and traffic over the seeds with a walker in all three runs: adult 1, wheelchair 1, long_cane 1 of 1 with a run without robots" in printed and "not complete" not in printed
 
 
 def test_on_a_named_seed_the_total_pairs_two_runs_and_the_parts_pair_three(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1053,6 +1067,162 @@ def test_a_layout_stage_recorded_with_the_crowd_only_contestant_is_its_run_witho
 
 def test_the_seed_list_reads_numbers_ranges_and_none() -> None:
     assert infra._seed_list("51-55") == [51, 52, 53, 54, 55] and infra._seed_list("51, 53-54") == [51, 53, 54] and infra._seed_list("none") == []
-    for bad in ("", "a", "5-3", "1-", "-2", "1,,2"):
-        with pytest.raises(ValueError, match="seeds are numbers and ranges"):
+    assert infra._seed_list("51,51,52,51-53") == [51, 52, 53]
+    for bad in ("", "a", "5-3", "1-", "-2", "1,,2", "51 - 55", "5e1", "1.0", "\u0665\u0661", "51-5500000000"):
+        with pytest.raises(ValueError, match="seeds are whole numbers and ranges"):
             infra._seed_list(bad)
+    # a range is never built beyond the bound
+    with pytest.raises(ValueError, match="names more than 10000 seeds"):
+        infra._seed_list("1-999999999")
+    with pytest.raises(ValueError, match="names more than 10000 seeds"):
+        infra._seed_list("1-6000,7001-12000")
+
+
+def test_the_named_seeds_are_whole_numbers_and_the_option_never_replaces_the_manifests(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    doc = {"seeds": [1, 2]}
+    assert infra.without_robots_seeds(doc) is None and infra.without_robots_seeds({**doc, "without_robots_seeds": None}) is None
+    assert infra.without_robots_seeds({**doc, "without_robots_seeds": []}) == frozenset() and infra.without_robots_seeds(doc, []) == frozenset()
+    assert infra.without_robots_seeds({**doc, "without_robots_seeds": [1, 1]}) == {1} and infra.without_robots_seeds(doc, np.array([2])) == {2}
+    for bad in ("1", "1-2", "none", 1, 1.0, {"1": 2}):
+        with pytest.raises(ValueError, match="is a list of seeds"):
+            infra.without_robots_seeds({**doc, "without_robots_seeds": bad})
+    for bad in (["1"], [1.0], [1.5], [True], [None]):
+        with pytest.raises(ValueError, match="holds whole numbers only"):
+            infra.without_robots_seeds({**doc, "without_robots_seeds": bad})
+        with pytest.raises(ValueError, match="holds whole numbers only"):
+            infra.without_robots_seeds(doc, bad)
+    # the same seeds from both are fine; other seeds from the option are refused, whichever names more
+    assert infra.without_robots_seeds({**doc, "without_robots_seeds": [1]}, [1]) == {1}
+    for key, option in (([1, 2], [1]), ([1], [1, 2]), ([1], []), ([], [1])):
+        with pytest.raises(ValueError, match="they differ"):
+            infra.without_robots_seeds({**doc, "without_robots_seeds": key}, option)
+    # so a seed whose planned run is missing is never made complete by the option
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2)]})
+    with pytest.raises(ValueError, match=r"names seeds \[1, 2\] and --without-robots-seeds names \[1\]"):
+        infra.layout_table(site, dirs["runs"], {**doc, "without_robots_seeds": [1, 2]}, split_seeds=[1])
+    planned = infra.layout_table(site, dirs["runs"], {**doc, "without_robots_seeds": [1, 2]})
+    assert planned["complete"].to_list() == [True, False] and planned["incomplete"].to_list() == [None, "missing runs: without robots"]
+
+
+def test_the_option_reaches_the_table_through_the_parser_and_none_names_no_seed(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": [("fleet_dwb", 1), ("fleet_dwb", 2)]})
+    manifest = tmp_path / "infra_rd.layouts.json"
+    manifest.write_text(json.dumps(doc))
+    parser = argparse.ArgumentParser()
+    infra.add_infra_parser(parser.add_subparsers(dest="command"))
+    base = ["infra", "table", "--site", str(site), "--layouts", str(dirs["runs"]), "--manifest", str(manifest), "--output-dir", str(tmp_path / "out")]
+    assert parser.parse_args(base).without_robots_seeds is None
+    assert parser.parse_args([*base, "--without-robots-seeds", "1-2"]).without_robots_seeds == [1, 2]
+    args = parser.parse_args([*base, "--without-robots-seeds", "none"])
+    assert args.without_robots_seeds == []
+    # no seed has a run without robots: every row is complete with its total, none has parts
+    assert infra.infra_command(args) == 0
+    table = pl.read_parquet(tmp_path / "out" / infra.TABLE_FILE)
+    assert table["complete"].all() and not table["split"].any() and table["C_adult"].to_list() == pytest.approx([60.0 / 300.0] * 2)
+    assert table["C_adult_element"].null_count() == 2 and "C_adult_split" not in table.columns and "split_seeds" in infra.layout_means(table).columns
+    assert "of 0 with a run without robots" in capsys.readouterr().out
+    # without the option the same run dirs miss the run without robots on every seed
+    assert infra.infra_command(parser.parse_args(base)) == 0
+    assert "2 (layout, seed) rows not complete (missing runs: without robots)" in capsys.readouterr().out
+    # a seed list that does not parse is refused with its reason, not with the type's name
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--without-robots-seeds", "51-"])
+    assert "seeds are whole numbers and ranges like 51-55,60 or `none`, not '51-'" in capsys.readouterr().err
+
+
+def test_the_fleet_mode_ran_where_its_log_was_reset_in_the_episode() -> None:
+    episode_ns = 3_096_400_000_000
+    reset = _message({"t0": "3096.401", "job.0.kind": "delivery"}, episode_ns)
+    latched = _message({"t0": "1595.303", "job.0.kind": "delivery", "job.0.outcome": "completed"}, episode_ns)
+    assert infra.fleet_ran_in(reset) and infra.fleet_ran_in(pl.concat([latched, reset]))
+    # a recorder that joins 16 s into the episode stamps the reset message that much later: still this episode's
+    assert infra.fleet_ran_in(pl.concat([latched, _message({"t0": "3096.401"}, episode_ns + 16_000_000_000)]))
+    # the log an earlier fleet episode left latched is all a later run without robots records: not a fleet run,
+    # though the log reads as full
+    assert not infra.fleet_ran_in(latched) and infra.log_from_snapshot(latched)["job.0.outcome"] == "completed"
+    assert not infra.fleet_ran_in(pl.DataFrame()) and not infra.fleet_ran_in(_log({}))
+    # a fleet log without t0 cannot be told apart and counts as a fleet run
+    assert infra.fleet_ran_in(_message({"job.0.kind": "delivery"}, episode_ns))
+
+
+def test_a_run_without_robots_is_never_the_fleet_run_whatever_its_contestant_is_called(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # crowd-only runs under a name the analysis does not know, and no seed named to have a run without robots
+    site, dirs, doc = _layout_runs(tmp_path / "alone", monkeypatch, {"crowd": [("crowd_only", 1), ("crowd_only", 2)]})
+    for named in (None, []):
+        alone = infra.layout_table(site, dirs["crowd"], doc, split_seeds=named)
+        assert not alone["complete"].any() and "C_adult" not in alone.columns and "jobs_released" not in alone.columns
+        assert all("with the fleet" in reason and "the run under crowd_only (episode_00" in reason and "is not read as the fleet run" in reason for reason in alone["incomplete"].to_list())
+    # the same with the log of the lane's earlier fleet episode still latched in the recording
+    latched = _message({"t0": "100.000", "job.0.kind": "delivery", "job.0.released": "500.000", "job.0.ended": "700.000", "job.0.outcome": "completed"}, 1_600_000_000_000)
+    site, dirs, doc = _layout_runs(tmp_path / "latched", monkeypatch, {"crowd": [("crowd_only", 1), ("unhindered_peds", 1)]}, logs={"crowd_only": latched, "unhindered_peds": latched})
+    row = infra.layout_table(site, dirs["crowd"], {**doc, "seeds": [1]}).to_dicts()[0]
+    assert row["complete"] is False and row["incomplete"].startswith("missing runs: with the fleet; the run under crowd_only") and "jobs_released" not in row
+    assert row["C_adult"] == pytest.approx(30.0 / 300.0) and row["C_adult_traffic"] is None  # the element part alone, as for any row without its fleet run
+    # beside the fleet run it is a second run of the stage, refused
+    site, dirs, doc = _layout_runs(tmp_path / "beside", monkeypatch, {"fleet": [("fleet_dwb", 1)], "crowd": [("crowd_only", 1)]})
+    with pytest.raises(ValueError, match="stage site__layout_aaaa__s1 has more than one usable run"):
+        infra.layout_table(site, [dirs["fleet"], dirs["crowd"]], {**doc, "seeds": [1]}, split_seeds=[1])
+    # a run named as a run without robots in which the fleet mode ran is not read as one
+    site, dirs, doc = _layout_runs(tmp_path / "named", monkeypatch, {"runs": [("fleet_dwb", 1), ("peds_only", 1)]}, logs={"peds_only": _log(LOG)})
+    row = infra.layout_table(site, dirs["runs"], {**doc, "seeds": [1]}).to_dicts()[0]
+    assert row["complete"] is False and row["incomplete"].startswith("missing runs: without robots; the run under peds_only") and "C_adult" not in row
+    # a fleet contestant's run that recorded no fleet log is not the fleet run either, also where nothing names the seeds
+    site, dirs, doc = _layout_runs(tmp_path / "nolog", monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1)]}, logs={"fleet_dwb": None})
+    row = infra.layout_table(site, dirs["runs"], {**doc, "seeds": [1]}).to_dicts()[0]
+    assert row["complete"] is False and "the run under fleet_dwb (episode_000) holds no fleet task log reset in its episode" in row["incomplete"]
+
+
+def test_the_parts_sum_to_the_total_of_the_walkers_in_all_three_runs_not_to_the_seeds_total(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # two adults; the second does not finish the runs without robots
+    walkers = [*SITE, ("south_adult", "4", "adult", 600.0, 1000.0)]
+    every = [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2), ("unhindered_peds", 2)]
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": every}, lost=("4", "2"), walkers=walkers)
+    table = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    assert table["peds_adult"].to_list() == [2, 2] and table["peds_adult_split"].to_list() == [1, 1] and table["dropped_adult_split"].to_list() == [1, 1]
+    assert table["C_adult"].to_list() == pytest.approx([120.0 / 700.0] * 2) and table["C_adult_split"].to_list() == pytest.approx([60.0 / 300.0] * 2)
+    assert (table["C_adult_element"] + table["C_adult_traffic"]).to_list() == table["C_adult_split"].to_list()
+    assert table["C_adult_element"].to_list() == pytest.approx([30.0 / 300.0] * 2)
+    # the wheelchair user is in no three-run pair: a total, no parts, though the rows have the three runs
+    assert table["split"].all() and table["C_wheelchair"].to_list() == pytest.approx([60.0 / 400.0] * 2)
+    assert table["C_wheelchair_split"].to_list() == [None, None] and table["C_wheelchair_element"].to_list() == [None, None]
+    means = infra.layout_means(table)
+    assert (means["split_seeds"].to_list(), means["split_seeds_adult"].to_list(), means["split_seeds_wheelchair"].to_list(), means["split_seeds_long_cane"].to_list()) == ([2], [2], [0], [2])
+    assert "C_wheelchair_element" not in means.columns and means["C_adult_split"].to_list() == pytest.approx([60.0 / 300.0]) and means["C_adult"].to_list() == pytest.approx([120.0 / 700.0])
+    # where the three runs pair everything (nothing named) the total is the split's total
+    old = infra.layout_table(site, dirs["runs"], doc)
+    assert old["C_adult"].to_list() == table["C_adult_split"].to_list() and "C_adult_split" not in old.columns and "split_seeds" not in infra.layout_means(old).columns
+
+
+def test_named_seeds_report_the_visitors_and_miss_what_their_runs_miss(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, dirs, doc = _layout_runs(tmp_path / "visitors", monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2)]}, visitor=True)
+    table = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1])
+    # the visitor is reported on the seed with a run without robots, and is no through-walker on either
+    assert table["visitor_wheelchair_peds"].to_list() == [1, None] and table["visitor_wheelchair_walk_s"].to_list() == [pytest.approx(430.0), None]
+    assert table["visitor_wheelchair_traffic"].to_list() == [pytest.approx(30.0 / 430.0), None] and table["peds_wheelchair"].to_list() == [1, 1]
+    assert table["C_wheelchair"].to_list() == pytest.approx([60.0 / 400.0] * 2)
+    # every walker spawns before a 1,500 s warm-up: no row is complete, and each names the runs it read
+    late = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1], warmup_s=1500.0)
+    assert not late["complete"].any() and late["c_worst"].is_null().all()
+    assert late["incomplete"].to_list() == ["no walker spawned after the 1500 s warm-up and finished: the site as is, without robots, with the fleet", "no walker spawned after the 1500 s warm-up and finished: the site as is, with the fleet"]
+    # a named seed with its run without robots but no fleet run has no total and no parts
+    site, dirs, doc = _layout_runs(tmp_path / "nofleet", monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("unhindered_peds", 2)]})
+    table = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    assert table["complete"].to_list() == [True, False] and table["incomplete"].to_list() == [None, "missing runs: with the fleet"]
+    assert table["split"].to_list() == [True, False] and table["C_adult"].to_list() == [pytest.approx(60.0 / 300.0), None] and table["C_adult_element"].to_list() == [pytest.approx(30.0 / 300.0), None]
+
+
+def test_compare_reads_the_two_run_totals_whether_or_not_a_seed_has_the_split(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fleet = [("fleet_dwb", seed, layout) for layout in ("aaaa", "bbbb") for seed in (1, 2)]
+    picks = {"joint": "bbbb", "robot_only": "aaaa"}
+    site, dirs, doc = _layout_runs(tmp_path / "some", monkeypatch, {"runs": [*fleet, ("unhindered_peds", 1, "aaaa"), ("unhindered_peds", 1, "bbbb")]})
+    some = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1])
+    assert some["complete"].all() and some["split"].to_list() == [True, False, True, False]
+    site, dirs, doc = _layout_runs(tmp_path / "every", monkeypatch, {"runs": [*fleet, *[("unhindered_peds", seed, layout) for layout in ("aaaa", "bbbb") for seed in (1, 2)]]})
+    every = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    unnamed = infra.layout_table(site, dirs["runs"], doc)
+    results = [infra._plain(infra.compare(table, picks, n_boot=500)) for table in (some, every, unnamed)]
+    assert results[0] == results[1] == results[2]
+    assert results[0]["seeds"] == [1, 2] and results[0]["delta_c_worst"]["estimate"] == pytest.approx(20.0 / 300.0 - 60.0 / 300.0) and results[0]["verdict"] == "lower"
+    assert results[0]["delta_aid_minus_adult"]["wheelchair"]["seeds"] == 2
