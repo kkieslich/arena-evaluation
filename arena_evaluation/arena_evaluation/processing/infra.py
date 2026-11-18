@@ -26,7 +26,12 @@ times of other code are never read, and times of different commits are refused l
   with the fleet. The element part pairs the layout without robots with the site, the traffic part the layout with
   robots with the one without; all divide by the same reference travel time, so element + traffic = total.
   `C_worst` = max over groups. Locker visitors (the layout's own sources) are reported apart: their walk in the layout
-  without robots and their traffic part.
+  without robots and their traffic part. A study may record the run without robots on some seeds only
+  (`without_robots_seeds` in the manifest, or `--without-robots-seeds`): `C_g` then pairs the site as is and the fleet
+  run on every seed, and the element and traffic parts come from the named seeds, of the walkers that finished all
+  three runs (`layout_table`). Without the key every seed needs the three runs, as above. The run without robots is the
+  runner's `unhindered_peds` reference of the fleet stage, or the same stage recorded on its own with the crowd-only
+  contestant (`peds_only`), which starts no robot stack.
 - **The premise check** (§10) on the narrowest and the widest layout: their `C_worst` gap against the seed spread,
   over both layouts, and the task rate the selection runs at, 75 % of the fleet's measured capacity in the wide layout
   (`RATE_ROLE`); the narrow layout's capacity is reported, its service and cost count as layout cost. The capacity
@@ -89,6 +94,11 @@ AID_GROUPS = ("wheelchair", "long_cane")
 #: The runner's contestant of the runs without robots, and the site-as-is suite's contestant
 NO_ROBOTS = "unhindered_peds"
 SITE_PLANNER = "peds_only"
+#: The contestants of a layout's run without robots: the runner's reference of the fleet stage (the robot stack up, the
+#: robots parked off the map), or the stage recorded on its own with the crowd-only contestant
+WITHOUT_ROBOTS = (NO_ROBOTS, SITE_PLANNER)
+#: The manifest key naming the seeds that have a run without robots; without it every seed has one
+WITHOUT_ROBOTS_SEEDS = "without_robots_seeds"
 FLEET_KIND = "fleet"
 TABLE_FILE = "infra_layouts.parquet"
 FIGURE_FILE = "infra_service_cost.png"
@@ -776,22 +786,29 @@ def _group(agent_type: str, source_name: str | None) -> str:
     return match["group"] if match else agent_group(agent_type)
 
 
-def cost(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = (), warmup_s: float = WARMUP_S) -> dict[str, typing.Any]:
+def cost(site: pl.DataFrame, without: pl.DataFrame | None, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = (), warmup_s: float = WARMUP_S) -> dict[str, typing.Any]:
     """The pedestrian cost of one layout at one seed (§6) from the track tables of the site as is, the layout without
-    robots and (None for a premise or element-only check) the layout with robots: per group the paired through-walkers,
-    the total, element and traffic parts of `C_g`, the absolute delay, and the drops; `C_worst` and its group; the locker
-    visitors' walk without robots and their traffic part."""
-    return cost_from_times(_times(site, warmup_s), _times(without, warmup_s), _times(robots, warmup_s) if robots is not None else None, visitor_sources=visitor_sources)
+    robots (None for a seed that has no such run) and the layout with robots (None for a premise or element-only
+    check): per group the paired through-walkers, the total, element and traffic parts of `C_g`, the absolute delay, and
+    the drops; `C_worst` and its group; the locker visitors' walk without robots and their traffic part."""
+    return cost_from_times(_times(site, warmup_s), _times(without, warmup_s) if without is not None else None, _times(robots, warmup_s) if robots is not None else None, visitor_sources=visitor_sources)
 
 
-def cost_from_times(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = ()) -> dict[str, typing.Any]:
-    """`cost` from the walker travel times (`_times`, `walker_times`) of the three runs in place of their tracks."""
+def cost_from_times(site: pl.DataFrame, without: pl.DataFrame | None, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = ()) -> dict[str, typing.Any]:
+    """`cost` from the walker travel times (`_times`, `walker_times`) of the three runs in place of their tracks.
+
+    Without the run without robots (`without` None) the through-walkers pair the site as is and the fleet run alone:
+    the total is the delay against the site as is, there is no element or traffic part and no visitor record.
+    ValueError without both layout runs."""
+    if without is None and robots is None:
+        raise ValueError("the cost needs the layout's run without robots or its run with the fleet")
     visitors = set(visitor_sources)
     ref = site.filter(~pl.col("source_name").is_in(list(visitors)) & (pl.col("source_name") != ""))
     off = without
     on = robots
-    walkers = ref.select("key", "agent_type", "source_name", pl.col("travel_s").alias("site_s"))
-    joined = walkers.join(off.select("key", pl.col("travel_s").alias("off_s")), on="key", how="left")
+    joined = ref.select("key", "agent_type", "source_name", pl.col("travel_s").alias("site_s"))
+    if off is not None:
+        joined = joined.join(off.select("key", pl.col("travel_s").alias("off_s")), on="key", how="left")
     if on is not None:
         joined = joined.join(on.select("key", pl.col("travel_s").alias("on_s")), on="key", how="left")
     joined = joined.sort("key")  # sums in one order, whatever order the inputs come in
@@ -800,20 +817,21 @@ def cost_from_times(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFr
         group = _group(row["agent_type"], row["source_name"])
         g = groups.setdefault(group, {"peds": 0, "dropped": 0, "site_s": 0.0, "off_s": 0.0, "on_s": 0.0})
         # a through-walker that finished the site as is but not a layout run drops from the pair (§6), counted per group
-        if row["off_s"] is None or (on is not None and row["on_s"] is None):
+        if (off is not None and row["off_s"] is None) or (on is not None and row["on_s"] is None):
             g["dropped"] += 1
             continue
         g["peds"] += 1
         g["site_s"] += row["site_s"]
-        g["off_s"] += row["off_s"]
+        if off is not None:
+            g["off_s"] += row["off_s"]
         g["on_s"] += row["on_s"] if on is not None else row["off_s"]
     out: dict[str, typing.Any] = {"groups": {}}
     for group, g in sorted(groups.items()):
         ref_s = g["site_s"]
         record = {"peds": g["peds"], "dropped": g["dropped"], "site_travel_s": ref_s / g["peds"] if g["peds"] else None}
         if ref_s > 0:
-            record["element"] = (g["off_s"] - ref_s) / ref_s
-            record["traffic"] = (g["on_s"] - g["off_s"]) / ref_s if on is not None else None
+            record["element"] = (g["off_s"] - ref_s) / ref_s if off is not None else None
+            record["traffic"] = (g["on_s"] - g["off_s"]) / ref_s if on is not None and off is not None else None
             record["total"] = (g["on_s"] - ref_s) / ref_s if on is not None else record["element"]
             record["delay_s"] = ((g["on_s"] if on is not None else g["off_s"]) - ref_s) / g["peds"]
         else:
@@ -824,7 +842,7 @@ def cost_from_times(site: pl.DataFrame, without: pl.DataFrame, robots: pl.DataFr
     out["worst_group"] = max(totals, key=lambda g: totals[g]) if totals else None
     delays = {group: r["delay_s"] for group, r in out["groups"].items() if r["delay_s"] is not None}
     out["worst_group_delay_s"] = max(delays, key=lambda g: delays[g]) if delays else None
-    out["visitors"] = _visitors(off, on, visitors)
+    out["visitors"] = _visitors(off, on, visitors) if off is not None else {}
     return out
 
 
@@ -852,15 +870,40 @@ def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> 
 # --- tables ----------------------------------------------------------------------------------------------------------
 
 
-def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts_dir: pathlib.Path | typing.Sequence[pathlib.Path], manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None, allow_mixed_commits: bool = False) -> pl.DataFrame:
+def without_robots_seeds(manifest: typing.Mapping[str, typing.Any], seeds: typing.Collection[int] | None = None) -> frozenset[int] | None:
+    """The seeds that have a run without robots: `seeds` where given, else the manifest's `without_robots_seeds`; None
+    when neither names them (every seed has one, and the three runs pair as §6 says). ValueError for a seed the
+    manifest does not run."""
+    named = manifest.get(WITHOUT_ROBOTS_SEEDS) if seeds is None else seeds
+    if named is None:
+        return None
+    chosen = frozenset(int(s) for s in named)
+    unknown = sorted(chosen - {int(s) for s in manifest.get("seeds") or []})
+    if unknown:
+        raise ValueError(f"seeds {unknown} are named as seeds with a run without robots, but the manifest runs seeds {sorted(int(s) for s in manifest.get('seeds') or [])}")
+    return chosen
+
+
+def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts_dir: pathlib.Path | typing.Sequence[pathlib.Path], manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None, allow_mixed_commits: bool = False, split_seeds: typing.Collection[int] | None = None) -> pl.DataFrame:
     """One row per layout of `manifest` and seed: its roles, the service of its fleet run, its pedestrian cost against
     the site as is at that seed (`cost`), flattened (`C_<group>`, `C_<group>_element`, `C_<group>_traffic`,
     `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`). `site_dir` and
     `layouts_dir` may each be several run dirs (a suite's parts recorded on several machines), read as one; all of them
-    must name the same commits (`check_commits`) and hold walker times kept by one release (`check_kept_times`)."""
+    must name the same commits (`check_commits`) and hold walker times kept by one release (`check_kept_times`).
+
+    A layout's run without robots is its stage under a `WITHOUT_ROBOTS` contestant. Where the manifest or `split_seeds`
+    names the seeds that have one (`without_robots_seeds`), the run is optional per seed: on every seed `C_<group>`,
+    the delay, the counts and `c_worst` pair the site as is and the fleet run alone, so a seed's total does not depend
+    on whether it has the run; on the named seeds `C_<group>_element` and `C_<group>_traffic` are the parts of the
+    walkers that finished all three runs (`peds_<group>_split` of them, `dropped_<group>_split` dropped), which sum to
+    `C_<group>` where no walker drops for the run without robots alone, and the visitors are reported; `split` says
+    whether a row has the parts. A named seed without the run is not complete and keeps its total; a run without robots
+    at a seed that is not named is refused. Where nothing names the seeds, every seed needs the three runs and pairs
+    them as before, and a seed without one of them has no cost."""
     warmup = float(manifest.get("warmup_s", WARMUP_S) if warmup_s is None else warmup_s)
     episode_s = float(manifest.get("episode_s") or 0.0) or None
     visitor_sources = list(manifest.get("visitor_sources") or [])
+    split = without_robots_seeds(manifest, split_seeds)
     site_dirs, layout_dirs = _dirs(site_dir), _dirs(layouts_dir)
     check_commits([*site_dirs, *layout_dirs], allow_mixed=allow_mixed_commits)
     site_what, layouts_what = ", ".join(map(str, site_dirs)), ", ".join(map(str, layout_dirs))
@@ -882,11 +925,16 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
     site_name = str(manifest["site"])
     for layout_id, world in world_of.items():
         for seed in manifest.get("seeds") or []:
-            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner == NO_ROBOTS], f"{layouts_what} (without robots)")
-            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner != NO_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_what} (with the fleet)")
+            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner in WITHOUT_ROBOTS], f"{layouts_what} (without robots)")
+            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner not in WITHOUT_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_what} (with the fleet)")
             ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_what} (the site as is)")
-            complete = off is not None and on is not None and ref is not None
-            row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": complete, "incomplete": None if complete else "missing runs: " + ", ".join(what for what, r in (("the site as is", ref), ("without robots", off), ("with the fleet", on)) if r is None)}
+            needs_off = split is None or int(seed) in split
+            if off is not None and not needs_off:
+                raise ValueError(f"{layouts_what}: stage {off.stage} has a run without robots (episode_{off.episode:03d}), but seed {seed} is not among the seeds named to have one ({sorted(split or ())}); name the seed in the manifest's {WITHOUT_ROBOTS_SEEDS} or with --without-robots-seeds, or leave the run's dir out")
+            complete = on is not None and ref is not None and (off is not None or not needs_off)
+            row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": complete, "incomplete": None if complete else "missing runs: " + ", ".join(what for what, r, needed in (("the site as is", ref, True), ("without robots", off, needs_off), ("with the fleet", on, True)) if needed and r is None)}
+            if split is not None:
+                row["split"] = off is not None and on is not None and ref is not None
             row.update({f"pred_{group}": value for group, value in predicted.get(layout_id, {}).items()})
             row.update({f"pred_traffic_{group}": value for group, value in predicted_traffic.get(layout_id, {}).items()})
             if on is not None:
@@ -895,15 +943,21 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
                 if measured_exposure is not None:
                     row.update({f"exposure_{r['group']}_s": r["exposure_s"] for r in measured_exposure.iter_rows(named=True)})
                     row.update({f"exposure_{r['group']}_{PREDICTION_BAND_TAG}_s": r.get(f"exposure_{PREDICTION_BAND_TAG}_s") for r in measured_exposure.iter_rows(named=True)})
-            if off is not None and ref is not None:
+            times: dict[str, pl.DataFrame | None] = {}
+            if split is None and off is not None and ref is not None:
                 times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": walker_times(off.episode_dir, off.env, warmup), "with the fleet": None if on is None else walker_times(on.episode_dir, on.env, warmup)}
                 measured = cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)
                 row.update(_flatten(measured))
-                # a run without a walker that spawned after the warm-up and finished has no cost to give: not complete
-                empty = [what for what, t in times.items() if t is not None and len(t) == 0]
-                if empty:
-                    row["complete"] = False
-                    row["incomplete"] = f"no walker spawned after the {warmup:g} s warm-up and finished: " + ", ".join(empty)
+            elif split is not None and on is not None and ref is not None:
+                times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": None if off is None else walker_times(off.episode_dir, off.env, warmup), "with the fleet": walker_times(on.episode_dir, on.env, warmup)}
+                row.update(_flatten(cost_from_times(times["the site as is"], None, times["with the fleet"], visitor_sources=visitor_sources)))
+                if off is not None:
+                    row.update(_flatten_split(cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)))
+            # a run without a walker that spawned after the warm-up and finished has no cost to give: not complete
+            empty = [what for what, t in times.items() if t is not None and len(t) == 0]
+            if empty:
+                row["complete"] = False
+                row["incomplete"] = f"no walker spawned after the {warmup:g} s warm-up and finished: " + ", ".join(empty)
             rows.append(row)
     check_kept_times([*site_dirs, *layout_dirs], warmup, allow_mixed=allow_mixed_commits)
     return pl.DataFrame(rows, infer_schema_length=None)
@@ -913,6 +967,17 @@ def _flatten(measured: typing.Mapping[str, typing.Any]) -> dict[str, typing.Any]
     out: dict[str, typing.Any] = {"c_worst": measured["c_worst"], "worst_group": measured["worst_group"], "worst_group_delay_s": measured["worst_group_delay_s"]}
     for group, r in measured["groups"].items():
         out |= {f"C_{group}": r["total"], f"C_{group}_element": r["element"], f"C_{group}_traffic": r["traffic"], f"delay_{group}_s": r["delay_s"], f"peds_{group}": r["peds"], f"dropped_{group}": r["dropped"], f"site_travel_{group}_s": r["site_travel_s"]}
+    for group, r in (measured.get("visitors") or {}).items():
+        out |= {f"visitor_{group}_peds": r["peds"], f"visitor_{group}_walk_s": r["walk_s"], f"visitor_{group}_traffic": r["traffic"]}
+    return out
+
+
+def _flatten_split(measured: typing.Mapping[str, typing.Any]) -> dict[str, typing.Any]:
+    """Of a cost that pairs the three runs, what a row with the run without robots adds to its total against the site
+    as is: the element and traffic parts, the walkers they pair and drop, and the visitors."""
+    out: dict[str, typing.Any] = {}
+    for group, r in measured["groups"].items():
+        out |= {f"C_{group}_element": r["element"], f"C_{group}_traffic": r["traffic"], f"peds_{group}_split": r["peds"], f"dropped_{group}_split": r["dropped"]}
     for group, r in (measured.get("visitors") or {}).items():
         out |= {f"visitor_{group}_peds": r["peds"], f"visitor_{group}_walk_s": r["walk_s"], f"visitor_{group}_traffic": r["traffic"]}
     return out
@@ -932,11 +997,14 @@ def _interval(values: np.ndarray, n_boot: int = 2000, seed: int = 0) -> tuple[fl
 def layout_means(table: pl.DataFrame) -> pl.DataFrame:
     """One row per layout: the equal-weight mean over its seeds of `T` (`task_time_s`), every `C_<group>` and the
     service counts, `C_worst` as the max over the groups' means, the seeds counted, and 95 % seed-bootstrap intervals of
-    `T` and of the per-seed `c_worst` (the figure's error bars)."""
+    `T` and of the per-seed `c_worst` (the figure's error bars). A mean is over the seeds that have the value: where
+    the run without robots is recorded on some seeds only (`layout_table`), the element and traffic parts are means
+    over those seeds, counted in `split_seeds`."""
     if len(table) == 0:
         return table
     numeric = [c for c, dtype in table.schema.items() if dtype.is_numeric() and c not in ("seed",)]
-    means = table.group_by("layout_id", "world", "roles", maintain_order=True).agg(*(pl.col(c).mean() for c in numeric), pl.len().alias("seeds"), pl.col("complete").all())
+    counts = [pl.len().alias("seeds"), pl.col("complete").all(), *([pl.col("split").sum().alias("split_seeds")] if "split" in table.columns else [])]
+    means = table.group_by("layout_id", "world", "roles", maintain_order=True).agg(*(pl.col(c).mean() for c in numeric), *counts)
     groups = [g for g in GROUPS if f"C_{g}" in means.columns]
     means = means.with_columns(pl.max_horizontal([pl.col(f"C_{g}") for g in groups]).alias("c_worst_of_means") if groups else pl.lit(None).alias("c_worst_of_means"))
     if groups:
@@ -1238,6 +1306,19 @@ def _manifest(path: pathlib.Path) -> dict[str, typing.Any]:
     return json.loads(path.read_text())
 
 
+def _seed_list(text: str) -> list[int]:
+    """Seeds from `51-55`, `51,53,60` or both mixed; `none` for no seed."""
+    if text.strip().lower() == "none":
+        return []
+    seeds: list[int] = []
+    for part in text.split(","):
+        match = re.fullmatch(r"\s*(\d+)(?:-(\d+))?\s*", part)
+        if match is None or int(match[2] or match[1]) < int(match[1]):
+            raise ValueError(f"seeds are numbers and ranges like 51-55,60 or `none`, not {text!r}")
+        seeds.extend(range(int(match[1]), int(match[2] or match[1]) + 1))
+    return seeds
+
+
 def _fmt(value: typing.Any, spec: str = ".3f") -> str:
     return "-" if value is None or (isinstance(value, float) and not math.isfinite(value)) else format(value, spec)
 
@@ -1253,7 +1334,7 @@ def _print_layouts(means: pl.DataFrame) -> None:
         )
         parts = ", ".join(f"{g} element {_fmt(r.get(f'C_{g}_element'))} traffic {_fmt(r.get(f'C_{g}_traffic'))} delay {_fmt(r.get(f'delay_{g}_s'), '.1f')} s" for g in groups)
         if parts:
-            print(f"{'':10s} {parts}")
+            print(f"{'':10s} {parts}" + (f"; element and traffic over the {r['split_seeds']} seeds with a run without robots" if r.get("split_seeds") is not None else ""))
 
 
 def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float, *, recompute: bool = False) -> int:
@@ -1298,7 +1379,7 @@ def infra_command(args: typing.Any) -> int:
         return 0
     manifest = _manifest(args.manifest)
     layout_dirs = _dirs(args.layouts)
-    table = layout_table(args.site, layout_dirs, manifest, warmup_s=args.warmup, tau_s=args.tau, allow_mixed_commits=getattr(args, "allow_mixed_commits", False))
+    table = layout_table(args.site, layout_dirs, manifest, warmup_s=args.warmup, tau_s=args.tau, allow_mixed_commits=getattr(args, "allow_mixed_commits", False), split_seeds=getattr(args, "without_robots_seeds", None))
     out_dir = pathlib.Path(args.output_dir or layout_dirs[0])
     out_dir.mkdir(parents=True, exist_ok=True)
     table.write_parquet(out_dir / TABLE_FILE)
@@ -1369,6 +1450,7 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     common.add_argument("--tau", type=float, default=None, help="horizon of the restricted mean task time T, s (default the episode minus the warm-up; one value for a whole study)")
     common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default the first --layouts)")
     common.add_argument("--allow-mixed-commits", action="store_true", help="read run dirs (site and layouts alike) whose manifests or kept walker times name different Arena, humansim or arena_evaluation commits, with a warning, instead of refusing them")
+    common.add_argument("--without-robots-seeds", type=_seed_list, default=None, metavar="SEEDS", help=f"the seeds that have a run without robots, e.g. 51-55 or `none` (default the manifest's {WITHOUT_ROBOTS_SEEDS}; with neither, every seed needs one and the three runs pair as before): the cost against the site as is then pairs the site as is and the fleet run on every seed, and the element and traffic parts come from these seeds")
     common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
     sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
     sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the task rate at 75 %% of the wide layout's measured capacity")
