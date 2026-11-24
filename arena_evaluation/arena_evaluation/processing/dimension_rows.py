@@ -212,12 +212,27 @@ def _pedestrian_rows(run_id: str, episode_id: int, env_id: str, bundle: TopicBun
         return pl.DataFrame()
     fields = _PEDESTRIAN_FIELDS if agent_states is not None else _PEDESTRIAN_CORE_FIELDS
     first_values = [pl.col(source).drop_nulls().first().alias(dimension) for dimension, source in fields.items()]
-    return _stamped(
-        frame.sort("t_ns").group_by("ped_id", maintain_order=True).agg(first_values),
-        run_id,
-        episode_id,
-        env_id,
-    )
+    rows = frame.sort("t_ns").group_by("ped_id", maintain_order=True).agg(first_values)
+    return _stamped(rows.with_columns(track_key=_track_keys(rows, _first_frame(bundle, bundle.pedestrian_agent_meta))), run_id, episode_id, env_id)
+
+
+_ENV_PREFIX = r"^/?env_\d+/"
+
+
+def _track_keys(rows: pl.DataFrame, meta: pl.DataFrame | None) -> pl.Expr:
+    """Each pedestrian's pairing key, as `ped_track_store` keys its track: the releasing source and index of its first
+    agent_meta row that names one (`source_name#source_seq`), else the first name its agent meta gives, else its
+    recorded name unless that is its engine id, each without the env prefix; else `id<agent id>`."""
+    agent_id = pl.col("ped_id").str.strip_prefix("Pedestrian_")
+    keys: dict[str, str] = {}
+    if meta is not None and meta.height and {"agent_id", "source_name", "source_seq", "name"} <= set(meta.columns):
+        ordered = meta.sort("t_ns", maintain_order=True)
+        released = ordered.filter(pl.col("source_name").fill_null("") != "").group_by("agent_id", maintain_order=True).agg(pl.format("{}#{}", pl.col("source_name"), pl.col("source_seq")).first().alias("key"))
+        named = ordered.filter(pl.col("name").fill_null("") != "").group_by("agent_id", maintain_order=True).agg(pl.col("name").str.replace(_ENV_PREFIX, "").first().alias("key"))
+        keys = {str(a): k for a, k in named.iter_rows()} | {str(a): k for a, k in released.iter_rows()}
+    recorded = pl.col("ped_name").fill_null("").str.replace(_ENV_PREFIX, "")
+    fallback = pl.when((recorded != "") & (recorded != agent_id)).then(recorded).otherwise(pl.lit("id") + agent_id)
+    return pl.when(agent_id.is_in(list(keys))).then(agent_id.replace(keys)).otherwise(fallback)
 
 
 def _stamped(frame: pl.DataFrame, run_id: str, episode_id: int, env_id: str) -> pl.DataFrame:

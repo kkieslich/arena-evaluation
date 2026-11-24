@@ -109,6 +109,7 @@ class DimPedestrians(_EpisodeKey, name="dim_pedestrians", kind=TableKind.DIMENSI
 
     ped_id = _key(pl.String, "Pedestrian the row describes.")
     ped_name = _optional(pl.String, "Name of the pedestrian agent.")
+    track_key = _optional(pl.String, "Key that pairs the pedestrian across runs of one seed: its releasing source and index (source_name#source_seq), else its name without the env prefix, else id<agent id>.")
     agent_type = _optional(pl.String, "Agent type of the pedestrian, from its agent metadata.")
     ped_policy = _optional(pl.String, "Policy name the pedestrian's agent runs.")
     desired_speed = _optional(pl.Float64, "Desired speed of the pedestrian.", unit="m/s")
