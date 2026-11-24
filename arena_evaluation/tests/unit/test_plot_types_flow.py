@@ -17,8 +17,9 @@ pytest.importorskip("plotly")
 from arena_evaluation.presentation.plot_types.flow import JSD_FLOOR, FlowJsdRenderer, FlowMapRenderer
 from arena_evaluation.presentation.report_builder import ReportBuilder
 from arena_evaluation.processing.flow import FLOW_CELLS_FILE, FlowGrid
-from arena_evaluation.processing.flow.benchmark import FLOW_CELL_SCHEMA
-from arena_evaluation.storage.schemas import PlotSpec
+from arena_evaluation.processing.flow.benchmark import FLOW_CELL_SCHEMA, FLOW_RUN_SCHEMA
+from arena_evaluation.processing.flow.plots import map_pairs
+from arena_evaluation.presentation.viz_manifest import PlotSpec
 
 ROOM = [(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (0.0, 2.0)]
 GRID = FlowGrid.from_polygons([ROOM])
@@ -61,6 +62,8 @@ CELLS = pl.concat(
         _run(INERT, 1, _counts((0, 0, STAND, 8.0), *WALK)),
     ]
 )
+#: the maps the report draws of CELLS (`flow_map_pairs`)
+PAIRS = map_pairs(CELLS)
 
 
 def _snapshot(run_dir: pathlib.Path) -> pathlib.Path:
@@ -90,13 +93,13 @@ def _array(value: list | dict) -> np.ndarray:
 
 
 def _map_renderer(run_dir: pathlib.Path | None) -> FlowMapRenderer:
-    renderer = FlowMapRenderer(PlotSpec(id="flow_map", type="flow_map", title="Flow map", data_key="ped_seconds"))
+    renderer = FlowMapRenderer(PlotSpec(id="flow_map", type="flow_map", title="Flow map"))
     renderer.run_dir = run_dir
     return renderer
 
 
 def test_each_edit_maps_its_base_world_itself_and_the_difference_largest_change_first(tmp_path: pathlib.Path) -> None:
-    move, inert = _map_renderer(_snapshot(tmp_path)).render_plotly(CELLS)
+    move, inert = _map_renderer(_snapshot(tmp_path)).render_plotly(PAIRS)
     traces, layout = _figure(move)
     assert "move_fountain__ab against flowplot_room, mean of seeds 1, 2" in layout["title"]["text"]
     base, edit, diff = (_array(t["z"]) for t in traces if t["type"] == "heatmap")
@@ -109,7 +112,7 @@ def test_each_edit_maps_its_base_world_itself_and_the_difference_largest_change_
 
 
 def test_the_walked_cells_carry_arrows_along_their_walking_direction(tmp_path: pathlib.Path) -> None:
-    traces, _ = _figure(_map_renderer(_snapshot(tmp_path)).render_plotly(CELLS)[0])
+    traces, _ = _figure(_map_renderer(_snapshot(tmp_path)).render_plotly(PAIRS)[0])
     arrows = [t for t in traces if t["type"] == "scatter" and t["mode"] == "markers"]
     assert len(arrows) == 2
     # east is the 45° bin from 0°, its centre 22.5°; plotly turns markers clockwise from north
@@ -117,29 +120,29 @@ def test_the_walked_cells_carry_arrows_along_their_walking_direction(tmp_path: p
 
 
 def test_every_edit_shares_one_scale_so_a_small_change_looks_small(tmp_path: pathlib.Path) -> None:
-    layouts = [_figure(html)[1] for html in _map_renderer(_snapshot(tmp_path)).render_plotly(CELLS)]
+    layouts = [_figure(html)[1] for html in _map_renderer(_snapshot(tmp_path)).render_plotly(PAIRS)]
     assert layouts[0]["coloraxis"]["cmax"] == layouts[1]["coloraxis"]["cmax"]
     assert layouts[0]["coloraxis2"]["cmax"] == layouts[1]["coloraxis2"]["cmax"] == -layouts[1]["coloraxis2"]["cmin"] > 0
 
 
 def test_walls_come_from_the_base_world_and_are_left_out_without_it(tmp_path: pathlib.Path) -> None:
-    traces, _ = _figure(_map_renderer(_snapshot(tmp_path)).render_plotly(CELLS)[0])
+    traces, _ = _figure(_map_renderer(_snapshot(tmp_path)).render_plotly(PAIRS)[0])
     walls = [t for t in traces if t["type"] == "scatter" and t["mode"] == "lines"]
     assert len(walls) == 3 and {0.0, 4.0} <= {x for x in walls[0]["x"] if x is not None}
 
 
-def test_each_edit_is_one_png(tmp_path: pathlib.Path) -> None:
+def test_each_edit_is_one_png_the_largest_change_also_the_plots_own(tmp_path: pathlib.Path) -> None:
     out = _snapshot(tmp_path) / "plots" / "flow_map.png"
-    out.parent.mkdir()
-    _map_renderer(tmp_path).render_seaborn(CELLS, out)
+    _map_renderer(tmp_path).render_static(PAIRS, out)
     pngs = sorted(p.name for p in out.parent.iterdir())
-    assert pngs == [f"flow_map_{INERT}.png", f"flow_map_{MOVE}.png"]
+    assert pngs == ["flow_map.png", f"flow_map_{INERT}.png", f"flow_map_{MOVE}.png"]
+    assert out.read_bytes().startswith(PNG)
     assert all((out.parent / name).read_bytes().startswith(PNG) for name in pngs)
 
 
 def test_each_contestant_gets_its_own_maps(tmp_path: pathlib.Path) -> None:
     other = CELLS.with_columns(planner=pl.lit("orca"))
-    htmls = _map_renderer(_snapshot(tmp_path)).render_plotly(pl.concat([CELLS, other]))
+    htmls = _map_renderer(_snapshot(tmp_path)).render_plotly(map_pairs(pl.concat([CELLS, other])))
     titles = [_figure(html)[1]["title"]["text"] for html in htmls]
     assert len(titles) == 4 and sum("(orca)" in t for t in titles) == 2
 
@@ -147,18 +150,18 @@ def test_each_contestant_gets_its_own_maps(tmp_path: pathlib.Path) -> None:
 def test_base_worlds_alone_draw_nothing(tmp_path: pathlib.Path) -> None:
     renderer = _map_renderer(_snapshot(tmp_path))
     out = tmp_path / "flow_map.png"
-    assert renderer.render_plotly(CELLS.filter(pl.col("flow_world") == BASE)) is None
-    renderer.render_seaborn(CELLS.filter(pl.col("flow_world") == BASE), out)
+    alone = map_pairs(CELLS.filter(pl.col("flow_world") == BASE))
+    assert alone.is_empty() and renderer.render_plotly(alone) is None
+    renderer.render_static(alone, out)
     assert not list(tmp_path.glob("*.png"))
 
 
 SCORES = pl.DataFrame(
     {
-        "episode": [0, 1, 2, 3, 4, 5],
         "planner": ["peds_only"] * 6,
         "stage": [f"{BASE}__s1", f"{BASE}__s2", f"{MOVE}__s1", f"{MOVE}__s2", f"{INERT}__s1", f"{INERT}__s2"],
-        "status": ["evaluated"] * 6,
-        "is_reference": [False] * 6,
+        "episode": [0, 1, 2, 3, 4, 5],
+        "env": ["env_0"] * 6,
         "flow_world": [BASE, BASE, MOVE, MOVE, INERT, INERT],
         "flow_base": [BASE] * 6,
         "flow_seed": [1, 2, 1, 2, 1, 2],
@@ -177,7 +180,7 @@ SCORES = pl.DataFrame(
 
 
 def _jsd_renderer() -> FlowJsdRenderer:
-    return FlowJsdRenderer(PlotSpec(id="flow_jsd_overview", type="flow_jsd", title="Flow change per edit", data_key="flow_jsd_pooled"))
+    return FlowJsdRenderer(PlotSpec(id="flow_jsd_overview", type="flow_jsd", title="Flow change per edit"))
 
 
 def test_scores_show_the_largest_change_on_top_with_a_dot_per_seed() -> None:
@@ -194,15 +197,20 @@ def test_scores_without_flow_columns_draw_nothing() -> None:
 
 def test_scores_are_one_png(tmp_path: pathlib.Path) -> None:
     out = tmp_path / "flow_jsd.png"
-    _jsd_renderer().render_seaborn(SCORES, out)
+    _jsd_renderer().render_static(SCORES, out)
     assert out.read_bytes().startswith(PNG)
 
 
 def test_the_flow_report_draws_the_scores_and_a_map_per_edit(tmp_path: pathlib.Path) -> None:
+    from star_benchmark import write_benchmark
+
     run = _snapshot(tmp_path)
-    SCORES.write_parquet(run / "combined_metrics.parquet")
+    write_benchmark(run, [{"episode_id": i, "stage": stage, "planner": "peds_only"} for i, stage in enumerate(SCORES["stage"].to_list())])
+    SCORES.select(list(FLOW_RUN_SCHEMA)).write_parquet(run / "flow_runs.parquet")
     CELLS.write_parquet(run / FLOW_CELLS_FILE)
-    ReportBuilder.from_dirs([run], run, manifest="flow").build()
-    report = (run / "report.html").read_text()
+    PAIRS.write_parquet(run / "flow_map_pairs.parquet")
+    report_path = ReportBuilder(run, output_dir=run, manifest="flow").build()
+    assert report_path is not None
+    report = report_path.read_text()
     assert "Flow Change Report" in report and "move_fountain__ab against flowplot_room" in report
-    assert {f"flow_map_{MOVE}.png", f"flow_map_{INERT}.png", "flow_jsd_overview.png"} <= {p.name for p in (run / "plots").iterdir()}
+    assert {f"flow_map_{MOVE}.png", f"flow_map_{INERT}.png", "flow_jsd_overview.png"} <= {p.name for p in (report_path.parent / "plots").iterdir()}

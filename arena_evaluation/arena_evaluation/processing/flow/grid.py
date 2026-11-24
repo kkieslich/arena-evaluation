@@ -21,7 +21,7 @@ STANDING_MPS = 0.2
 MAX_STEP_FACTOR = 4.0
 # a map as rows: cell centre (world frame), cell size, heading bin centre (null for standing) and the time in it
 CELL_SCHEMA = {"x": pl.Float64, "y": pl.Float64, "cell_m": pl.Float64, "heading_rad": pl.Float64, "ped_seconds": pl.Float64}
-# every evaluated run's map of a benchmark, written next to its combined metrics
+# every scored run's map of a benchmark, written at the benchmark root (`storage.run_tables`)
 FLOW_CELLS_FILE = "flow_cells.parquet"
 
 

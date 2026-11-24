@@ -1,0 +1,40 @@
+# FLOWEDIT flow change: each layout edit of a `flowedit suite` benchmark against its base world run on the same seeds.
+title: Flow Change Report
+description: Where pedestrians walk, stand and head in each layout edit against its base world, run by the same contestant on the same seeds. The maps show pedestrian-seconds per m² per run (mean of the seeds both ran) and their difference, all on one scale. The scores are Jensen-Shannon divergences in bits, 0 for the same flow, 1 for disjoint flow, per seed and pooled over seeds (the primary score).
+groups:
+  - {id: overview, title: Flow Change per Edit}
+  - {id: maps, title: "Flow Maps: base world, edit and difference"}
+  - {id: per_stage, title: Per Stage (against the base world at the same seed)}
+units:
+  flow_jsd: bits
+  flow_jsd_occupancy: bits
+  flow_jsd_pooled: bits
+  flow_jsd_pooled_occupancy: bits
+  flow_room_ped_seconds: ped·s
+  flow_peds: ""
+  flow_paired_peds: ""
+  flow_unpaired_peds: ""
+  flow_pooled_seeds: ""
+plots:
+  - id: flow_jsd_overview
+    type: flow_jsd
+    title: Flow change per edit (bar pooled over seeds, dot per seed)
+    data: {source: flow_runs}
+    layout_group: overview
+  - id: flow_map
+    type: flow_map
+    title: Flow map
+    data: {source: flow_map_pairs}
+    layout_group: maps
+  - id: flow_stage_table
+    type: table
+    title: Flow change per stage
+    data: {source: flow_runs}
+    layout_group: per_stage
+    channels:
+      x: planner
+      color: stage
+      y: [flow_reference_stage, flow_jsd, flow_jsd_occupancy, flow_paired_peds, flow_unpaired_peds, flow_room_ped_seconds, flow_peds]
+    options:
+      labels: {flow_reference_stage: Reference stage, flow_jsd: JSD (bits), flow_jsd_occupancy: JSD occupancy (bits), flow_paired_peds: Paired peds, flow_unpaired_peds: Unpaired peds, flow_room_ped_seconds: Room ped·s, flow_peds: Peds}
+      format: {flow_jsd: "{:.3f}", flow_jsd_occupancy: "{:.3f}", flow_paired_peds: "{:.0f}", flow_unpaired_peds: "{:.0f}", flow_room_ped_seconds: "{:.0f}", flow_peds: "{:.0f}"}

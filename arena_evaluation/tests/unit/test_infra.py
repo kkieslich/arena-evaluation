@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import pathlib
@@ -25,10 +26,15 @@ def _tracks(peds: list[tuple[str, str, str, float, float]], horizon: float = HOR
     return pl.DataFrame(rows, schema=TRACK_SCHEMA)
 
 
+#: message indices in recording order: every helper call below records later than the ones before it
+_MESSAGES = itertools.count()
+_LOG_SCHEMA = {"t_ns": pl.Int64, "env_id": pl.String, "msg_index": pl.Int64, "entity_name": pl.String, "field_name": pl.String, "value_str": pl.String}
+
+
 def _log(fields: dict[str, str]) -> pl.DataFrame:
-    rows = [{"time_ns": i, "env_id": 0, "world": "w", "entity": "env_0/fleet", "kind": "fleet", "field": k, "field_kind": "discrete", "value_str": v, "value_num": None, "value_bool": None, "value_list": None} for i, (k, v) in enumerate(fields.items())]
-    rows.append({"time_ns": 99, "env_id": 0, "world": "w", "entity": "env_0/jackal_0", "kind": "robot", "field": "job.0.kind", "field_kind": "discrete", "value_str": "x", "value_num": None, "value_bool": None, "value_list": None})
-    return pl.DataFrame(rows)
+    """A task log table (`episode_fleet_log`) with each field in a message of its own, at its own stamp."""
+    rows = [{"t_ns": i, "env_id": "env_0", "msg_index": next(_MESSAGES), "entity_name": "env_0/fleet", "field_name": k, "value_str": v} for i, (k, v) in enumerate(fields.items())]
+    return pl.DataFrame(rows, schema=_LOG_SCHEMA)
 
 
 LOG = {
@@ -48,7 +54,7 @@ LOG = {
 
 def test_the_fleet_log_is_the_last_value_of_each_field_of_the_fleet_entity() -> None:
     fields = {**LOG, "job.1.ended": "650.000"}
-    snapshot = pl.concat([_log(LOG), _log({"job.1.ended": "700.000"}).with_columns(pl.col("time_ns") + 1000)])
+    snapshot = pl.concat([_log(LOG), _log({"job.1.ended": "700.000"}).with_columns(pl.col("t_ns") + 1000)])
     log = infra.log_from_snapshot(snapshot)
     assert log["job.1.ended"] == "700.000" and log["t0"] == "100.000"
     assert infra.log_from_snapshot(_log(fields))["job.1.ended"] == "650.000"
@@ -60,20 +66,19 @@ def test_the_fleet_log_leaves_out_the_previous_episodes_latched_log() -> None:
     # episode's reset publishes its own log: a field only the previous episode wrote must not survive
     previous = {"t0": "98.635", "job.0.kind": "delivery", "job.0.released": "134.657", "job.0.ended": "1015.317", "job.0.outcome": "abandoned", "charge.3.robot": "r0", "charge.3.started": "314.252", "charge.3.ended": "571.062", "charge.3.outcome": "charged"}
     own = {"t0": "1600.698", "job.0.kind": "delivery", "job.0.released": "28.179", "charge.3.robot": "r2", "charge.3.queued": "1006.060"}
-    latched = pl.DataFrame([{**row, "time_ns": 0} for row in _log(previous).filter(pl.col("kind") == "fleet").to_dicts()])
-    later = _log(own).filter(pl.col("kind") == "fleet").with_columns(pl.lit(1_600_764_300_000).alias("time_ns"))
-    update = _log({"t0": "1600.698", "job.0.assigned": "28.238"}).filter(pl.col("kind") == "fleet").with_columns(pl.lit(1_628_969_400_000).alias("time_ns"))
+    latched = _log(previous).with_columns(pl.lit(0, dtype=pl.Int64).alias("t_ns"))
+    later = _log(own).with_columns(pl.lit(1_600_764_300_000, dtype=pl.Int64).alias("t_ns"))
+    update = _log({"t0": "1600.698", "job.0.assigned": "28.238"}).with_columns(pl.lit(1_628_969_400_000, dtype=pl.Int64).alias("t_ns"))
     log = infra.log_from_snapshot(pl.concat([latched, later, update]))
     assert log == {**own, "job.0.assigned": "28.238"}
     assert infra.jobs(log)[0]["ended"] is None and infra.charges(log)[0]["started"] is None
 
 
-def _message(fields: dict[str, str], time_ns: int, members: bool = True) -> pl.DataFrame:
-    """One semantic message's rows of the fleet entity as mcap_reader writes them: a row per field, then `members`."""
-    rows = _log(fields).filter(pl.col("kind") == "fleet").with_columns(pl.lit(time_ns).alias("time_ns"))
-    if members:
-        rows = pl.concat([rows, rows.head(1).with_columns(pl.lit("members").alias("field"), pl.lit("members").alias("field_kind"), pl.lit(None, pl.String).alias("value_str"))])
-    return rows
+def _message(fields: dict[str, str], time_ns: int) -> pl.DataFrame:
+    """One semantic message's rows of the fleet entity as the reader writes them (`episode_fleet_log`): a row per field,
+    all of one message index."""
+    index = next(_MESSAGES)
+    return _log(fields).with_columns(pl.lit(time_ns, dtype=pl.Int64).alias("t_ns"), pl.lit(index, dtype=pl.Int64).alias("msg_index"))
 
 
 def test_the_fleet_log_leaves_out_a_latched_log_that_shares_the_reset_messages_stamp() -> None:
@@ -83,11 +88,10 @@ def test_the_fleet_log_leaves_out_a_latched_log_that_shares_the_reset_messages_s
                 "jam.0.job": "3", "jam.0.target": "locker_0", "top_up.0.dispatched": "900.000", "top_up.0.started": "950.000", "top_up.1.dispatched": "1200.000", "top_up.1.ended": "1300.000"}
     own = {"t0": "3096.401", "job.0.kind": "delivery", "job.0.released": "174.891"}
     stamp, later = 3_096_400_500_000, 3_271_292_100_000
-    for members in (True, False):
-        snapshot = pl.concat([_message(previous, stamp, members), _message({"t0": "3096.401"}, stamp, members), _message(own, later, members)])
-        log = infra.log_from_snapshot(snapshot)
-        assert log == own, members
-        assert len(infra.jobs(log)) == 1 and infra.top_ups(log) == [] and not any(k.startswith("jam.") for k in log)
+    snapshot = pl.concat([_message(previous, stamp), _message({"t0": "3096.401"}, stamp), _message(own, later)])
+    log = infra.log_from_snapshot(snapshot)
+    assert log == own
+    assert len(infra.jobs(log)) == 1 and infra.top_ups(log) == [] and not any(k.startswith("jam.") for k in log)
     # with the messages delimited, the boundary is the reset message's first row, wherever its t0 lies in it
     reset = {"job.0.kind": "delivery", "t0": "3096.401", "job.0.released": "0.500"}
     log = infra.log_from_snapshot(pl.concat([_message(previous, stamp), _message(reset, stamp)]))
@@ -396,20 +400,31 @@ def test_the_figure_draws_one_point_per_layout(tmp_path: pathlib.Path) -> None:
     assert out.is_file() and out.stat().st_size > 10_000
 
 
+def _episode(root: pathlib.Path, episode: int, planner: str, stage: str, *, robots: tuple[str, ...] | None = ("env_0_jackal_0", "env_0_jackal_1"), reference_type: str | None = None) -> pathlib.Path:
+    """One processed episode dir: its `episode_NNN.yaml` and, unless `robots` is None (an episode `evaluation process`
+    could not evaluate), its fact rows, one per robot."""
+    from arena_evaluation.storage.schemas import RunMetadata
+
+    episode_dir = root / "episodes" / f"episode_{episode:03d}"
+    (episode_dir / "topics").mkdir(parents=True, exist_ok=True)
+    reference = reference_type or ("unhindered_peds" if planner == "unhindered_peds" else None)
+    metadata = RunMetadata(benchmark_id=root.name, planner=planner, map="site", stage=stage, episode_id=episode, recording_started_at="2026-01-01T00:00:00", python_version="3.12", ros_distro="jazzy", modes={}, params={}, is_reference=reference is not None, reference_type=reference)
+    (episode_dir / f"episode_{episode:03d}.yaml").write_text(json.dumps(metadata.model_dump(mode="json")))
+    if robots is not None:
+        (episode_dir / "metrics").mkdir(exist_ok=True)
+        pl.DataFrame({"run_id": [root.name] * len(robots), "episode_id": [episode] * len(robots), "robot_id": list(robots)}).write_parquet(episode_dir / "metrics" / "fact_episodes.parquet")
+    return episode_dir
+
+
 def _benchmark(root: pathlib.Path, runs: list[tuple[str, str, int, pl.DataFrame | None]]) -> pathlib.Path:
-    """A processed benchmark dir: combined metrics rows (planner, stage, episode, robot) and each episode's semantic
-    snapshot; the tracks come from the monkeypatched track store."""
+    """A processed benchmark dir: each episode's yaml (planner, stage), its fact rows (one per robot) and its task log
+    table; the tracks come from the monkeypatched track store."""
     root.mkdir(parents=True)
-    rows = []
     for episode, (planner, stage, _, snapshot) in enumerate(runs):
-        for robot in ("env_0_jackal_0", "env_0_jackal_1"):
-            rows.append({"planner": planner, "stage": stage, "episode": episode, "robot": robot, "status": "evaluated", "is_reference": planner == "unhindered_peds"})
-        topics = root / "episodes" / f"episode_{episode:03d}" / "topics"
-        topics.mkdir(parents=True)
+        topics = _episode(root, episode, planner, stage) / "topics"
         if snapshot is not None:
             # stamped on the sim clock, where the log's t0 (100 s in LOG) lies
-            snapshot.with_columns(pl.col("time_ns") + 100_000_000_000).write_parquet(topics / "semantic_snapshot.parquet")
-    pl.DataFrame(rows).write_parquet(root / "combined_metrics.parquet")
+            snapshot.with_columns(pl.col("t_ns") + 100_000_000_000).write_parquet(topics / infra.FLEET_LOG_FILE)
     return root
 
 
@@ -455,12 +470,10 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     assert (layouts / "plots" / infra.FIGURE_FILE).is_file()
     printed = capsys.readouterr().out
     assert "joint pick: bbbb" in printed and "C_adult" in printed
-    with pytest.raises(FileNotFoundError, match="no combined_metrics"):
+    with pytest.raises(FileNotFoundError, match="no episodes/"):
         infra.runs(tmp_path)
     # a stage the runner ran twice (the failed attempt kept its recording) is refused, not read silently
-    metrics = pl.read_parquet(layouts / "combined_metrics.parquet")
-    extra = metrics.filter((pl.col("stage") == "site__layout_aaaa__s1") & (pl.col("planner") == "fleet_dwb")).with_columns(pl.lit(99, dtype=metrics.schema["episode"]).alias("episode"))
-    pl.concat([metrics, extra]).write_parquet(layouts / "combined_metrics.parquet")
+    _episode(layouts, 99, "fleet_dwb", "site__layout_aaaa__s1")
     with pytest.raises(ValueError, match="stage site__layout_aaaa__s1 has more than one usable run"):
         infra.infra_command(args)
 
@@ -477,16 +490,14 @@ def test_the_restricted_mean_counts_censored_jobs_up_to_the_horizon() -> None:
 
 def test_runs_leave_out_failed_attempts_and_robot_references_and_a_stage_run_twice_is_refused(tmp_path: pathlib.Path) -> None:
     root = tmp_path / "bench"
-    root.mkdir()
-    rows = [
-        {"planner": "fleet_dwb", "stage": "w__s1", "episode": 0, "robot": "env_0_jackal_0", "status": "error", "is_reference": False, "reference_type": None},
-        {"planner": "fleet_dwb", "stage": "w__s1", "episode": 1, "robot": "env_0_jackal_0", "status": "evaluated", "is_reference": False, "reference_type": None},
-        {"planner": "fleet_dwb_unobstructed_robot", "stage": "w__s1", "episode": 2, "robot": "env_0_jackal_0", "status": "evaluated", "is_reference": True, "reference_type": "unobstructed_robot"},
-        {"planner": "unhindered_peds", "stage": "w__s1", "episode": 3, "robot": "env_0_jackal_0", "status": "no_trajectory", "is_reference": True, "reference_type": "unhindered_peds"},
-        {"planner": "unhindered_peds", "stage": "w__s2", "episode": 4, "robot": "env_0_jackal_0", "status": "path_only", "is_reference": True, "reference_type": "unhindered_peds"},
-        {"planner": "unhindered_peds", "stage": "w__s2", "episode": 5, "robot": "env_0_jackal_0", "status": "evaluated", "is_reference": True, "reference_type": "unhindered_peds"},
-    ]
-    pl.DataFrame(rows).write_parquet(root / "combined_metrics.parquet")
+    # episode 0 has no fact rows (its processing failed, a failed attempt the runner retried); 3 is a run without any
+    # robot (the crowd-only contestant's: one fact row named by its env)
+    _episode(root, 0, "fleet_dwb", "w__s1", robots=None)
+    _episode(root, 1, "fleet_dwb", "w__s1", robots=("env_0_jackal_0",))
+    _episode(root, 2, "fleet_dwb_unobstructed_robot", "w__s1", robots=("env_0_jackal_0",), reference_type="unobstructed_robot")
+    _episode(root, 3, "unhindered_peds", "w__s1", robots=("env_0",))
+    _episode(root, 4, "unhindered_peds", "w__s2", robots=("env_0_jackal_0",))
+    _episode(root, 5, "unhindered_peds", "w__s2", robots=("env_0_jackal_0",))
     found = infra.runs(root)
     assert [(r.planner, r.stage, r.episode) for r in found] == [("fleet_dwb", "w__s1", 1), ("unhindered_peds", "w__s1", 3), ("unhindered_peds", "w__s2", 4), ("unhindered_peds", "w__s2", 5)]
     assert infra.unique([r for r in found if r.stage == "w__s1" and r.planner == "fleet_dwb"], "here").episode == 1
@@ -586,7 +597,7 @@ def test_kept_walker_times_let_a_copy_without_tracks_read_the_same(tmp_path: pat
         copy = tmp_path / "copy" / run_dir.name
         for path in run_dir.rglob("*"):
             rel = path.relative_to(run_dir)
-            if path.is_file() and (rel.name in ("combined_metrics.parquet", "semantic_snapshot.parquet") or "infra_times." in str(rel)):
+            if path.is_file() and _small(rel):
                 (copy / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, copy / rel)
         copies.append(copy)
@@ -606,6 +617,11 @@ def test_kept_walker_times_let_a_copy_without_tracks_read_the_same(tmp_path: pat
 _real_has_tracks = infra.has_tracks
 
 
+def _small(rel: pathlib.Path) -> bool:
+    """A file of a run dir that a small copy carries: per episode its yaml, fact rows, task log and kept times."""
+    return rel.name in (f"{rel.parent.name}.yaml", "fact_episodes.parquet", infra.FLEET_LOG_FILE) or "infra_times." in str(rel)
+
+
 def _small_copy(tmp_path: pathlib.Path, run_dirs: list[pathlib.Path]) -> list[pathlib.Path]:
     """The small files of each run dir, and every episode's (empty) topics dir, as a copy made elsewhere."""
     import shutil
@@ -615,7 +631,7 @@ def _small_copy(tmp_path: pathlib.Path, run_dirs: list[pathlib.Path]) -> list[pa
         copy = tmp_path / "copy" / run_dir.name
         for path in run_dir.rglob("*"):
             rel = path.relative_to(run_dir)
-            if path.is_file() and (rel.name in ("combined_metrics.parquet", "semantic_snapshot.parquet", "manifest.yaml") or "infra_times." in str(rel)):
+            if path.is_file() and (_small(rel) or rel.name == "manifest.yaml"):
                 (copy / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, copy / rel)
         for episode in (run_dir / "episodes").iterdir():
@@ -773,9 +789,13 @@ def test_the_kept_exposure_measures_both_bands(tmp_path: pathlib.Path, monkeypat
     tracks = pl.DataFrame(rows, schema=TRACK_SCHEMA)
     times = np.arange(0.0, 1000.0, 0.1)
     episode = tmp_path / "run" / "episodes" / "episode_000"
+    (episode / "topics").mkdir(parents=True)
+    robots = []
     for robot, (x, y) in {"jackal_0": (np.clip(times - 400.0, 0.0, 200.0), np.zeros_like(times)), "jackal_1": (np.full_like(times, 100.0), np.full_like(times, 5.5))}.items():
-        (episode / "topics" / f"env_0_{robot}").mkdir(parents=True)
-        pl.DataFrame({"time_ns": ((times + 50.0) * 1e9).astype(np.int64), "pos_x_gt": x, "pos_y_gt": y}).write_parquet(episode / "topics" / f"env_0_{robot}" / "tf_gt.parquet")
+        robots.append(pl.DataFrame({"t_ns": ((times + 50.0) * 1e9).astype(np.int64), "env_id": "env_0", "robot_id": f"env_0_{robot}", "x": x, "y": y}))
+    # another env's robot on the walkers' line is not this env's
+    robots.append(pl.DataFrame({"t_ns": ((times + 50.0) * 1e9).astype(np.int64), "env_id": "env_1", "robot_id": "env_1_jackal_0", "x": np.clip(times - 400.0, 0.0, 200.0), "y": np.zeros_like(times)}))
+    pl.concat(robots).write_parquet(episode / "topics" / "robot_tracks.parquet")
     monkeypatch.setattr(infra, "tracks_for_episode", lambda episode_dir, env: tracks)
     monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
     out = {r["group"]: r for r in infra.run_exposure(episode, "env_0", 420.0).iter_rows(named=True)}
@@ -802,15 +822,14 @@ def test_walker_times_and_the_cost_are_the_same_bits_in_any_row_order() -> None:
 
 
 def _extraction(episode_dir: pathlib.Path, tables: dict[str, pl.DataFrame]) -> pathlib.Path:
-    """A current extraction of an episode holding `tables` for robot env_0_jackal_0, as `evaluation process` writes it."""
+    """A current extraction of an episode holding `tables`, as `evaluation process` writes it."""
     from arena_evaluation.processing.parquet_store import TopicParquetStore
-    from arena_evaluation.storage.schemas import TopicBundle
 
-    bundle = TopicBundle()
-    for name, frame in tables.items():
-        setattr(bundle, name, frame)
     topics = episode_dir / "topics"
-    TopicParquetStore.write({"env_0_jackal_0": bundle}, topics, tables=frozenset(tables))
+    topics.mkdir(parents=True)
+    for name, frame in tables.items():
+        frame.write_parquet(topics / f"{name}.parquet")
+    TopicParquetStore.mark_complete(topics)
     return topics
 
 
@@ -818,9 +837,13 @@ def test_an_extraction_without_pedestrian_tables_or_of_an_older_format_gives_no_
     from arena_evaluation.processing.parquet_store import TopicParquetStore
 
     episode = tmp_path / "run" / "episodes" / "episode_000"
-    topics = _extraction(episode, {"odom": pl.DataFrame({"time_ns": [1, 2], "pos_x": [0.0, 1.0]})})  # e.g. --measures with robot tables only
-    assert TopicParquetStore.is_current(topics, frozenset()) and not infra.has_tracks(episode, "env_0")
-    assert "no pedestrian table (odom)" in infra.track_problem(episode, "env_0")
+    # a recording of env_0 without any pedestrian table, and one of env_1 with them
+    lifecycle = pl.DataFrame({"t_ns": [1, 2], "env_id": ["env_0", "env_1"], "episode_id": [0, 0], "outcome_state": [1, 1]})
+    peds = pl.DataFrame({"t_ns": [1], "env_id": ["env_1"], "ped_id": ["Pedestrian_1"], "x": [0.0], "y": [0.0]})
+    topics = _extraction(episode, {"episode_lifecycle": lifecycle, "pedestrian_agent_states": peds, "robot_odom": pl.DataFrame({"t_ns": [1, 2], "env_id": "env_0", "robot_id": "env_0_jackal_0", "odom_x": [0.0, 1.0]})})
+    assert TopicParquetStore.is_current(topics) and not infra.has_tracks(episode, "env_0") and infra.has_tracks(episode, "env_1")
+    assert "holds no pedestrian table for env_0" in infra.track_problem(episode, "env_0")
+    assert "holds no env_2" in infra.track_problem(episode, "env_2")
     with pytest.raises(FileNotFoundError, match=r"no tracks to compute them from: its extraction holds no pedestrian table .*re-run `evaluation process`"):
         infra.walker_times(episode, "env_0", 420.0)
     assert not infra.times_path(episode, "env_0", 420.0).exists()
@@ -1135,8 +1158,9 @@ def test_the_option_reaches_the_table_through_the_parser_and_none_names_no_seed(
 
 def test_the_fleet_mode_ran_where_its_log_was_reset_in_the_episode() -> None:
     episode_ns = 3_096_400_000_000
-    reset = _message({"t0": "3096.401", "job.0.kind": "delivery"}, episode_ns)
+    # the latched copy is recorded first (its message index is the lower)
     latched = _message({"t0": "1595.303", "job.0.kind": "delivery", "job.0.outcome": "completed"}, episode_ns)
+    reset = _message({"t0": "3096.401", "job.0.kind": "delivery"}, episode_ns)
     assert infra.fleet_ran_in(reset) and infra.fleet_ran_in(pl.concat([latched, reset]))
     # a recorder that joins 16 s into the episode stamps the reset message that much later: still this episode's
     assert infra.fleet_ran_in(pl.concat([latched, _message({"t0": "3096.401"}, episode_ns + 16_000_000_000)]))
@@ -1230,3 +1254,14 @@ def test_compare_reads_the_two_run_totals_whether_or_not_a_seed_has_the_split(tm
     assert results[0] == results[1] == results[2]
     assert results[0]["seeds"] == [1, 2] and results[0]["delta_c_worst"]["estimate"] == pytest.approx(20.0 / 300.0 - 60.0 / 300.0) and results[0]["verdict"] == "lower"
     assert results[0]["delta_aid_minus_adult"]["wheelchair"]["seeds"] == 2
+
+
+def test_the_seed_bootstrap_is_the_percentile_one_its_p_agrees_with_its_interval() -> None:
+    rng = np.random.default_rng(3)
+    for values in (rng.normal(0.02, 0.01, 10), rng.normal(0.0, 0.01, 10), rng.normal(-0.01, 0.02, 6)):
+        estimate, low, high, p = infra.seed_bootstrap(values, n_boot=4000, rng=np.random.default_rng(0))
+        assert estimate == pytest.approx(float(np.mean(values)))
+        assert (p < 0.05) == (low > 0.0 or high < 0.0)
+        # the same draws give the same interval and p
+        assert infra.seed_bootstrap(values, n_boot=4000, rng=np.random.default_rng(0)) == (estimate, low, high, p)
+    assert all(math.isnan(v) for v in infra.seed_bootstrap(np.array([np.nan]), n_boot=10, rng=np.random.default_rng(0)))

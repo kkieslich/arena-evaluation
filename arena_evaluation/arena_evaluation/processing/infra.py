@@ -1,18 +1,18 @@
 """INFRA measures (study design §6, §8, §10, §12) over processed benchmark runs of `flowedit infra`'s suites.
 
-Inputs are benchmark directories `evaluation process` has run on (their `combined_metrics.parquet`, each episode's
-extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite. One suite's
+Inputs are benchmark directories `evaluation process` has run on (each episode's fact table
+`metrics/fact_episodes.parquet` and its extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite. One suite's
 runs may lie in several run dirs (its parts recorded on several machines): they are read as one, their manifests must
 name the same Arena and humansim commits (`check_commits`), and a stage two of them hold is refused like a stage run
 twice. What the measures read of an episode is small once `evaluation infra times` has kept each run's walker travel
-times beside its tracks (`walker_times`): the run dir's `combined_metrics.parquet` and `manifest.yaml`, and per episode
-`topics/semantic_snapshot.parquet` and `topics/.derived/infra_times.*/`; such a copy of a run dir reads like the
+times beside its tracks (`walker_times`): the run dir's `manifest.yaml`, and per episode its `episode_NNN.yaml`,
+`metrics/fact_episodes.parquet`, `topics/episode_fleet_log.parquet` and `topics/.derived/infra_times.*/`; such a copy of a run dir reads like the
 original without its recording or its tracks, for the warm-up the times were kept for (another one raises). Kept times
 name the track store's version and a digest of their code, and record the arena_evaluation commit that computed them:
 times of other code are never read, and times of different commits are refused like runs of different commits.
 
 - **Robot service** (§6), from the fleet mode's task log (the `fleet` semantic entity, schema in kkieslich/Arena's
-  `task_generator/tasks/robots/README.md#fleet-task-log`): `T` = the restricted mean task time (release to
+  `task_generator/tasks/robots/README.md#fleet-task-log`, extracted to `episode_fleet_log`): `T` = the restricted mean task time (release to
   completion) of the jobs released after the warm-up, up to a horizon fixed per study (default the episode minus the
   warm-up), from the Kaplan-Meier estimate with the jobs not completed censored at their elapsed time, so the slow jobs
   an episode cuts off still count (`restricted_mean`); the plain mean over completed jobs, the completed and censored
@@ -46,7 +46,7 @@ times of other code are never read, and times of different commits are refused l
   than 20 % of its tasks failed by jams is dropped (§8).
 - **The comparison** (§12) on the evaluation seeds: per seed the difference joint pick - robot-only pick of `C_worst`,
   `T` (relative to the robot-only pick's) and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds
-  (`experiments.stats.cluster_bootstrap`, a seed per cluster) and Holm across the two aid groups. The decision has
+  (`seed_bootstrap`, a seed per cluster: a percentile interval and its p) and Holm across the two aid groups. The decision has
   three outcomes: `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies below 0, `equivalent` when
   its 90 % interval lies within +-`DELTA` (the smallest cost of interest, 0.01), else `inconclusive`. With the guideline
   layout among the picks (a practice-based baseline, not held to the travel margin), the secondary contrasts joint -
@@ -78,11 +78,13 @@ import typing
 import numpy as np
 import polars as pl
 
-from arena_evaluation.processing.metrics.social.paired_peds import _travel_times
-from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group
+from arena_evaluation.processing.paired_peds import _travel_times
+from arena_evaluation.processing.pedestrian_groups import agent_group
 from arena_evaluation.processing import ped_track_store
+from arena_evaluation.processing.alignment import interpolate_values
+from arena_evaluation.processing.benchmark_runs import FACTS_FILE, episode_runs
 from arena_evaluation.processing.parquet_store import TopicParquetStore
-from arena_evaluation.processing.ped_track_store import TOPICS_DIR, episode_envs, tracks_for_episode
+from arena_evaluation.processing.ped_track_store import DERIVED_DIR, TOPICS_DIR, topics_envs, tracks_for_episode
 
 #: The warm-up the analysis leaves out and the episode length (Kolja, 9 Nov: 25 min with 7 min warm-up)
 WARMUP_S = 420.0
@@ -164,33 +166,21 @@ class Run:
     episode_dir: pathlib.Path
 
 
-#: Processing statuses of a row whose episode has no usable recording (a failed attempt the runner retried)
-_UNUSABLE = frozenset({"error", "no_recording"})
-
-
 def runs(benchmark_dir: pathlib.Path) -> list[Run]:
     """Every usable run of a processed benchmark dir whose stage is `<world>__s<seed>`, one per (planner, stage,
-    episode, env): rows of status `error` or `no_recording` are left out (a failed attempt the runner retried), and of
-    the reference rows only the runs without robots (`unhindered_peds`). Check for a stage run twice with `unique`."""
-    benchmark_dir = pathlib.Path(benchmark_dir)
-    path = benchmark_dir / "combined_metrics.parquet"
-    if not path.is_file():
-        raise FileNotFoundError(f"{benchmark_dir}: no combined_metrics.parquet, run `evaluation process --benchmark-dir {benchmark_dir}` first")
-    metrics = pl.read_parquet(path, columns=None)
+    episode, env) (`benchmark_runs.episode_runs`: an episode with fact rows, or a crowd-only one; an episode without a
+    recording or whose processing failed, a failed attempt the runner retried, is left out), and of the reference
+    episodes only the runs without robots (`unhindered_peds`). Check for a stage run twice with `unique`."""
     out: dict[tuple[str, str, int, str], Run] = {}
-    columns = [c for c in ("planner", "stage", "episode", "robot", "status", "is_reference", "reference_type") if c in metrics.columns]
-    for row in metrics.select(columns).iter_rows(named=True):
-        match = _STAGE.match(str(row.get("stage") or ""))
-        if match is None or row.get("episode") is None:
+    for run in episode_runs(benchmark_dir):
+        match = _STAGE.match(run.stage)
+        if match is None:
             continue
-        if str(row.get("status") or "") in _UNUSABLE:
+        if run.is_reference and str(run.reference_type or run.planner) != NO_ROBOTS:
             continue
-        if row.get("is_reference") and str(row.get("reference_type") or row.get("planner")) != NO_ROBOTS:
-            continue
-        env_match = re.search(r"(env_\d+)", str(row.get("robot") or ""))
-        key = (str(row["planner"]), str(row["stage"]), int(row["episode"]), env_match.group(1) if env_match else "env_0")
+        key = (run.planner, run.stage, run.episode, run.env)
         if key not in out:
-            out[key] = Run(key[0], key[1], match["world"], int(match["seed"]), key[2], key[3], benchmark_dir / "episodes" / f"episode_{key[2]:03d}")
+            out[key] = Run(key[0], key[1], match["world"], int(match["seed"]), key[2], key[3], run.episode_dir)
     return sorted(out.values(), key=lambda r: (r.world, r.seed, r.planner, r.episode, r.env))
 
 
@@ -285,7 +275,7 @@ def check_kept_times(run_dirs: typing.Sequence[pathlib.Path], warmup_s: float, *
     key = _warmup_key(warmup_s)
     code = _exposure_code()
     for run_dir in run_dirs:
-        kept = pathlib.Path(run_dir).glob(f"episodes/*/{TOPICS_DIR}/.derived/{times_dir()}/*.w{key}.parquet")
+        kept = pathlib.Path(run_dir).glob(f"episodes/*/{TOPICS_DIR}/{DERIVED_DIR}/{times_dir()}/*.w{key}.parquet")
         for path in sorted(kept):
             env = path.name.split(".", 1)[0]
             if path.name == f"{env}.w{key}.parquet":
@@ -343,72 +333,77 @@ def restricted_mean(times: typing.Sequence[float], completed: typing.Sequence[bo
 # --- robot service ---------------------------------------------------------------------------------------------------
 
 
+#: The extracted task log of the fleet mode (`episode_fleet_log`: one row per field per semantic snapshot message)
+FLEET_LOG_FILE = "episode_fleet_log.parquet"
+
+
+def _fleet_table(episode_dir: pathlib.Path) -> pl.DataFrame | None:
+    path = pathlib.Path(episode_dir) / TOPICS_DIR / FLEET_LOG_FILE
+    return pl.read_parquet(path) if path.is_file() else None
+
+
 def fleet_log(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, str]:
     """The fleet mode's task log of `env` in an extracted episode: the last value of each field of its `fleet` entity
     since the episode's reset (`log_from_snapshot`), {} without one."""
-    path = pathlib.Path(episode_dir) / "topics" / "semantic_snapshot.parquet"
-    if not path.is_file():
-        return {}
-    snapshot = pl.read_parquet(path)
-    return log_from_snapshot(snapshot, env)
+    table = _fleet_table(episode_dir)
+    return {} if table is None else log_from_snapshot(table, env)
 
 
 def fleet_ran(episode_dir: pathlib.Path, env: str = "env_0") -> bool:
-    """Whether the fleet mode ran in an extracted episode of `env` (`fleet_ran_in`); False without a semantic snapshot."""
-    path = pathlib.Path(episode_dir) / "topics" / "semantic_snapshot.parquet"
-    return path.is_file() and fleet_ran_in(pl.read_parquet(path), env)
+    """Whether the fleet mode ran in an extracted episode of `env` (`fleet_ran_in`); False without a fleet log table."""
+    table = _fleet_table(episode_dir)
+    return table is not None and fleet_ran_in(table, env)
+
+
+def _fleet_rows(snapshot: pl.DataFrame, env: str) -> pl.DataFrame:
+    """The task log rows of `env` (all of them when the table holds one env) in recording order: by stamp, and at one
+    stamp by message."""
+    rows = snapshot
+    if "env_id" in rows.columns and rows["env_id"].n_unique() > 1:
+        rows = rows.filter(pl.col("env_id") == env)
+    return rows.sort("t_ns", "msg_index", maintain_order=True)
 
 
 def fleet_ran_in(snapshot: pl.DataFrame, env: str = "env_0") -> bool:
-    """Whether the fleet mode ran in the episode of a semantic snapshot table: it holds rows of `env`'s `fleet` entity,
-    and the task log was reset in this episode. The fleet mode writes `t0`, the reset's time, on every reset, so the
-    first stamped message that carries the last `t0` is stamped at about that time (`FLEET_RESET_SLACK_S`, either
-    way). A run without robots recorded after a fleet episode of its lane starts with that episode's log still latched,
-    and that is not a fleet run: its only `t0` is an episode older than the message's stamp, or the message has no
-    stamp at all (0; both occur in recorded runs). A table without any fleet row is not one either. A fleet log without
-    a `t0` row cannot be told apart this way and counts as a fleet run, as it always did."""
-    if len(snapshot) == 0 or "kind" not in snapshot.columns:
+    """Whether the fleet mode ran in the episode of a task log table (`episode_fleet_log`): it holds rows of `env`, and
+    the task log was reset in this episode. The fleet mode writes `t0`, the reset's time, on every reset, so the first
+    stamped message that carries the last `t0` is stamped at about that time (`FLEET_RESET_SLACK_S`, either way). A run
+    without robots recorded after a fleet episode of its lane starts with that episode's log still latched, and that is
+    not a fleet run: its only `t0` is an episode older than the message's stamp, or the message has no stamp at all (0;
+    both occur in recorded runs). A table without any row is not one either. A fleet log without a `t0` row cannot be
+    told apart this way and counts as a fleet run, as it always did."""
+    if len(snapshot) == 0 or "field_name" not in snapshot.columns:
         return False
-    rows = snapshot.filter(pl.col("kind") == FLEET_KIND)
-    if "env_id" in rows.columns and rows["env_id"].n_unique() > 1:
-        rows = rows.filter(pl.col("env_id") == int(env.rsplit("_", 1)[-1]))
-    rows = rows.filter(pl.col("field") != "members")
+    rows = _fleet_rows(snapshot, env)
     if len(rows) == 0:
         return False
-    t0 = rows.filter(pl.col("field") == "t0").sort("time_ns", maintain_order=True)
+    t0 = rows.filter(pl.col("field_name") == "t0")
     if len(t0) == 0:
         return True
     last = t0["value_str"][-1]
     reset_s = _f(last)
-    carried = t0.filter((pl.col("value_str") == last) & (pl.col("time_ns") > 0))
-    return reset_s is not None and len(carried) > 0 and abs(reset_s - carried["time_ns"][0] / 1e9) <= FLEET_RESET_SLACK_S
+    carried = t0.filter((pl.col("value_str") == last) & (pl.col("t_ns") > 0))
+    return reset_s is not None and len(carried) > 0 and abs(reset_s - carried["t_ns"][0] / 1e9) <= FLEET_RESET_SLACK_S
 
 
 def log_from_snapshot(snapshot: pl.DataFrame, env: str = "env_0") -> dict[str, str]:
-    """The task log of `env`'s `fleet` entity in a semantic snapshot table (`mcap_reader` layout): the last value of each
-    field from the episode's reset on. A recording starts with the semantic state its lane's previous episode left
-    latched, that episode's whole task log; the fleet mode writes `t0` on every reset, so the rows before the first one
-    with the last `t0` belong to an earlier episode and are left out (else a field this episode never wrote, a charge's
-    `ended`, a job's `outcome`, would keep the earlier episode's value).
+    """The task log of `env`'s `fleet` entity in a task log table (`episode_fleet_log`): the last value of each field
+    from the episode's reset on. A recording starts with the semantic state its lane's previous episode left latched,
+    that episode's whole task log; the fleet mode writes `t0` on every reset, so the rows before the first one with the
+    last `t0` belong to an earlier episode and are left out (else a field this episode never wrote, a charge's `ended`,
+    a job's `outcome`, would keep the earlier episode's value).
 
     The boundary lies in recording order, not at a stamp: the latched copy and the reset message can carry one stamp,
-    and the latched copy comes first. Each message's rows of an entity end with its `members` row, so the boundary is
-    the first row of the message that holds the first row with the last `t0` (in a table without `members` rows, that
-    row itself)."""
-    if len(snapshot) == 0 or "kind" not in snapshot.columns:
+    and the latched copy comes first. The table keeps every message apart (`msg_index`, the messages in recording
+    order), so the boundary is the message that holds the first row with the last `t0`."""
+    if len(snapshot) == 0 or "field_name" not in snapshot.columns:
         return {}
-    rows = snapshot.filter(pl.col("kind") == FLEET_KIND)
-    if "env_id" in rows.columns and rows["env_id"].n_unique() > 1:
-        rows = rows.filter(pl.col("env_id") == int(env.rsplit("_", 1)[-1]))
-    members = rows["field"] == "members"
-    rows = rows.with_row_index("_row").with_columns(_message=members.cast(pl.Int64).cum_sum().shift(1, fill_value=0))
-    rows = rows.filter(pl.col("field") != "members").sort("time_ns", maintain_order=True)
-    t0 = rows.filter(pl.col("field") == "t0")
+    rows = _fleet_rows(snapshot, env)
+    t0 = rows.filter(pl.col("field_name") == "t0")
     if len(t0):
         first = t0.filter(pl.col("value_str") == t0["value_str"][-1]).row(0, named=True)
-        start = rows.filter(pl.col("_message") == first["_message"])["_row"].min() if members.any() else first["_row"]
-        rows = rows.filter((pl.col("time_ns") > first["time_ns"]) | ((pl.col("time_ns") == first["time_ns"]) & (pl.col("_row") >= start)))
-    return {field: value for field, value in rows.select("field", pl.col("value_str").fill_null("")).iter_rows()}
+        rows = rows.filter((pl.col("t_ns") > first["t_ns"]) | ((pl.col("t_ns") == first["t_ns"]) & (pl.col("msg_index") >= first["msg_index"])))
+    return {field: value for field, value in rows.select("field_name", pl.col("value_str").fill_null("")).iter_rows()}
 
 
 def _table(log: typing.Mapping[str, str], prefix: str) -> list[dict[str, typing.Any]]:
@@ -532,7 +527,7 @@ def _times_code() -> str:
     import hashlib
     import inspect
 
-    from arena_evaluation.processing.metrics.social import paired_peds
+    from arena_evaluation.processing import paired_peds
 
     try:
         source = inspect.getsource(_times) + inspect.getsource(paired_peds._travel_times)
@@ -554,7 +549,7 @@ def _warmup_key(warmup_s: float) -> str:
 
 def times_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathlib.Path:
     """Where the kept walker travel times of `env` in an episode lie for a warm-up of `warmup_s`, beside its tracks."""
-    return pathlib.Path(episode_dir) / TOPICS_DIR / ".derived" / times_dir() / f"{env}.w{_warmup_key(warmup_s)}.parquet"
+    return pathlib.Path(episode_dir) / TOPICS_DIR / DERIVED_DIR / times_dir() / f"{env}.w{_warmup_key(warmup_s)}.parquet"
 
 
 @functools.lru_cache(maxsize=1)
@@ -596,7 +591,12 @@ def exposure_provenance(path: pathlib.Path) -> dict[str, typing.Any] | None:
 
 
 #: the extracted tables the walker tracks are built from (`ped_track_store.TRACK_TOPICS`): one of them must be there
-_PED_TABLES = frozenset({"peds_physics", "peds"})
+_PED_TABLES = (ped_track_store.ENGINE_TABLE, ped_track_store.ARENA_TABLE)
+
+
+def _env_rows(topics: pathlib.Path, table: str, env: str) -> bool:
+    path = topics / f"{table}.parquet"
+    return path.is_file() and pl.scan_parquet(path).filter(pl.col("env_id") == env).head(1).collect().height > 0
 
 
 def track_problem(episode_dir: pathlib.Path, env: str) -> str | None:
@@ -605,16 +605,12 @@ def track_problem(episode_dir: pathlib.Path, env: str) -> str | None:
     topics = pathlib.Path(episode_dir) / TOPICS_DIR
     if not (topics / TopicParquetStore.VERSION_FILE).is_file():
         return "no extraction of its recording (a copy of the run dir); run `evaluation infra times --benchmark <its run dir> --warmup <s>` where the run's tracks are, and copy the run dir again"
-    if not TopicParquetStore.is_current(topics, frozenset()):
+    if not TopicParquetStore.is_current(topics):
         return "its extraction is of an older format; re-run `evaluation process` on the run dir"
-    cached = TopicParquetStore.cached_tables(topics)
-    if cached is not None and not (cached & _PED_TABLES):
-        return f"its extraction holds no pedestrian table ({', '.join(sorted(cached))}); re-run `evaluation process` with the pedestrian tables (e.g. --measures flow)"
-    bundle = episode_envs(TopicParquetStore.read(topics) or {}).get(env)
-    if bundle is None:
+    if env not in topics_envs(topics):
         return f"its extraction holds no {env}; re-run `evaluation process` on the run dir"
-    if all(getattr(bundle, table, None) is None for table in _PED_TABLES):
-        return f"its extraction holds no pedestrian table for {env}; re-run `evaluation process` with the pedestrian tables (e.g. --measures flow)"
+    if not any(_env_rows(topics, table, env) for table in _PED_TABLES):
+        return f"its extraction holds no pedestrian table for {env}; re-run `evaluation process` on the run dir"
     return None
 
 
@@ -634,7 +630,7 @@ def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recomp
         return pl.read_parquet(path)
     if not has_tracks(episode_dir, env):
         problem = (track_problem(episode_dir, env) or "no tracks").replace("--warmup <s>", f"--warmup {warmup_s:g}")
-        raise FileNotFoundError(f"{episode_dir}: no walker times of {env} kept for a warm-up of {warmup_s:g} s ({TOPICS_DIR}/.derived/{times_dir()}/) and no tracks to compute them from: {problem}")
+        raise FileNotFoundError(f"{episode_dir}: no walker times of {env} kept for a warm-up of {warmup_s:g} s ({TOPICS_DIR}/{DERIVED_DIR}/{times_dir()}/) and no tracks to compute them from: {problem}")
     tracks = tracks_for_episode(episode_dir, env)
     if len(tracks) == 0:
         raise ValueError(f"{episode_dir}: the tracks of {env} hold no walker; an INFRA episode always has them, re-run `evaluation process` on the run dir")
@@ -648,13 +644,16 @@ def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recomp
 
 
 def robot_tracks(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, pl.DataFrame]:
-    """Each robot's ground-truth track of `env` in an extracted episode (`topics/<env>_<robot>/tf_gt.parquet`): time_ns,
-    x, y, world frame, by robot name; {} without one."""
-    topics = pathlib.Path(episode_dir) / TOPICS_DIR
+    """Each robot's ground-truth track of `env` in an extracted episode (`topics/robot_tracks.parquet`): time_ns, x, y,
+    in the env's frame, by robot name (its id without the `<env>_` prefix); {} without one."""
+    path = pathlib.Path(episode_dir) / TOPICS_DIR / "robot_tracks.parquet"
+    if not path.is_file():
+        return {}
+    rows = pl.scan_parquet(path).filter(pl.col("env_id") == env).select("robot_id", pl.col("t_ns").alias("time_ns"), "x", "y").collect()
     out = {}
-    for path in sorted(topics.glob(f"{env}_*/tf_gt.parquet")):
-        table = pl.read_parquet(path, columns=["time_ns", "pos_x_gt", "pos_y_gt"]).sort("time_ns")
-        out[path.parent.name.removeprefix(f"{env}_")] = table.rename({"pos_x_gt": "x", "pos_y_gt": "y"})
+    for robot in sorted(rows["robot_id"].unique().to_list()):
+        table = rows.filter(pl.col("robot_id") == robot).drop("robot_id").sort("time_ns")
+        out[str(robot).removeprefix(f"{env}_")] = table
     return out
 
 
@@ -696,7 +695,7 @@ def conflict_exposure(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataF
             rt = track["time_ns"].to_numpy() / 1e9 - t0
             rx, ry = track["x"].to_numpy(), track["y"].to_numpy()
             speed = np.hypot(np.gradient(rx, rt), np.gradient(ry, rt))
-            px, py, pv = np.interp(t, rt, rx), np.interp(t, rt, ry), np.interp(t, rt, speed)
+            px, py, pv = interpolate_values(rt, rx, t), interpolate_values(rt, ry, t), interpolate_values(rt, speed, t)
             inside = (t >= rt[0]) & (t <= rt[-1])
             near |= inside & (pv > moving_mps) & (np.hypot(x - px, y - py) <= band_m)
         groups = sample["group"].to_numpy()
@@ -712,7 +711,7 @@ def conflict_exposure(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataF
 def exposure_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathlib.Path:
     """Where the kept conflict exposure of `env` in an episode lies for a warm-up of `warmup_s`: beside the kept walker
     times (`times_dir`), so a copy of a run dir with them carries it too."""
-    return pathlib.Path(episode_dir) / TOPICS_DIR / ".derived" / times_dir() / f"{env}.exposure{EXPOSURE_VERSION}.w{_warmup_key(warmup_s)}.parquet"
+    return pathlib.Path(episode_dir) / TOPICS_DIR / DERIVED_DIR / times_dir() / f"{env}.exposure{EXPOSURE_VERSION}.w{_warmup_key(warmup_s)}.parquet"
 
 
 def run_exposure(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame | None:
@@ -1011,8 +1010,7 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
             notes = []
             snapshot = None
             if on is not None:
-                path = on.episode_dir / "topics" / "semantic_snapshot.parquet"
-                snapshot = pl.read_parquet(path) if path.is_file() else None
+                snapshot = _fleet_table(on.episode_dir)
                 if snapshot is None or not fleet_ran_in(snapshot, on.env):
                     notes.append(f"the run under {on.planner} (episode_{on.episode:03d}) holds no fleet task log reset in its episode, so it is not read as the fleet run")
                     on = snapshot = None
@@ -1225,6 +1223,32 @@ def _verdict(d95: typing.Mapping[str, typing.Any], d90: typing.Mapping[str, typi
     return "inconclusive"
 
 
+def seed_bootstrap(values: np.ndarray, *, n_boot: int, rng: np.random.Generator, level: float = 0.95) -> tuple[float, float, float, float]:
+    """§12's bootstrap over seeds: (mean, percentile interval at `level`, two-sided p) of per-seed differences, each
+    seed a cluster of one. The p is `2 min(P(draw <= 0), P(draw >= 0))` over the same draws, so it lies below 1 -
+    `level` exactly when the interval excludes 0, and the interval is the plain percentile one. This is the study's
+    pre-registered statistic, kept here apart from `experiments.stats.cluster_bootstrap` (which tests a shifted null
+    with its own draws and widens the interval to hold the estimate), so the study's decisions do not move with it."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    clusters = [np.array([v]) for v in values]
+    estimate = float(np.mean(np.concatenate(clusters)))
+    k = len(clusters)
+    draws = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, k, size=k)
+        draws[i] = float(np.mean(np.concatenate([clusters[j] for j in idx])))
+    draws = draws[np.isfinite(draws)]
+    if len(draws) == 0:
+        return estimate, float("nan"), float("nan"), float("nan")
+    tail = (1.0 - level) / 2.0
+    lo, hi = np.quantile(draws, [tail, 1.0 - tail])
+    p = min(1.0, 2.0 * min(np.mean(draws <= 0.0), np.mean(draws >= 0.0)))
+    return estimate, float(lo), float(hi), float(p)
+
+
 def compare(table: pl.DataFrame, picks: typing.Mapping[str, str], *, slack: float = SERVICE_SLACK, delta: float = DELTA, n_boot: int = 10_000, seed: int = 0) -> dict[str, typing.Any]:
     """§12 on the evaluation seeds. The primary contrast joint pick - robot-only pick, per seed: `c_worst`, `T` over the
     robot-only pick's `T`, and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds and Holm across the
@@ -1235,14 +1259,14 @@ def compare(table: pl.DataFrame, picks: typing.Mapping[str, str], *, slack: floa
     robot-only - guideline get the same rule: Holm (across the two) applies to their `lower` claims, which also need a
     Holm-adjusted p below 0.05; `equivalent` uses each one's unadjusted 90 % interval. "Most for aid users" holds for an
     aid group whose Holm-adjusted p < 0.05 with its interval below 0."""
-    from arena_evaluation.experiments.stats import cluster_bootstrap, holm
+    from arena_evaluation.experiments.stats import holm
 
     rng = np.random.default_rng(seed)
 
     def boot(values: np.ndarray, level: float = 0.95) -> dict[str, typing.Any]:
         values = values[np.isfinite(values)]
-        res = cluster_bootstrap([np.array([v]) for v in values], n_boot=n_boot, rng=rng, level=level)
-        return {"estimate": res.estimate, "ci_low": res.ci_low, "ci_high": res.ci_high, "p": res.p, "seeds": res.n_pairs}
+        estimate, ci_low, ci_high, p = seed_bootstrap(values, n_boot=n_boot, rng=rng, level=level)
+        return {"estimate": estimate, "ci_low": ci_low, "ci_high": ci_high, "p": p, "seeds": len(values)}
 
     def boot_both(values: np.ndarray) -> tuple[dict[str, typing.Any], dict[str, typing.Any]]:
         """The 95 % and the `EQUIVALENCE_LEVEL` interval from one set of draws, so the narrower lies inside the wider."""
@@ -1474,7 +1498,7 @@ def infra_command(args: typing.Any) -> int:
     if args.infra == "times":
         warmup = float(args.warmup if args.warmup is not None else (_manifest(args.manifest).get("warmup_s", WARMUP_S) if args.manifest else WARMUP_S))
         kept = keep_times(args.benchmark, warmup, recompute=getattr(args, "recompute", False))
-        print(f"kept the walker travel times of {kept} runs (warm-up {warmup:g} s) in {', '.join(map(str, _dirs(args.benchmark)))}; a copy of each run dir now needs only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/{times_dir()}/")
+        print(f"kept the walker travel times of {kept} runs (warm-up {warmup:g} s) in {', '.join(map(str, _dirs(args.benchmark)))}; a copy of each run dir now needs only {RUN_MANIFEST} and per episode episode_NNN.yaml, {FACTS_FILE}, {TOPICS_DIR}/{FLEET_LOG_FILE} and {TOPICS_DIR}/{DERIVED_DIR}/{times_dir()}/")
         return 0
     manifest = _manifest(args.manifest)
     layout_dirs = _dirs(args.layouts)
@@ -1563,7 +1587,7 @@ def add_infra_parser(subparsers: typing.Any) -> None:
     sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10, the score check, the forecaster check, the T vs C_worst figure")
     q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick (and each against the guideline layout) on the evaluation seeds: lower, equivalent or inconclusive")
     q.add_argument("--boot", type=int, default=10_000, help="bootstrap draws (default 10000)")
-    q = sub.add_parser("times", help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST}, combined_metrics.parquet and per episode topics/semantic_snapshot.parquet and topics/.derived/infra_times.*/ reads like the original (run it where the tracks are, before copying, with the analysis' warm-up)")
+    q = sub.add_parser("times", help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST} and per episode episode_NNN.yaml, {FACTS_FILE}, {TOPICS_DIR}/{FLEET_LOG_FILE} and {TOPICS_DIR}/{DERIVED_DIR}/infra_times.*/ reads like the original (run it where the tracks are, before copying, with the analysis' warm-up)")
     q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir; repeatable")
     q.add_argument("--manifest", type=pathlib.Path, default=None, help="the suite's <suite>.layouts.json, for its warm-up")
     q.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g}); the analysis reads the times kept for its own warm-up")

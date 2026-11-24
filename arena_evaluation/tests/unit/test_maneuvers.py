@@ -83,7 +83,19 @@ def test_ramp_tests():
 def test_angular_sweep():
     phases = build_schedule()
     angular = [p for p in phases if p.kind == PhaseKind.ANGULAR]
-    assert [p.wz_target for p in angular] == [-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+    assert [p.wz_target for p in angular] == [
+        -2.5,
+        -2.0,
+        -1.5,
+        -1.0,
+        -0.5,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        2.5,
+    ]
     assert all(p.duration_s == ANGULAR_DWELL_S for p in angular)
     assert all(p.vx_target == 0.0 for p in angular)
 
@@ -251,7 +263,11 @@ def test_custom_arc_factors_change_targets_and_respect_the_rated_wz_limit():
 
 
 def test_sweep_defaults_keys_are_accepted_by_build_schedule():
-    assert set(SWEEP_DEFAULTS) == {"arc_speed_factors", "arc_radius_factors", "ramp_horizons_s"}
+    assert set(SWEEP_DEFAULTS) == {
+        "arc_speed_factors",
+        "arc_radius_factors",
+        "ramp_horizons_s",
+    }
     assert build_schedule(**SWEEP_DEFAULTS) == build_schedule()
 
 

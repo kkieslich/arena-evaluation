@@ -11,7 +11,9 @@ alone does not explain. H2 is tested on these contrasts, one per control and pla
 edit minus base and control minus base are reported beside them with their effect sizes and intervals, as their own family.
 
 `arena evaluation edits` prints the tests, writes `edit_pairs.parquet` (one row per planner, world, seed and measure) and
-`edit_tests.csv` next to the metrics, and with `--plot` one figure of the first measure.
+`edit_tests.csv` at the benchmark dir, and with `--plot` one figure of the first measure. The measures are read from the
+episodes' fact rows (`metrics/fact_episodes.parquet` and `metrics/fact_robots.parquet`, one row per robot), the planner
+and stage from each episode's `episode_NNN.yaml` (`benchmark_runs.episode_runs`).
 
 The test is a paired t-test on the seeds' differences (df = n - 1), with Cohen's d_z (mean difference over the standard
 deviation of the differences) and the 95 % t interval of the mean difference. The exact Wilcoxon signed-rank p is listed
@@ -28,7 +30,7 @@ from collections.abc import Mapping, Sequence
 
 import polars as pl
 
-from arena_evaluation.processing.flow.benchmark import parse_stage
+from arena_evaluation.processing.benchmark_runs import episode_runs
 
 EDIT_PAIRS_FILE = "edit_pairs.parquet"
 EDIT_TESTS_FILE = "edit_tests.csv"
@@ -45,12 +47,20 @@ DEFAULT_MEASURES = (
     "personal_space_intrusion_integral",
     "time_in_intimate_zone",
     "psi_personal_events",
-    "ped_robot_contacts",
-    "path_length",
+    "contact_count_pedestrian",
+    "path_length_m",
 )
 
+#: Names of earlier releases, read as the metric that holds the measure now
+ALIASES = {"path_length": "path_length_m", "ped_robot_contacts": "contact_count_pedestrian"}
+
+#: The fact tables of an episode that hold robot measures, one row per robot
+FACT_FILES = ("fact_episodes.parquet", "fact_robots.parquet")
+_FACT_KEY = ["run_id", "episode_id", "robot_id"]
+
 EDIT, CONTROL, UNLABELLED = "edit", "control", "edited"
-#: The role of an edit-minus-control row: `world` the edit, `against` the control
+#: The role of an edit-minus-control row: `world` the edit, `against` the control (`presentation.edit_pairs_plot` draws
+#: the same role names)
 CONTRAST = "contrast"
 
 #: Seeds up to which tied differences get the signed-rank p by enumerating every sign flip (2^n of them)
@@ -89,6 +99,40 @@ TESTS_SCHEMA = {
     "p_t_holm": pl.Float64,
     "p_wilcoxon": pl.Float64,
 }
+
+
+def parse_stage(stage: str | None) -> tuple[str, int] | None:
+    """(world, seed) of a `flowedit suite` stage name `<world>__s<seed>`, None for any other."""
+    from arena_simulation_setup.generative.flowedit.suite import parse_stage_name
+
+    if stage is None:
+        return None
+    try:
+        return parse_stage_name(stage)
+    except ValueError:
+        return None
+
+
+def benchmark_metrics(benchmark_dir: pathlib.Path) -> pl.DataFrame:
+    """One row per robot of every usable episode of a processed benchmark dir: planner, stage, is_reference, episode,
+    robot and every metric column of its fact rows (`FACT_FILES`, joined on the robot); empty without any."""
+    frames = []
+    for run in episode_runs(benchmark_dir):
+        facts = None
+        for name in FACT_FILES:
+            path = run.episode_dir / "metrics" / name
+            if not path.is_file():
+                continue
+            table = pl.read_parquet(path).filter(pl.col("robot_id").is_in(list(run.robots)))
+            if facts is None:
+                facts = table
+            else:
+                shared = [c for c in table.columns if c in facts.columns and c not in _FACT_KEY]
+                facts = facts.join(table.drop(shared), on=_FACT_KEY, how="left")
+        if facts is None or len(facts) == 0:
+            continue
+        frames.append(facts.with_columns(pl.lit(run.planner).alias("planner"), pl.lit(run.stage).alias("stage"), pl.lit(run.is_reference).alias("is_reference"), pl.col("episode_id").alias("episode"), pl.col("robot_id").alias("robot")))
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
 
 def roles_from_split(split: Mapping[str, typing.Any]) -> dict[str, str]:
@@ -304,27 +348,29 @@ def format_tests(tests: pl.DataFrame, measures: Sequence[str] | None = None) -> 
     return "\n".join(out)
 
 
-def _metrics_file(directory: pathlib.Path) -> pathlib.Path | None:
-    return next((path for path in (directory / "combined_metrics.parquet", directory / "metrics.parquet") if path.is_file()), None)
-
-
 def edits_command(directories: list[pathlib.Path], split: pathlib.Path | None = None, measures: Sequence[str] | None = None, plot: bool = False) -> int:
     """`arena evaluation edits`: print each directory's tests, write `edit_pairs.parquet` and `edit_tests.csv` (and with
-    `plot` the figure of the first measure) next to its metrics; 1 when a directory has no metrics or no pair."""
+    `plot` the figure of the first measure) in the benchmark dir; 1 when a directory has no fact rows or no pair."""
     import yaml
 
     split_doc = (yaml.safe_load(split.read_text()) or {}) if split is not None else {}
     roles = roles_from_split(split_doc)
     controls = controls_from_split(split_doc)
-    chosen = list(measures or DEFAULT_MEASURES)
+    chosen = list(dict.fromkeys(ALIASES.get(m, m) for m in (measures or DEFAULT_MEASURES)))
     failed = False
     for directory in directories:
-        source = _metrics_file(directory)
-        if source is None:
-            print(f"Error: no combined_metrics.parquet or metrics.parquet in {directory}, run `arena evaluation process` first.")
+        try:
+            metrics = benchmark_metrics(directory)
+        except (FileNotFoundError, ValueError) as error:
+            print(f"Error: {error}")
             failed = True
             continue
-        episodes = episode_table(pl.read_parquet(source), chosen)
+        if len(metrics) == 0:
+            print(f"Error: no episode of {directory} has fact rows, run `arena evaluation process` first.")
+            failed = True
+            continue
+        out_dir = pathlib.Path(directory)
+        episodes = episode_table(metrics, chosen)
         pairs = pl.concat([contrast_table(episodes, controls), pair_table(episodes, roles)])
         tests = edit_tests(pairs)
         print(f"{directory}:")
@@ -332,17 +378,17 @@ def edits_command(directories: list[pathlib.Path], split: pathlib.Path | None = 
         if len(pairs) == 0:
             failed = True
             continue
-        pairs.write_parquet(source.parent / EDIT_PAIRS_FILE)
-        tests.write_csv(source.parent / EDIT_TESTS_FILE)
-        print(f"wrote {source.parent / EDIT_PAIRS_FILE} and {source.parent / EDIT_TESTS_FILE}")
+        pairs.write_parquet(out_dir / EDIT_PAIRS_FILE)
+        tests.write_csv(out_dir / EDIT_TESTS_FILE)
+        print(f"wrote {out_dir / EDIT_PAIRS_FILE} and {out_dir / EDIT_TESTS_FILE}")
         if plot:
             measure = next(m for m in chosen if m in set(pairs["measure"].to_list()))
             from arena_evaluation.presentation.edit_pairs_plot import plot_edit_pairs
 
-            out = plot_edit_pairs(pairs, tests, measure, source.parent / "plots" / f"edit_pairs_{measure}.png", planners_from_split(split_doc))
+            out = plot_edit_pairs(pairs, tests, measure, out_dir / "plots" / f"edit_pairs_{measure}.png", planners_from_split(split_doc))
             print(f"wrote {out}")
             if (pairs["role"] == CONTRAST).any():
-                out = plot_edit_pairs(pairs, tests, measure, source.parent / "plots" / f"edit_contrasts_{measure}.png", planners_from_split(split_doc), contrasts=True)
+                out = plot_edit_pairs(pairs, tests, measure, out_dir / "plots" / f"edit_contrasts_{measure}.png", planners_from_split(split_doc), contrasts=True)
                 print(f"wrote {out}")
     return 1 if failed else 0
 
@@ -354,17 +400,20 @@ __all__ = [
     "EDIT",
     "EDIT_PAIRS_FILE",
     "EDIT_TESTS_FILE",
+    "ALIASES",
     "PAIRS_SCHEMA",
     "PERSONAL_SPACE_TIME",
     "TESTS_SCHEMA",
     "contrast_table",
     "controls_from_split",
     "edit_tests",
+    "benchmark_metrics",
     "edits_command",
     "episode_table",
     "format_tests",
     "holm",
     "pair_table",
+    "parse_stage",
     "paired_test",
     "planners_from_split",
     "roles_from_split",

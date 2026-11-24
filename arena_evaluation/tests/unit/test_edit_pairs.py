@@ -1,5 +1,6 @@
 """Edited world minus base world per planner and seed: the episode table, the pairs, the paired tests, the print, the CLI and the figure."""
 
+import json
 import math
 import pathlib
 import sys
@@ -41,12 +42,12 @@ SCHEMA = {
     "is_reference": pl.Boolean,
     "time_in_intimate_zone": pl.Float64,
     "time_in_personal_zone": pl.Float64,
-    "path_length": pl.Float64,
+    "path_length_m": pl.Float64,
 }
 
 
 def _row(planner: str, world: str, seed: int, intimate: float, personal: float, *, reference: bool = False, path: float = 30.0) -> dict:
-    return {"episode": 0, "robot": "env_0_jackal", "planner": planner, "stage": f"{world}__s{seed}", "is_reference": reference, "time_in_intimate_zone": intimate, "time_in_personal_zone": personal, "path_length": path}
+    return {"episode": 0, "robot": "env_0_jackal", "planner": planner, "stage": f"{world}__s{seed}", "is_reference": reference, "time_in_intimate_zone": intimate, "time_in_personal_zone": personal, "path_length_m": path}
 
 
 # dwb: the move adds 10 s of personal-space time at every seed (plus 0..4 s), the inert copy nothing (+-1 s)
@@ -65,8 +66,8 @@ def _frame(rows: list[dict] = ROWS) -> pl.DataFrame:
 
 
 def test_the_episode_table_has_one_row_per_planner_world_and_seed_with_personal_space_time_derived():
-    table = episode_table(_frame(), ["personal_space_time", "path_length", "no_such_measure"])
-    assert table.columns == ["planner", "world", "seed", "personal_space_time", "path_length"]
+    table = episode_table(_frame(), ["personal_space_time", "path_length_m", "no_such_measure"])
+    assert table.columns == ["planner", "world", "seed", "personal_space_time", "path_length_m"]
     assert len(table) == 15
     base_1 = table.filter((pl.col("world") == BASE) & (pl.col("seed") == 1)).row(0, named=True)
     assert base_1["personal_space_time"] == pytest.approx(22.0)
@@ -130,7 +131,7 @@ def test_holm_adjusts_step_down_and_keeps_missing_values():
 
 
 def test_the_tests_find_the_move_and_not_the_inert_copy():
-    tests = edit_tests(pair_table(episode_table(_frame(), ["personal_space_time", "path_length"]), roles_from_split(SPLIT)))
+    tests = edit_tests(pair_table(episode_table(_frame(), ["personal_space_time", "path_length_m"]), roles_from_split(SPLIT)))
     assert dict(tests.schema) == TESTS_SCHEMA
     by = {(r["world"], r["measure"]): r for r in tests.iter_rows(named=True)}
     move, inert = by[(MOVE, "personal_space_time")], by[(INERT, "personal_space_time")]
@@ -138,7 +139,7 @@ def test_the_tests_find_the_move_and_not_the_inert_copy():
     assert abs(inert["mean_diff"]) < 1 and inert["p_t"] > 0.5
     assert move["p_t_holm"] == pytest.approx(min(1.0, 2 * move["p_t"]))
     # path length did not change: zero differences, nothing to test
-    assert by[(MOVE, "path_length")]["mean_diff"] == 0.0 and by[(MOVE, "path_length")]["p_wilcoxon"] is None
+    assert by[(MOVE, "path_length_m")]["mean_diff"] == 0.0 and by[(MOVE, "path_length_m")]["p_wilcoxon"] is None
 
 
 def test_the_print_has_a_table_per_measure_and_says_why_when_empty():
@@ -155,18 +156,45 @@ def _cli(monkeypatch, *argv: str) -> int | None:
     return cli._main_impl()
 
 
+def _processed(root: pathlib.Path, rows: list[dict]) -> pathlib.Path:
+    """A processed benchmark dir holding `rows`, each an episode: its yaml (planner, stage, reference) and its fact
+    rows, the zone times in fact_episodes and the path length in fact_robots."""
+    from arena_evaluation.storage.schemas import RunMetadata
+
+    for episode, row in enumerate(rows):
+        episode_dir = root / "episodes" / f"episode_{episode:03d}"
+        (episode_dir / "metrics").mkdir(parents=True)
+        reference = "unhindered_peds" if row["is_reference"] else None
+        metadata = RunMetadata(benchmark_id=root.name, planner=row["planner"], map="w", stage=row["stage"], episode_id=episode, recording_started_at="2026-01-01T00:00:00", python_version="3.12", ros_distro="jazzy", modes={}, params={}, is_reference=reference is not None, reference_type=reference)
+        (episode_dir / f"episode_{episode:03d}.yaml").write_text(json.dumps(metadata.model_dump(mode="json")))
+        key = {"run_id": [root.name], "episode_id": [episode], "robot_id": [row["robot"]]}
+        pl.DataFrame({**key, "result": ["SUCCESS"], "time_in_intimate_zone": [row["time_in_intimate_zone"]], "time_in_personal_zone": [row["time_in_personal_zone"]]}).write_parquet(episode_dir / "metrics" / "fact_episodes.parquet")
+        pl.DataFrame({**key, "env_id": ["env_0"], "path_length_m": [row["path_length_m"]]}).write_parquet(episode_dir / "metrics" / "fact_robots.parquet")
+    return root
+
+
+def test_the_metrics_of_a_processed_benchmark_are_its_fact_rows(tmp_path: pathlib.Path):
+    from arena_evaluation.processing.edit_pairs import benchmark_metrics
+
+    metrics = benchmark_metrics(_processed(tmp_path / "bench", ROWS))
+    assert len(metrics) == len(ROWS) and {"planner", "stage", "is_reference", "time_in_intimate_zone", "path_length_m"} <= set(metrics.columns)
+    # a measure of an earlier release's name reads the metric that holds it now
+    from arena_evaluation.processing.edit_pairs import ALIASES
+
+    assert ALIASES["path_length"] == "path_length_m"
+    assert episode_table(metrics, ["personal_space_time", "path_length_m"]).equals(episode_table(_frame(), ["personal_space_time", "path_length_m"]))
+
+
 def test_the_edits_command_prints_writes_and_plots(tmp_path: pathlib.Path, monkeypatch, capsys):
-    run = tmp_path / "bench"
-    run.mkdir()
-    _frame().write_parquet(run / "combined_metrics.parquet")
+    run = _processed(tmp_path / "bench", ROWS)
     split = tmp_path / "split.yaml"
     split.write_text(f"control_worlds:\n  {MOVE}: [{INERT}]\ncontest:\n  - {{name: mppi}}\n  - {{name: dwb}}\n")
     assert planners_from_split({"contest": [{"name": "mppi"}, {"name": "dwb"}]}) == ["mppi", "dwb"] and planners_from_split({}) == []
     assert _cli(monkeypatch, "edits", "--benchmark-dir", str(run), "--split", str(split), "--plot") == 0
     out = capsys.readouterr().out
-    assert "personal_space_time: edited world minus base world" in out and "path_length:" in out
+    assert "personal_space_time: edited world minus base world" in out and "path_length_m:" in out
     pairs = pl.read_parquet(run / EDIT_PAIRS_FILE)
-    assert set(pairs["measure"].to_list()) == {"personal_space_time", "time_in_intimate_zone", "path_length"}
+    assert set(pairs["measure"].to_list()) == {"personal_space_time", "time_in_intimate_zone", "path_length_m"}
     assert pl.read_csv(run / EDIT_TESTS_FILE)["role"].unique().sort().to_list() == [CONTRAST, CONTROL, EDIT]
     # the H2 contrasts print first
     assert out.index("function-carrying edit minus geometry-only control") < out.index("edited world minus base world")
@@ -176,9 +204,7 @@ def test_the_edits_command_prints_writes_and_plots(tmp_path: pathlib.Path, monke
 
 
 def test_the_edits_command_fails_without_pairs(tmp_path: pathlib.Path, monkeypatch, capsys):
-    run = tmp_path / "bench"
-    run.mkdir()
-    _frame([_row("dwb", BASE, 1, 1.0, 2.0)]).write_parquet(run / "combined_metrics.parquet")
+    run = _processed(tmp_path / "bench", [_row("dwb", BASE, 1, 1.0, 2.0)])
     assert _cli(monkeypatch, "edits", "--benchmark-dir", str(run)) == 1
     assert "No edit/base pairs" in capsys.readouterr().out and not (run / EDIT_PAIRS_FILE).exists()
 
@@ -226,3 +252,10 @@ def test_the_h2_contrasts_are_holm_adjusted_apart_from_the_rows_against_the_base
     text = format_tests(tests)
     assert text.startswith("personal_space_time: function-carrying edit minus geometry-only control, paired by seed (H2)")
     assert "move_fountain_leave_demand" in text and "edited world minus base world" in text
+
+
+def test_the_figure_draws_the_roles_the_pairs_carry():
+    from arena_evaluation.presentation import edit_pairs_plot
+
+    assert (edit_pairs_plot.EDIT, edit_pairs_plot.CONTROL, edit_pairs_plot.CONTRAST) == (EDIT, CONTROL, CONTRAST)
+    assert edit_pairs_plot.short_world(MOVE) == short_world(MOVE)

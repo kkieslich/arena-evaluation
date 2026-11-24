@@ -1,26 +1,34 @@
 """Each pedestrian measure per group of agent types across the runs of a benchmark, per seed and as the mean over seeds.
 
-`ped_group_table` reads the `<measure>_by_group` columns that `pedestrian_groups` and `paired_peds` write on every
-robot row. `arena evaluation groups` prints the mean over seeds and writes the table next to the metrics.
+The per-pedestrian measures are the columns of each episode's `metrics/fact_pedestrians.parquet`, a pedestrian's agent
+type comes from the benchmark's `dim_pedestrians.parquet` (`adult` without one), its group from `agent_group`. The
+robot contacts come from `metrics/fact_contacts.parquet` (the contacts of a robot whose other body is a pedestrian):
+`ped_robot_contacts` per robot, `ped_fleet_contacts` summed over the env's robots and `ped_contact_free_rate`, the share
+of pedestrians no robot touched. The paired measures by group come from `ped_paired.parquet` (`paired_peds`).
+`arena evaluation groups` prints the mean over seeds and writes `ped_groups.parquet` in the benchmark dir.
 """
 
 from __future__ import annotations
 
 import pathlib
+import re
 import shutil
 import typing
 
 import polars as pl
 
-from arena_evaluation.processing.flow.benchmark import parse_stage
-from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_MEASURES
-from arena_evaluation.processing.metrics.social.pedestrian_groups import FLEET_MEASURES, PED_MEASURES, worst_group
-from arena_evaluation.processing.parquet_store import ParquetStore
+from arena_evaluation.processing.benchmark_runs import EpisodeRun, episode_runs
+from arena_evaluation.processing.edit_pairs import parse_stage
+from arena_evaluation.processing.paired_peds import PAIRED_FILE, PAIRED_MEASURES
+from arena_evaluation.processing.pedestrian_groups import FLEET_MEASURES, PED_MEASURES, agent_group, worst_group
+from arena_evaluation.processing.ped_track_store import DEFAULT_AGENT_TYPE, strip_env
 
 PED_GROUPS_FILE = "ped_groups.parquet"
+DIM_PEDESTRIANS_FILE = "dim_pedestrians.parquet"
+PEDESTRIAN_KIND = "pedestrian"
 
-# The direction that is better of every measure with a `<measure>_by_group` column, the other end names the worst
-# group. A measure without one (`ped_paired_dropped`, a count) names no worst group.
+# The direction that is better of every measure scored by group, the other end names the worst group. A measure without
+# one (`ped_paired_dropped`, a count) names no worst group.
 GROUP_DIRECTIONS = {**PED_MEASURES, **FLEET_MEASURES, **PAIRED_MEASURES}
 
 # `level` is `seed` for a row of one seed and `mean` for the equal-weight mean over the seeds, whose `seed` is null.
@@ -42,70 +50,143 @@ PED_GROUPS_SCHEMA = {
 _BY_GROUP = "_by_group"
 _RUN = ["planner", "stage", "seed", "episode", "env"]
 _PARTITION = ["planner", "stage", "level", "seed", "measure"]
+#: One group's value of one measure in one run (or one robot of it): the mean over the group's pedestrians and their number
+_LONG_SCHEMA = {"planner": pl.String, "stage": pl.String, "episode": pl.Int64, "env": pl.String, "measure": pl.String, "group": pl.String, "value": pl.Float64, "peds": pl.Int64}
+_DIGITS = re.compile(r"\d+")
 
 
-def grouped_measures(metrics: pl.DataFrame) -> list[str]:
-    """The measures with a `<measure>_by_group` column of `{group, value, peds}` records, in column order."""
-    measures = []
-    for name, dtype in metrics.schema.items():
-        if name.endswith(_BY_GROUP) and isinstance(dtype, pl.List) and isinstance(dtype.inner, pl.Struct):
-            if {"group", "value", "peds"} <= {field.name for field in dtype.inner.fields}:
-                measures.append(name.removesuffix(_BY_GROUP))
-    return measures
+def _read(path: pathlib.Path) -> pl.DataFrame | None:
+    return pl.read_parquet(path) if path.is_file() else None
 
 
-def _runs(metrics: pl.DataFrame, measures: list[str]) -> pl.DataFrame:
-    """The contestant rows with their planner, stage, seed, episode and env (as `mcap_reader.bundle_env`) and the group columns.
+def _agent_types(benchmark_dir: pathlib.Path) -> pl.DataFrame:
+    """episode_id, env_id, ped_id and agent_type of every pedestrian of the benchmark's `dim_pedestrians.parquet`."""
+    schema = {"episode_id": pl.Int64, "env_id": pl.String, "ped_id": pl.String, "agent_type": pl.String}
+    dims = _read(benchmark_dir / DIM_PEDESTRIANS_FILE)
+    if dims is None or "agent_type" not in dims.columns:
+        return pl.DataFrame(schema=schema)
+    return dims.select([pl.col(c).cast(t) for c, t in schema.items()]).unique(subset=["episode_id", "env_id", "ped_id"], keep="first")
 
-    A `flowedit suite` stage `<world>__s<seed>` is the world at that seed; the seed of any other stage is null.
+
+def _pedestrians(run: EpisodeRun, types: pl.DataFrame) -> pl.DataFrame | None:
+    """The run's pedestrian fact rows with each pedestrian's group, None without any."""
+    facts = _read(run.episode_dir / "metrics" / "fact_pedestrians.parquet")
+    if facts is None or "ped_id" not in facts.columns:
+        return None
+    rows = facts.filter(pl.col("env_id") == run.env) if "env_id" in facts.columns else facts
+    rows = rows.unique(subset=["ped_id"], keep="first", maintain_order=True)
+    rows = rows.join(types.filter((pl.col("episode_id") == run.episode) & (pl.col("env_id") == run.env)).select("ped_id", "agent_type"), on="ped_id", how="left")
+    agent_type = pl.col("agent_type").fill_null("")
+    rows = rows.with_columns(pl.when(agent_type == "").then(pl.lit(DEFAULT_AGENT_TYPE)).otherwise(agent_type).alias("agent_type"))
+    return rows.with_columns(pl.col("agent_type").map_elements(agent_group, return_dtype=pl.String).alias("group"))
+
+
+def _group_means(run: EpisodeRun, peds: pl.DataFrame, measure: str, values: pl.Expr) -> pl.DataFrame:
+    """One `_LONG_SCHEMA` row per group: the mean of `values` over the group's pedestrians with a finite one."""
+    scored = peds.select("group", values.cast(pl.Float64).alias("value")).filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
+    out = scored.group_by("group").agg(pl.col("value").mean(), pl.len().cast(pl.Int64).alias("peds"))
+    return out.with_columns(pl.lit(run.planner).alias("planner"), pl.lit(run.stage).alias("stage"), pl.lit(run.episode, pl.Int64).alias("episode"), pl.lit(run.env).alias("env"), pl.lit(measure).alias("measure")).select(list(_LONG_SCHEMA)).cast(_LONG_SCHEMA)
+
+
+def _contact_ped(obstacle: str, peds: pl.DataFrame) -> str | None:
+    """The ped_id of the pedestrian a contact's obstacle id names: its id or name (without the env prefix), else the
+    pedestrian whose id ends in the obstacle's last number; None when none matches."""
+    name = strip_env("/".join(part for part in str(obstacle).split("/") if part))
+    for ped_id, ped_name in peds.select("ped_id", pl.col("ped_name").fill_null("")).iter_rows():
+        if name in (ped_id, strip_env(str(ped_name))):
+            return ped_id
+    digits = _DIGITS.findall(name)
+    if digits:
+        for ped_id in peds["ped_id"].to_list():
+            found = _DIGITS.findall(str(ped_id))
+            if found and found[-1] == digits[-1]:
+                return ped_id
+    return None
+
+
+def _contacts(run: EpisodeRun, peds: pl.DataFrame) -> dict[str, dict[str, float]] | None:
+    """Contacts of each robot of the run with each of its pedestrians (0 for every pedestrian the robot never touched),
+    by robot; None without the run's contact fact rows."""
+    facts = _read(run.episode_dir / "metrics" / "fact_contacts.parquet")
+    if facts is None:
+        return None
+    contacts = {robot: dict.fromkeys(peds["ped_id"].to_list(), 0.0) for robot in run.robots}
+    for robot, kind, obstacle in facts.select("robot_id", "collider_kind", "obstacle_id").iter_rows():
+        if robot not in contacts or kind != PEDESTRIAN_KIND:
+            continue
+        ped = _contact_ped(str(obstacle or ""), peds)
+        if ped is not None:
+            contacts[robot][ped] += 1.0
+    return contacts
+
+
+def _paired_rows(benchmark_dir: pathlib.Path) -> list[pl.DataFrame]:
+    """The paired measures by group of `ped_paired.parquet` as `_LONG_SCHEMA` rows."""
+    paired = _read(benchmark_dir / PAIRED_FILE)
+    if paired is None:
+        return []
+    frames = []
+    for column in [c for c in paired.columns if c.endswith(_BY_GROUP)]:
+        measure = column.removesuffix(_BY_GROUP)
+        frames.append(
+            paired.select("planner", "stage", "episode", "env", pl.lit(measure).alias("measure"), pl.col(column).alias("record"))
+            .explode("record")
+            .drop_nulls("record")
+            .unnest("record")
+            .select(list(_LONG_SCHEMA))
+            .cast(_LONG_SCHEMA)
+        )
+    return frames
+
+
+def group_rows(benchmark_dir: pathlib.Path) -> pl.DataFrame:
+    """Every group's value of every measure in every contestant run of a processed benchmark dir (`_LONG_SCHEMA`):
+    the per-pedestrian measures and `ped_fleet_contacts`, `ped_contact_free_rate` once per run, `ped_robot_contacts`
+    once per robot of the run, and the paired measures. Reference runs are left out."""
+    benchmark_dir = pathlib.Path(benchmark_dir)
+    types = _agent_types(benchmark_dir)
+    frames: list[pl.DataFrame] = []
+    for run in episode_runs(benchmark_dir):
+        if run.is_reference:
+            continue
+        peds = _pedestrians(run, types)
+        if peds is None or len(peds) == 0:
+            continue
+        frames.extend(_group_means(run, peds, measure, pl.col(measure)) for measure in PED_MEASURES if measure in peds.columns)
+        contacts = _contacts(run, peds)
+        if contacts:
+            for by_ped in contacts.values():
+                frames.append(_group_means(run, peds.with_columns(pl.col("ped_id").replace_strict(by_ped, default=0.0, return_dtype=pl.Float64).alias("_c")), "ped_robot_contacts", pl.col("_c")))
+            fleet = {ped: sum(robot[ped] for robot in contacts.values()) for ped in peds["ped_id"].to_list()}
+            with_fleet = peds.with_columns(pl.col("ped_id").replace_strict(fleet, return_dtype=pl.Float64).alias("_f"))
+            frames.append(_group_means(run, with_fleet, "ped_fleet_contacts", pl.col("_f")))
+            frames.append(_group_means(run, with_fleet, "ped_contact_free_rate", (pl.col("_f") == 0).cast(pl.Float64)))
+    frames.extend(_paired_rows(benchmark_dir))
+    return pl.concat(frames) if frames else pl.DataFrame(schema=_LONG_SCHEMA)
+
+
+def ped_group_table(rows: pl.DataFrame) -> pl.DataFrame:
+    """One row per (planner, stage, seed, measure, group) and the equal-weight mean over seeds, each with the worst group.
+
+    `rows` are `group_rows`. Each (episode, env) counts once, with the mean of its rows (a per-robot value like
+    `ped_robot_contacts` enters as the mean over the env's robots) and the most pedestrians any of them scored. A seed's
+    value is the mean over its (episode, env) runs, its `peds` their sum; the mean over seeds weights every seed a group
+    has a value in equally and sums the seeds' `peds` and `runs`. A `flowedit suite` stage `<world>__s<seed>` is the
+    world at that seed, any other stage one seed of unknown value. `worst_group` is the group with the worst value of
+    its (planner, stage, level, seed, measure) by `GROUP_DIRECTIONS`, null when groups tie or the measure has no
+    direction.
     """
-
-    def column(name: str, dtype: type[pl.DataType]) -> pl.Expr:
-        return pl.col(name).cast(dtype) if name in metrics.columns else pl.lit(None, dtype)
-
-    rows = metrics.filter(~pl.col("is_reference").fill_null(False)) if "is_reference" in metrics.columns else metrics
-    rows = rows.select(
-        column("planner", pl.String).alias("planner"),
-        column("stage", pl.String).alias("stage"),
-        column("episode", pl.Int64).alias("episode"),
-        column("robot", pl.String).str.extract(r"(env_\d+)", 1).fill_null("env_0").alias("env"),
-        *(pl.col(f"{measure}{_BY_GROUP}") for measure in measures),
-    )
-    stages = [stage for stage in rows["stage"].unique().to_list() if stage is not None]
+    long = rows.filter(pl.col("group").is_not_null() & pl.col("value").is_not_null() & pl.col("value").is_not_nan())
+    if len(long) == 0:
+        return pl.DataFrame(schema=PED_GROUPS_SCHEMA)
+    measures = list(dict.fromkeys(long["measure"].to_list()))
+    stages = [stage for stage in long["stage"].unique().to_list() if stage is not None]
     parsed = {stage: parse_stage(stage) for stage in stages}
     lookup = pl.DataFrame(
         {"stage": stages, "world": [p[0] if p else stage for stage, p in parsed.items()], "seed": [p[1] if p else None for p in parsed.values()]},
         schema={"stage": pl.String, "world": pl.String, "seed": pl.Int64},
     )
-    return rows.join(lookup, on="stage", how="left").with_columns(pl.coalesce("world", "stage").alias("stage")).drop("world")
-
-
-def ped_group_table(metrics: pl.DataFrame) -> pl.DataFrame:
-    """One row per (planner, stage, seed, measure, group) and the equal-weight mean over seeds, each with the worst group.
-
-    Reference rows are left out. The pedestrian measures repeat on every robot row of an env, so each (episode, env)
-    counts once, with the mean of its robot rows (a per-robot value like `ped_robot_contacts` enters as the mean over
-    the env's robots) and the most pedestrians any of them scored. A seed's value is the mean over its (episode, env)
-    runs, its `peds` their sum; the mean over seeds weights every seed a group has a value in equally and sums the
-    seeds' `peds` and `runs`. `worst_group` is the group with the worst value of its (planner, stage, level, seed,
-    measure) by `GROUP_DIRECTIONS`, null when groups tie or the measure has no direction.
-    """
-    measures = grouped_measures(metrics)
-    if not measures or len(metrics) == 0:
-        return pl.DataFrame(schema=PED_GROUPS_SCHEMA)
-    runs = _runs(metrics, measures)
-    long = pl.concat(
-        [
-            runs.select(*_RUN, pl.lit(measure).alias("measure"), pl.col(f"{measure}{_BY_GROUP}").alias("record"))
-            .explode("record")
-            .drop_nulls("record")
-            .unnest("record")
-            .select(*_RUN, "measure", pl.col("group").cast(pl.String), pl.col("value").cast(pl.Float64), pl.col("peds").cast(pl.Int64))
-            for measure in measures
-        ]
-    ).filter(pl.col("group").is_not_null() & pl.col("value").is_not_null() & pl.col("value").is_not_nan())
-    if len(long) == 0:
-        return pl.DataFrame(schema=PED_GROUPS_SCHEMA)
+    long = long.join(lookup, on="stage", how="left").with_columns(pl.coalesce("world", "stage").alias("stage")).drop("world")
     per_run = long.group_by(*_RUN, "measure", "group").agg(pl.col("value").mean(), pl.col("peds").max())
     per_seed = per_run.group_by("planner", "stage", "seed", "measure", "group").agg(pl.col("value").mean(), pl.col("peds").sum(), pl.len().cast(pl.Int64).alias("runs"))
     mean = per_seed.group_by("planner", "stage", "measure", "group").agg(pl.col("value").mean(), pl.col("peds").sum(), pl.col("runs").sum(), pl.len().cast(pl.Int64).alias("seeds"))
@@ -145,7 +226,7 @@ def format_group_table(table: pl.DataFrame, width: int | None = None) -> str:
     """
     mean = table.filter(pl.col("level") == "mean")
     if len(mean) == 0:
-        return "No per-group pedestrian measures: the metrics have no `<measure>_by_group` values (recordings without agent types, or not processed)."
+        return "No per-group pedestrian measures: no pedestrian fact rows with a value (not processed, or no pedestrians)."
     width = width or shutil.get_terminal_size((120, 24)).columns
     seeds = table.filter(pl.col("level") == "seed")
     out: list[str] = []
@@ -185,24 +266,21 @@ def format_group_table(table: pl.DataFrame, width: int | None = None) -> str:
     return "\n".join(out)
 
 
-def _metrics_file(directory: pathlib.Path) -> pathlib.Path | None:
-    """The directory's combined_metrics.parquet, else its metrics.parquet, None without either."""
-    return next((path for path in (directory / "combined_metrics.parquet", directory / "metrics.parquet") if path.is_file()), None)
-
-
 def groups_command(directories: list[pathlib.Path]) -> int:
-    """`arena evaluation groups`: print each directory's group table and write it next to its metrics, 1 when a directory has no metrics."""
+    """`arena evaluation groups`: print each benchmark dir's group table and write it there, 1 when a dir has no
+    processed runs."""
     failed = False
     for directory in directories:
-        source = _metrics_file(directory)
-        if source is None:
-            print(f"Error: no combined_metrics.parquet or metrics.parquet in {directory}, run `arena evaluation process` first.")
+        try:
+            rows = group_rows(pathlib.Path(directory))
+        except (FileNotFoundError, ValueError) as error:
+            print(f"Error: {error}")
             failed = True
             continue
-        table = ped_group_table(ParquetStore.read(source)[0])
-        out = source.with_name(PED_GROUPS_FILE)
-        ParquetStore.write(table, out)
-        print(f"{source}:")
+        table = ped_group_table(rows)
+        out = pathlib.Path(directory) / PED_GROUPS_FILE
+        table.write_parquet(out)
+        print(f"{directory}:")
         print(format_group_table(table))
         print(f"Per-seed rows and means written to: {out}")
     return 1 if failed else 0

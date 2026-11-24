@@ -66,9 +66,10 @@ class LockstepSummary:
 
     def short(self) -> str:
         channels = ",".join(self.beat_channels) or "-"
-        return f"lockstep {self.verdict}: stalls={self.stalls} max={self.max_stall_s:.1f}s rtf={self.rtf:.2f} ticks={self.ticks} beats={self._beats()} beat_channels={channels}"
+        return f"lockstep {self.verdict}: stalls={self.stalls} max={self.max_stall_s:.1f}s rtf={self.rtf:.2f} ticks={self.ticks} beats={self.beats_text()} beat_channels={channels}"
 
-    def _beats(self) -> str:
+    def beats_text(self) -> str:
+        """Beats received/due, marked when none were due."""
         return f"{self.beats}/{self.beats_due}" if self.beats_expected else f"{self.beats}/{self.beats_due} (none due)"
 
     def to_dict(self) -> dict:
@@ -194,7 +195,13 @@ class LockstepMonitor:
         """env scopes the beat counts to channels whose topic lies under that namespace; `beats` False for a window whose
         robot drives under no planner, so its verdict asks for ticks and no long stall but no planner beat."""
         with self._lock:
-            w = _Window(active=self._active, channels=set(self._channels), env=env, beats_expected=beats, base=self._counters)
+            w = _Window(
+                active=self._active,
+                channels=set(self._channels),
+                env=env,
+                beats_expected=beats,
+                base=self._counters,
+            )
             if self._waiting:
                 w.stalled_on |= self._waiting
                 w.stall_since = now
@@ -231,7 +238,18 @@ def format_table(header: typing.Sequence[str], table: typing.Sequence[typing.Seq
 
 def format_report(rows: typing.Sequence[tuple[str, str, LockstepSummary]]) -> str:
     """One line per (contestant, stage): verdict, stalls, longest stall, mean rtf, gated ticks, beats received/due, beat channels, stalled channels."""
-    header = ("contestant", "stage", "verdict", "stalls", "max_stall_s", "rtf", "ticks", "beats", "beat_channels", "stalled_on")
+    header = (
+        "contestant",
+        "stage",
+        "verdict",
+        "stalls",
+        "max_stall_s",
+        "rtf",
+        "ticks",
+        "beats",
+        "beat_channels",
+        "stalled_on",
+    )
     table = [
         (
             contestant,
@@ -241,7 +259,7 @@ def format_report(rows: typing.Sequence[tuple[str, str, LockstepSummary]]) -> st
             f"{s.max_stall_s:.1f}",
             f"{s.rtf:.2f}",
             str(s.ticks),
-            s._beats(),
+            s.beats_text(),
             ",".join(s.beat_channels) or "-",
             ",".join(s.stalled_on) or "-",
         )

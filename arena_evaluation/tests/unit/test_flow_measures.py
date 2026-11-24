@@ -11,8 +11,8 @@ np = pytest.importorskip("numpy")
 pytest.importorskip("shapely")
 
 from arena_evaluation.processing.flow import FlowGrid, jsd, occupancy, pooled
-from arena_evaluation.processing.flow.benchmark import FLOW_CELL_SCHEMA, FlowOutput, add_flow_reference_metrics, parse_stage
-from arena_evaluation.processing.metrics.flow.flow_episode import object_uses
+from arena_evaluation.processing.benchmark_runs import EpisodeRun
+from arena_evaluation.processing.flow.benchmark import FLOW_CELL_SCHEMA, FLOW_RUN_SCHEMA, FLOW_USES_SCHEMA, FlowOutput, flow_measures, object_uses, parse_stage, write_flow_tables
 from arena_evaluation.processing.ped_track_store import TRACK_SCHEMA
 
 ROOM = [(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (0.0, 2.0)]
@@ -129,15 +129,20 @@ EPISODES = {
 }
 
 
-def _rows(planner: str = "peds_only", first: int = 0) -> list[dict]:
-    rows = [{"episode": first + i, "planner": planner, "robot": "env_0_jackal", "stage": stage, "status": "evaluated", "is_reference": False} for i, stage in enumerate(EPISODES)]
-    rows.append({"episode": first + 99, "planner": planner, "robot": "env_0_jackal", "stage": "hospital_1__s1", "status": "evaluated", "is_reference": True})
-    rows.append({"episode": first + 98, "planner": planner, "robot": "env_0_jackal", "stage": "a planner stage", "status": "evaluated", "is_reference": False})
-    return rows
+def _runs(planner: str = "peds_only", first: int = 0) -> list[EpisodeRun]:
+    """A run of every EPISODES stage, episode `first + i` the i-th, beside a reference run and a run of another stage."""
+    runs = [_run(first + i, planner, stage) for i, stage in enumerate(EPISODES)]
+    runs.append(_run(first + 99, planner, "hospital_1__s1", reference=True))
+    runs.append(_run(first + 98, planner, "a planner stage"))
+    return runs
 
 
-def _measure(rows: list[dict], recordings: dict[tuple[int, str], list[tuple]] | None = None, loaded: list[tuple[int, str]] | None = None) -> FlowOutput:
-    """Flow outputs of `rows`, episode `i` (and `i + 100`) recording EPISODES' i-th stage unless `recordings` names its (episode, env)."""
+def _run(episode: int, planner: str, stage: str, env: str = "env_0", *, reference: bool = False) -> EpisodeRun:
+    return EpisodeRun(planner, stage, episode, env, reference, "unhindered_peds" if reference else None, pathlib.Path("/runs/r/episodes") / str(episode), ("env_0_jackal",))
+
+
+def _measure(runs: list[EpisodeRun], recordings: dict[tuple[int, str], list[tuple]] | None = None, loaded: list[tuple[int, str]] | None = None) -> FlowOutput:
+    """Flow outputs of `runs`, episode `i` (and `i + 100`) recording EPISODES' i-th stage unless `recordings` names its (episode, env)."""
     stages = list(EPISODES)
 
     def tracks(directory: pathlib.Path, env: str) -> pl.DataFrame:
@@ -148,16 +153,21 @@ def _measure(rows: list[dict], recordings: dict[tuple[int, str], list[tuple]] | 
             return _tracks(recordings[(episode, env)])
         return _tracks(EPISODES[stages[episode % 100]])
 
-    return add_flow_reference_metrics(rows, lambda episode: pathlib.Path("/runs/r/episodes") / str(episode), tracks=tracks, grid=lambda world, run_dir: GRID)
+    return flow_measures(pathlib.Path("/runs/r"), runs=runs, tracks=tracks, grid=lambda world, run_dir: GRID, uses=lambda directory, env: [{"object": "fountain", "uses": int(directory.name), "max_queue": 0}])
+
+
+def _by_stage(out: FlowOutput, planner: str | None = None) -> dict[str, dict]:
+    rows = out.runs if planner is None else out.runs.filter(pl.col("planner") == planner)
+    return {r["stage"]: r for r in rows.iter_rows(named=True)}
 
 
 def test_each_edit_is_scored_against_its_base_world_at_the_same_seed() -> None:
-    rows = _rows()
-    assert _measure(rows).rows == 5
-    by = {r["stage"]: r for r in rows[:5]}
+    out = _measure(_runs())
+    assert len(out.runs) == 5 and out.runs.columns == list(FLOW_RUN_SCHEMA)
+    by = _by_stage(out)
     base, s1, s2, s6 = by["hospital_1__s1"], by["hospital_1__move_fountain__ab__s1"], by["hospital_1__move_fountain__ab__s2"], by["hospital_1__move_fountain__ab__s6"]
     assert base["flow_reference_stage"] is None and base["flow_jsd"] is None and base["flow_base"] == "hospital_1"
-    assert base["flow_room_ped_seconds"] == pytest.approx(5.0)
+    assert base["flow_room_ped_seconds"] == pytest.approx(5.0) and base["flow_peds"] == 2
     assert (s1["flow_reference_stage"], s1["flow_world"], s1["flow_seed"]) == ("hospital_1__s1", "hospital_1__move_fountain__ab", 1)
     assert s1["flow_jsd"] == pytest.approx(1.0) and s1["flow_jsd_occupancy"] == pytest.approx(1.0)
     assert (s1["flow_paired_peds"], s1["flow_unpaired_peds"]) == (2, 0)
@@ -168,15 +178,17 @@ def test_each_edit_is_scored_against_its_base_world_at_the_same_seed() -> None:
     assert pooled_jsd == s2["flow_jsd_pooled"] == s6["flow_jsd_pooled"] and s1["flow_pooled_seeds"] == 2
     assert 0.311 < pooled_jsd < 1.0
     assert s6["flow_reference_stage"] is None and s6["flow_jsd"] is None
+    # each scored run's object uses, with its identity
+    assert out.uses.columns == list(FLOW_USES_SCHEMA) and sorted(out.uses["episode"].to_list()) == [0, 1, 2, 3, 4]
 
 
 def test_each_scored_run_keeps_its_map_as_cell_rows() -> None:
-    rows = _rows()
-    cells = _measure(rows).cells
+    out = _measure(_runs())
+    cells = out.cells
     assert cells.columns == list(FLOW_CELL_SCHEMA)
     by_stage = {stage: group for (stage,), group in cells.group_by("stage")}
     assert set(by_stage) == set(EPISODES)
-    for row in rows[:5]:
+    for row in out.runs.iter_rows(named=True):
         assert by_stage[row["stage"]]["ped_seconds"].sum() == pytest.approx(row["flow_room_ped_seconds"])
     # both drinkers stand in the corner cell: its standing bin, no heading
     base = by_stage["hospital_1__s1"]
@@ -184,27 +196,25 @@ def test_each_scored_run_keeps_its_map_as_cell_rows() -> None:
     assert base.select("planner", "flow_world", "flow_base", "flow_seed").unique().rows() == [("peds_only", "hospital_1", "hospital_1", 1)]
 
 
-def test_rows_without_suite_stages_keep_no_maps() -> None:
-    rows = [{"episode": 1, "planner": "dwb", "robot": "env_0_jackal", "stage": "a planner stage", "status": "evaluated", "is_reference": False}]
-    out = _measure(rows)
-    assert out.rows == 0 and out.cells.is_empty() and out.cells.columns == list(FLOW_CELL_SCHEMA)
+def test_runs_without_suite_stages_keep_no_maps() -> None:
+    out = _measure([_run(1, "dwb", "a planner stage")])
+    assert out.runs.is_empty() and out.cells.is_empty() and out.cells.columns == list(FLOW_CELL_SCHEMA) and out.uses.is_empty()
 
 
-def test_reference_planner_and_failed_rows_are_left_alone() -> None:
-    rows = _rows()
-    rows[1]["status"] = "error"
-    _measure(rows)
-    assert "flow_jsd" not in rows[1] and "flow_jsd" not in rows[5] and "flow_jsd" not in rows[6]
-    # the edit at seed 2 has no evaluated base run any more
-    assert rows[3]["flow_reference_stage"] is None and rows[2]["flow_pooled_seeds"] == 1
+def test_reference_runs_and_runs_left_out_of_the_benchmark_are_left_alone() -> None:
+    # episode 1 (the base world at seed 2) failed to process: episode_runs leaves it out
+    runs = [run for run in _runs() if run.episode != 1]
+    out = _measure(runs)
+    by = _by_stage(out)
+    assert set(out.runs["episode"].to_list()) == {0, 2, 3, 4}
+    # the edit at seed 2 has no base run any more
+    assert by["hospital_1__move_fountain__ab__s2"]["flow_reference_stage"] is None and by["hospital_1__move_fountain__ab__s1"]["flow_pooled_seeds"] == 1
 
 
 def test_each_contestant_is_scored_against_its_own_base_run() -> None:
     # contestant b's base run at seed 1 already had the drinkers at the new spot, so its edit changes nothing
-    rows = _rows("a") + _rows("b", first=100)
-    _measure(rows, {(100, "env_0"): _stand("p#1", 3.75, 1.75) + _stand("p#2", 3.75, 1.75)})
-    a = {r["stage"]: r for r in rows[:5]}
-    b = {r["stage"]: r for r in rows[7:12]}
+    out = _measure(_runs("a") + _runs("b", first=100), {(100, "env_0"): _stand("p#1", 3.75, 1.75) + _stand("p#2", 3.75, 1.75)})
+    a, b = _by_stage(out, "a"), _by_stage(out, "b")
     assert a["hospital_1__move_fountain__ab__s1"]["flow_jsd"] == pytest.approx(1.0)
     assert b["hospital_1__move_fountain__ab__s1"]["flow_jsd"] == pytest.approx(0.0)
     assert b["hospital_1__move_fountain__ab__s1"]["flow_reference_stage"] == "hospital_1__s1"
@@ -212,22 +222,49 @@ def test_each_contestant_is_scored_against_its_own_base_run() -> None:
 
 
 def test_each_env_of_an_episode_reads_its_own_tracks_once() -> None:
-    rows = [{"episode": 20, "planner": "peds_only", "robot": robot, "stage": "hospital_1__s1", "status": "evaluated", "is_reference": False} for robot in ("env_0_jackal", "env_0_burger", "env_1_jackal")]
+    runs = [_run(20, "peds_only", "hospital_1__s1", env) for env in ("env_0", "env_1")]
     loaded: list[tuple[int, str]] = []
-    _measure(rows, {(20, "env_0"): _stand("p#1", 0.25, 0.25), (20, "env_1"): _stand("p#1", 0.25, 0.25) + _stand("p#2", 3.75, 1.75)}, loaded)
-    assert [r["flow_room_ped_seconds"] for r in rows] == pytest.approx([2.5, 2.5, 5.0])
+    out = _measure(runs, {(20, "env_0"): _stand("p#1", 0.25, 0.25), (20, "env_1"): _stand("p#1", 0.25, 0.25) + _stand("p#2", 3.75, 1.75)}, loaded)
+    assert out.runs["flow_room_ped_seconds"].to_list() == pytest.approx([2.5, 5.0])
     assert loaded == [(20, "env_0"), (20, "env_1")]
+
+
+def test_the_tables_are_written_at_the_benchmark_root_and_a_stale_one_is_removed(tmp_path: pathlib.Path) -> None:
+    from arena_evaluation.storage.run_tables import scan_run_tables
+
+    out = _measure(_runs())
+    write_flow_tables(tmp_path, out)
+    tables = scan_run_tables(tmp_path)
+    assert set(tables) == {"flow_runs", "flow_cells", "flow_object_uses", "flow_map_pairs"} and (tmp_path / "flow_cells.parquet").is_file()
+    assert tables["flow_runs"].collect().equals(out.runs) and tables["flow_cells"].collect().equals(out.cells)
+    write_flow_tables(tmp_path, _measure([_run(1, "dwb", "a planner stage")]))
+    assert scan_run_tables(tmp_path) == {}
 
 
 def test_object_uses_count_held_interactions_and_the_longest_queue() -> None:
     interactions = pl.DataFrame(
         {
-            "time_ns": [1, 2, 3, 4, 5],
+            "t_ns": [1, 2, 3, 4, 5],
             "interaction_id": [7, 7, 8, 9, 10],
             "object_id": ["env_0/fountain", "env_0/fountain", "env_0/fountain", "env_0/sofa", ""],
-            "queue": [[], [3, 4], [5], [], []],
             "holding": [False, True, True, False, True],
         }
     )
-    assert object_uses(interactions) == [{"object": "fountain", "uses": 2, "max_queue": 2}, {"object": "sofa", "uses": 0, "max_queue": 0}]
+    # the queued members of each interaction's frame (`pedestrian_interaction_members`), beside its participants
+    members = pl.DataFrame(
+        {
+            "t_ns": [2, 2, 2, 3, 3],
+            "interaction_id": [7, 7, 7, 8, 8],
+            "ped_id": ["Pedestrian_1", "Pedestrian_3", "Pedestrian_4", "Pedestrian_2", "Pedestrian_5"],
+            "member_role": ["participant", "queue", "queue", "participant", "queue"],
+        }
+    )
+    assert object_uses(interactions, members) == [{"object": "fountain", "uses": 2, "max_queue": 2}, {"object": "sofa", "uses": 0, "max_queue": 0}]
+    assert object_uses(interactions)[0] == {"object": "fountain", "uses": 2, "max_queue": 0}
     assert object_uses(None) == []
+
+
+def test_the_cell_table_holds_the_grids_cell_columns() -> None:
+    from arena_evaluation.processing.flow import CELL_SCHEMA
+
+    assert {k: v for k, v in FLOW_CELL_SCHEMA.items() if k in CELL_SCHEMA} == CELL_SCHEMA and list(FLOW_CELL_SCHEMA)[-len(CELL_SCHEMA) :] == list(CELL_SCHEMA)

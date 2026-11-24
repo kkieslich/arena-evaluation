@@ -7,7 +7,15 @@ import pathlib
 
 import polars as pl
 
-from arena_evaluation.processing.edit_pairs import CONTRAST, CONTROL, EDIT, short_world
+#: The `role` values of `edit_pairs`' rows: a function-carrying edit and a geometry-only control against their base
+#: world, and an edit minus one of its controls (the presentation layer binds the table and imports no processing)
+EDIT, CONTROL, CONTRAST = "edit", "control", "contrast"
+
+
+def short_world(world: str) -> str:
+    """`hospital_1__move_fountain__6e1d6873` as `move_fountain`: the edit's name without its base and id."""
+    parts = world.split("__")
+    return parts[1] if len(parts) >= 2 else world
 
 # Categorical slots 1 and 2 of the reference chart palette (blue, orange), a validated adjacent pair on the light surface;
 # role is also told by marker shape and by the x labels, never by color alone.
@@ -16,14 +24,14 @@ _OTHER_STYLE = ("#52514e", "D", "edited world")
 _ROLE_STYLE[CONTRAST] = ("#2a78d6", "o", "edit minus control")
 _SURFACE, _INK, _INK_2, _GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
-_UNITS = {"personal_space_time": "s", "personal_space_intrusion_integral": "m·s", "time_in_intimate_zone": "s", "path_length": "m"}
+_UNITS = {"personal_space_time": "s", "personal_space_intrusion_integral": "m·s", "time_in_intimate_zone": "s", "path_length_m": "m"}
 _TITLES = {
     "personal_space_time": "Time with a person inside the robot's personal space (1.2 m)",
     "personal_space_intrusion_integral": "Personal-space intrusion integral",
     "time_in_intimate_zone": "Time with a person inside the intimate zone (0.45 m)",
     "psi_personal_events": "Personal-space encounters",
-    "ped_robot_contacts": "Robot-pedestrian contacts",
-    "path_length": "Path length",
+    "contact_count_pedestrian": "Robot-pedestrian contacts",
+    "path_length_m": "Path length",
 }
 
 
