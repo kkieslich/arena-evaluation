@@ -14,7 +14,7 @@ import re
 import shutil
 import time
 import typing
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Iterable, MutableMapping
 
 import polars as pl
 
@@ -30,7 +30,7 @@ from arena_evaluation.processing.metrics.common.alignment import (
     asof_join,
 )
 from arena_evaluation.processing.metrics.dictionary import metric_dictionary
-from arena_evaluation.processing.metrics.registry import load_metric_definitions
+from arena_evaluation.processing.metrics.registry import load_metric_definitions, select_calculators
 from arena_evaluation.processing.metrics.social.interaction_common import (
     PEDESTRIAN_AGENT_STATES_TOPIC,
     PEDESTRIAN_ARENA_PEDS_TOPIC,
@@ -197,12 +197,13 @@ def _shutdown_executor_cleanly(executor: concurrent.futures.ProcessPoolExecutor)
         pass
 
 
-def _episode_pipeline(data_root_str: str) -> ProcessingPipeline:
-    """A single-worker pipeline rooted at the worker's data root."""
+def _episode_pipeline(data_root_str: str, measures: tuple[str, ...] | None = None) -> ProcessingPipeline:
+    """A single-worker pipeline rooted at the worker's data root, evaluating `measures` (None: every calculator)."""
     return ProcessingPipeline(
         FolderManager(data_root=pathlib.Path(data_root_str)),
         profiler=None,
         workers=1,
+        measures=measures,
     )
 
 
@@ -227,11 +228,12 @@ def _process_job(
     force_process: bool,
     ep: EpisodeDescriptor,
     status_dict: _EpisodeStatus,
+    measures: tuple[str, ...] | None = None,
 ) -> tuple[int, EpisodeEvaluation]:
     """Evaluate one episode in a spawned worker, keeping a benchmark-refusing failure fatal."""
     _report_status(status_dict, ep, "Loading Topics", 0, 18)
     try:
-        pipeline = _episode_pipeline(data_root_str)
+        pipeline = _episode_pipeline(data_root_str, measures)
         try:
             evaluation = pipeline.evaluate_episode(
                 ep,
@@ -849,11 +851,18 @@ class ProcessingPipeline:
         profiler: PhaseProfiler | None = None,
         workers: int | None = None,
         progress: RunProgressFactory = _silent_progress,
+        measures: Iterable[str] | None = None,
     ):
+        """`measures` (calculator names, categories or `MEASURE_SETS` names, `select_calculators`) runs only the
+        calculators they select; the other fact columns are NULL with `not_selected`, and the extraction, the
+        pedestrian track store and the cross-run tables (flow, paired pedestrians) are the same as without. None runs
+        every calculator."""
         load_metric_definitions()
         self.folder_manager = folder_manager
         self.profiler = profiler
         self.progress = progress
+        self.measures = None if measures is None else tuple(measures)
+        self.calculators = None if self.measures is None else select_calculators(self.measures)
         # -1 (or None) = auto-detect the CPU count; any value < 1 falls back to it.
         self.workers = (os.cpu_count() or 1) if (workers is None or workers < 1) else workers
 
@@ -916,6 +925,7 @@ class ProcessingPipeline:
         bundle: TopicBundle,
         pedsim_avail: bool,
         status_dict: _EpisodeStatus | None,
+        calculators: frozenset[str] | None = None,
     ) -> tuple[dict, ScopedFactTables | None, dict[str, pl.DataFrame] | None]:
         """Align and evaluate one robot's TopicBundle within an episode."""
         from arena_evaluation.processing.scoped_evaluator import ScopedEvaluator
@@ -1007,7 +1017,7 @@ class ProcessingPipeline:
         def on_calc_progress(calc_name: str, calc_idx: int, total_calcs: int) -> None:
             _report_status(status_dict, ep, calc_name, calc_idx, total_calcs)
 
-        evaluated = ScopedEvaluator(robot_params, metrics_config=suite_metrics_cfg).evaluate(
+        evaluated = ScopedEvaluator(robot_params, metrics_config=suite_metrics_cfg, calculators=calculators).evaluate(
             aligned_ep,
             run_id=ep.benchmark_id,
             episode_id=ep.episode_id,
@@ -1045,7 +1055,7 @@ class ProcessingPipeline:
         episode_dir = pathlib.Path(ep.episode_dir)
         metrics_dir = episode_dir / "metrics"
 
-        if not (force_extract or force_process) and episode_is_complete(metrics_dir):
+        if not (force_extract or force_process) and episode_is_complete(metrics_dir, self.calculators):
             return EpisodeEvaluation(episode_id=ep.episode_id, rows=[], metrics_dir=metrics_dir)
 
         yaml_path = episode_dir / f"{episode_dir.name}.yaml"
@@ -1103,6 +1113,7 @@ class ProcessingPipeline:
                     bundle,
                     pedsim_avail,
                     status_dict,
+                    self.calculators,
                 )
                 for robot_name, bundle in robots.items()
             ]
@@ -1129,15 +1140,16 @@ class ProcessingPipeline:
             status_dict=status_dict,
             force_process=force_process,
         )
-        self.publish_evaluation(evaluation)
+        self.publish_evaluation(evaluation, self.calculators)
         return evaluation.rows
 
     @staticmethod
-    def publish_evaluation(evaluation: EpisodeEvaluation) -> None:
-        """Write one evaluation's fact tables, then stamp its metrics directory as complete."""
+    def publish_evaluation(evaluation: EpisodeEvaluation, calculators: frozenset[str] | None = None) -> None:
+        """Write one evaluation's fact tables, then stamp its metrics directory as complete for `calculators` (None:
+        every calculator), so a later process that selects more evaluates the episode again."""
         if evaluation.facts is not None:
             write_fact_tables(evaluation.facts, evaluation.metrics_dir)
-        write_episode_stamp(evaluation.metrics_dir)
+        write_episode_stamp(evaluation.metrics_dir, calculators)
 
     def extract_benchmark(self, benchmark_id: str, force_extract: bool = False) -> None:
         """Extract all episodes of a benchmark, then write its dimensions once."""
@@ -1229,6 +1241,7 @@ class ProcessingPipeline:
                     str(self.folder_manager.data_root),
                     force_extract,
                     force_process,
+                    measures=self.measures,
                 ),
                 progress=self.progress,
                 on_done=lambda _ep, result: evaluations.append(result[1]),
@@ -1237,7 +1250,7 @@ class ProcessingPipeline:
 
         _print_status_summary([row for evaluation in evaluations for row in evaluation.rows])
         for evaluation in evaluations:
-            self.publish_evaluation(evaluation)
+            self.publish_evaluation(evaluation, self.calculators)
         benchmark_dir = self.folder_manager.benchmark_dir(benchmark_id)
         enforce_benchmark_contract(benchmark_dir)
         write_benchmark_stamp(benchmark_dir)

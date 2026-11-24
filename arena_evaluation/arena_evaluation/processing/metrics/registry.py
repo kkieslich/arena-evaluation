@@ -10,6 +10,7 @@ import types
 import typing
 from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 
 import numpy as np
 import polars as pl
@@ -26,6 +27,7 @@ from arena_evaluation.storage.exceptions import (
     SchemaViolationError,
 )
 from arena_evaluation.storage.registry import MetricScope
+from arena_evaluation.storage.registry.null_reasons import NullReason
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
 _METRICS_PACKAGE: typing.Final[str] = "arena_evaluation.processing.metrics."
@@ -190,9 +192,13 @@ class MetricRegistry:
         world: str | None = None,
         metrics_config: dict[str, typing.Any] | None = None,
         calculators: Sequence[type[BaseMetricCalculator]] | None = None,
+        selected: AbstractSet[str] | None = None,
     ):
-        """Register the given calculator classes, or every shipped calculator when none are given."""
+        """Register the given calculator classes, or every shipped calculator when none are given. `selected`
+        (`select_calculators`) runs only those calculators: the others stay registered, so the fact tables keep every
+        column, and publish NULL with `not_selected`; None runs every one."""
         self.robot_params = robot_params
+        self.selected = None if selected is None else frozenset(selected)
         self.world = world
         self.metrics_config = dict(metrics_config or {})
         self.calculators: dict[str, BaseMetricCalculator] = {}
@@ -255,17 +261,14 @@ class MetricRegistry:
             self.execution_stages_by_scope[scope] = self._compute_execution_order(scope)
         self.execution_stages = self.execution_stages_by_scope[MetricScope.EPISODE]
 
+    def is_selected(self, name: str) -> bool:
+        """Whether the calculator `name` runs: every one does without a selection."""
+        return self.selected is None or name in self.selected
+
     def series_calculators(self) -> list[tuple[str, BaseMetricCalculator]]:
-        """Registered calculators publishing a 1NF series table, with their table stem, ordered by stem."""
+        """Selected calculators publishing a 1NF series table, with their table stem, ordered by stem."""
         return sorted(
-            (
-                (
-                    calc.SERIES_TABLE_STEM or _series_table_stem(type(calc).__name__),
-                    calc,
-                )
-                for calc in self.calculators.values()
-                if type(calc).series_table is not BaseMetricCalculator.series_table
-            ),
+            ((series_stem(type(calc)), calc) for calc in self.calculators.values() if type(calc).series_table is not BaseMetricCalculator.series_table and self.is_selected(calc.NAME)),
             key=lambda item: item[0],
         )
 
@@ -345,6 +348,9 @@ class MetricRegistry:
                 calc_idx += 1
                 calc = self.calculators_by_scope[scope][calc_name]
                 scope_keys = calc.output_keys_for_scope(scope)
+                if not self.is_selected(calc_name):
+                    _mark_unavailable(scope_keys, NullReason.NOT_SELECTED.value, published=published, provenance=provenance)
+                    continue
                 reason = _unavailable_reason(
                     calc,
                     scope,
@@ -441,6 +447,43 @@ def shipped_calculators() -> list[type[BaseMetricCalculator]]:
     """Every concrete calculator class of the metrics package, found by importing the package's modules."""
     MetricRegistry.discover_calculators_cls()
     return _leaf_calculator_classes(BaseMetricCalculator)
+
+
+def series_stem(calc: type[BaseMetricCalculator]) -> str:
+    """The stem of the 1NF series table a calculator publishes."""
+    return calc.SERIES_TABLE_STEM or _series_table_stem(calc.__name__)
+
+
+#: Measure names `evaluation process --measures` takes beside calculator names and categories, each with the calculators
+#: it selects. `flow`: the flow measures (`flow_runs`, `flow_cells`, `flow_object_uses`, `flow_map_pairs`), which the
+#: benchmark step computes from the pedestrian track store after the episodes, so they need no calculator.
+MEASURE_SETS: typing.Final[Mapping[str, frozenset[str]]] = types.MappingProxyType({"flow": frozenset()})
+
+
+def select_calculators(measures: Iterable[str], calculators: Sequence[type[BaseMetricCalculator]] | None = None) -> frozenset[str]:
+    """The names of the calculators `measures` select: each measure a calculator NAME, a CATEGORY or a MEASURE_SETS
+    name, closed over the calculators they depend on (DEPENDS_ON, and the publishers of their SERIES_DEPENDS_ON tables).
+    ValueError for a measure that names none of them."""
+    classes = {calc.NAME: calc for calc in (shipped_calculators() if calculators is None else calculators)}
+    publishers = {series_stem(calc): name for name, calc in classes.items() if calc.series_table is not BaseMetricCalculator.series_table}
+    chosen: set[str] = set()
+    for measure in measures:
+        if measure in MEASURE_SETS:
+            chosen |= MEASURE_SETS[measure]
+            continue
+        found = {name for name, calc in classes.items() if measure in (name, calc.CATEGORY)}
+        if not found:
+            known = sorted({*MEASURE_SETS, *classes, *(calc.CATEGORY for calc in classes.values())})
+            raise ValueError(f"measure {measure!r} names no calculator, category or measure set; known: {', '.join(known)}")
+        chosen |= found
+    todo = list(chosen)
+    while todo:
+        calc = classes[todo.pop()]
+        for dep in (*calc.DEPENDS_ON, *(publishers[stem] for stem in calc.SERIES_DEPENDS_ON if stem in publishers)):
+            if dep in classes and dep not in chosen:
+                chosen.add(dep)
+                todo.append(dep)
+    return frozenset(chosen)
 
 
 @functools.cache

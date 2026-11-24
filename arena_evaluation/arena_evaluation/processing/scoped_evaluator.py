@@ -6,6 +6,7 @@ import dataclasses
 import pathlib
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from typing import Any, Final
 
 import numpy as np
@@ -363,10 +364,13 @@ class ScopedEvaluator:
         robot_params: RobotParams,
         metrics_config: Mapping[str, Any] | None = None,
         detector_params: DetectorParams = DEFAULT_DETECTOR_PARAMS,
+        calculators: AbstractSet[str] | None = None,
     ) -> None:
+        """`calculators` (`registry.select_calculators`) runs only those calculators, None every one."""
         self.robot_params = robot_params
         self.metrics_config: dict[str, Any] = dict(metrics_config or {})
         self.detector_params = detector_params
+        self.calculators = None if calculators is None else frozenset(calculators)
 
     @staticmethod
     def _episode_span(robot_tracks: pl.DataFrame | None) -> tuple[int, int, str | None]:
@@ -669,6 +673,7 @@ class ScopedEvaluator:
                 "contact_merge_gap_s": self.detector_params.contact_merge_gap_s,
                 **self.metrics_config,
             },
+            selected=self.calculators,
         )
         robot_key = str(materialized_input.robot_name or "robot")
         topics = materialized_input.topics or {}
@@ -697,7 +702,7 @@ class ScopedEvaluator:
         provenance = dict(ep_outcome.provenance)
         metrics = {
             **episode_metrics,
-            **registry.calculators["mechanism_states"].calculate(materialized, dict(episode_metrics)),
+            **(registry.calculators["mechanism_states"].calculate(materialized, dict(episode_metrics)) if registry.is_selected("mechanism_states") else {}),
         }
 
         contact_rows = self._scope_fact_rows(
