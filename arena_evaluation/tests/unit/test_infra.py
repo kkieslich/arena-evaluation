@@ -1,0 +1,1267 @@
+from __future__ import annotations
+
+import itertools
+import json
+import math
+import pathlib
+
+import numpy as np
+import polars as pl
+import pytest
+
+from arena_evaluation.processing import infra
+from arena_evaluation.processing.ped_track_store import TRACK_SCHEMA
+
+HORIZON = 1500.0
+
+
+def _tracks(peds: list[tuple[str, str, str, float, float]], horizon: float = HORIZON) -> pl.DataFrame:
+    """A track table: each (source_name, seq-key, agent_type, start, end) sampled every 5 s, and an anchor present the
+    whole episode so every other one starts after the first frame and ends before the last."""
+    rows = []
+    everyone = [("", "anchor", "adult", 0.0, horizon), *peds]
+    for i, (source, key, agent_type, start, end) in enumerate(everyone):
+        for t in [*np.arange(start, end, 5.0), end]:
+            rows.append({"episode_id": 0, "time_ns": int(t * 1e9), "t": float(t), "agent_id": i, "key": key if not source else f"{source}#{key}", "name": "", "source_name": source, "source_seq": i, "agent_type": agent_type, "x": 0.0, "y": 0.0, "vx": 0.0, "vy": 0.0, "radius": 0.25})
+    return pl.DataFrame(rows, schema=TRACK_SCHEMA)
+
+
+#: message indices in recording order: every helper call below records later than the ones before it
+_MESSAGES = itertools.count()
+_LOG_SCHEMA = {"t_ns": pl.Int64, "env_id": pl.String, "msg_index": pl.Int64, "entity_name": pl.String, "field_name": pl.String, "value_str": pl.String}
+
+
+def _log(fields: dict[str, str]) -> pl.DataFrame:
+    """A task log table (`episode_fleet_log`) with each field in a message of its own, at its own stamp."""
+    rows = [{"t_ns": i, "env_id": "env_0", "msg_index": next(_MESSAGES), "entity_name": "env_0/fleet", "field_name": k, "value_str": v} for i, (k, v) in enumerate(fields.items())]
+    return pl.DataFrame(rows, schema=_LOG_SCHEMA)
+
+
+LOG = {
+    "t0": "100.000",
+    # before the warm-up: not scored
+    "job.0.kind": "delivery", "job.0.released": "100.000", "job.0.assigned": "100.000", "job.0.ended": "300.000", "job.0.outcome": "completed",
+    "job.1.kind": "delivery", "job.1.released": "500.000", "job.1.assigned": "510.000", "job.1.loaded": "540.000", "job.1.ended": "700.000", "job.1.outcome": "completed", "job.1.wait_s": "40.000", "job.1.timeout_0": "330.000",
+    "job.2.kind": "pickup", "job.2.released": "600.000", "job.2.assigned": "600.000", "job.2.ended": "1000.000", "job.2.outcome": "completed",
+    "job.3.kind": "delivery", "job.3.released": "800.000", "job.3.assigned": "820.000", "job.3.ended": "900.000", "job.3.outcome": "failed", "job.3.reason": "jam",
+    "job.4.kind": "delivery", "job.4.released": "900.000", "job.4.assigned": "900.000", "job.4.ended": "1400.000", "job.4.outcome": "abandoned", "job.4.reason": "timeout",
+    "job.5.kind": "delivery", "job.5.released": "1450.000",
+    "charge.0.robot": "r0", "charge.0.queued": "600.000", "charge.0.dispatched": "630.000", "charge.0.ended": "1100.000", "charge.0.outcome": "charged",
+    "charge.1.robot": "r1", "charge.1.queued": "200.000", "charge.1.dispatched": "200.000",
+    "empty.0.robot": "r1", "empty.0.at": "1200.000",
+}
+
+
+def test_the_fleet_log_is_the_last_value_of_each_field_of_the_fleet_entity() -> None:
+    fields = {**LOG, "job.1.ended": "650.000"}
+    snapshot = pl.concat([_log(LOG), _log({"job.1.ended": "700.000"}).with_columns(pl.col("t_ns") + 1000)])
+    log = infra.log_from_snapshot(snapshot)
+    assert log["job.1.ended"] == "700.000" and log["t0"] == "100.000"
+    assert infra.log_from_snapshot(_log(fields))["job.1.ended"] == "650.000"
+    assert infra.log_from_snapshot(pl.DataFrame()) == {}
+
+
+def test_the_fleet_log_leaves_out_the_previous_episodes_latched_log() -> None:
+    # a recording starts with the log its lane's previous episode left latched (another t0, at time 0), then this
+    # episode's reset publishes its own log: a field only the previous episode wrote must not survive
+    previous = {"t0": "98.635", "job.0.kind": "delivery", "job.0.released": "134.657", "job.0.ended": "1015.317", "job.0.outcome": "abandoned", "charge.3.robot": "r0", "charge.3.started": "314.252", "charge.3.ended": "571.062", "charge.3.outcome": "charged"}
+    own = {"t0": "1600.698", "job.0.kind": "delivery", "job.0.released": "28.179", "charge.3.robot": "r2", "charge.3.queued": "1006.060"}
+    latched = _log(previous).with_columns(pl.lit(0, dtype=pl.Int64).alias("t_ns"))
+    later = _log(own).with_columns(pl.lit(1_600_764_300_000, dtype=pl.Int64).alias("t_ns"))
+    update = _log({"t0": "1600.698", "job.0.assigned": "28.238"}).with_columns(pl.lit(1_628_969_400_000, dtype=pl.Int64).alias("t_ns"))
+    log = infra.log_from_snapshot(pl.concat([latched, later, update]))
+    assert log == {**own, "job.0.assigned": "28.238"}
+    assert infra.jobs(log)[0]["ended"] is None and infra.charges(log)[0]["started"] is None
+
+
+def _message(fields: dict[str, str], time_ns: int) -> pl.DataFrame:
+    """One semantic message's rows of the fleet entity as the reader writes them (`episode_fleet_log`): a row per field,
+    all of one message index."""
+    index = next(_MESSAGES)
+    return _log(fields).with_columns(pl.lit(time_ns, dtype=pl.Int64).alias("t_ns"), pl.lit(index, dtype=pl.Int64).alias("msg_index"))
+
+
+def test_the_fleet_log_leaves_out_a_latched_log_that_shares_the_reset_messages_stamp() -> None:
+    # the latched copy of the previous episode's log and this episode's reset message can carry one stamp; the latched
+    # copy comes first in the recording, so its jobs, jam and top-ups must not survive (infra_eval_x_i2 episode_002)
+    previous = {"t0": "1595.303", **{f"job.{j}.{k}": v for j in range(1, 5) for k, v in (("kind", "delivery"), ("released", f"{100 * j}.000"), ("outcome", "failed"), ("reason", "jam"))},
+                "jam.0.job": "3", "jam.0.target": "locker_0", "top_up.0.dispatched": "900.000", "top_up.0.started": "950.000", "top_up.1.dispatched": "1200.000", "top_up.1.ended": "1300.000"}
+    own = {"t0": "3096.401", "job.0.kind": "delivery", "job.0.released": "174.891"}
+    stamp, later = 3_096_400_500_000, 3_271_292_100_000
+    snapshot = pl.concat([_message(previous, stamp), _message({"t0": "3096.401"}, stamp), _message(own, later)])
+    log = infra.log_from_snapshot(snapshot)
+    assert log == own
+    assert len(infra.jobs(log)) == 1 and infra.top_ups(log) == [] and not any(k.startswith("jam.") for k in log)
+    # with the messages delimited, the boundary is the reset message's first row, wherever its t0 lies in it
+    reset = {"job.0.kind": "delivery", "t0": "3096.401", "job.0.released": "0.500"}
+    log = infra.log_from_snapshot(pl.concat([_message(previous, stamp), _message(reset, stamp)]))
+    assert log == reset
+    # a later message of the same stamp still counts
+    log = infra.log_from_snapshot(pl.concat([_message(previous, stamp), _message({"t0": "3096.401"}, stamp), _message(own, stamp)]))
+    assert log == own
+
+
+def test_service_scores_the_jobs_released_after_the_warm_up() -> None:
+    s = infra.service(LOG, warmup_s=420.0, episode_s=1500.0)
+    assert (s["jobs_released"], s["jobs_completed"], s["jobs_failed"], s["jobs_abandoned"], s["jobs_open"], s["jobs_jammed"]) == (5, 2, 1, 1, 1, 1)
+    # T is the restricted mean up to 1080 s: completions at 200 and 400 s, censored at 50 (open), 100 (jam) and 500 s (abandoned)
+    assert s["task_time_s"] == pytest.approx(560.0)
+    assert s["task_time_completed_s"] == pytest.approx((200.0 + 400.0) / 2)
+    assert (s["task_time_tau_s"], s["completed_share"], s["censored_share"]) == (1080.0, pytest.approx(0.4), pytest.approx(0.6))
+    assert s["busy_s_per_job"] == pytest.approx((190.0 + 400.0) / 2)
+    assert s["assign_wait_s"] == pytest.approx((10.0 + 0.0) / 2) and s["dock_wait_s"] == pytest.approx(40.0)
+    assert infra.jobs(LOG)[1]["timeout_0"] == 330.0
+    assert s["success_rate"] == pytest.approx(2 / 4) and s["jam_share"] == pytest.approx(1 / 4)
+    assert (s["charges"], s["charger_queue_s"], s["charge_s"]) == (1, pytest.approx(30.0), pytest.approx(470.0))
+    # a log without top-ups (before they existed) has none
+    assert (s["top_ups"], s["top_up_s"]) == (0, 0.0)
+    assert s["tasks_per_h"] == pytest.approx(2 / ((1500.0 - 420.0) / 3600.0))
+    assert s["empty_batteries"] == 1
+    assert infra.service({}, warmup_s=420.0)["task_time_s"] is None
+
+
+TOP_UPS = {
+    # before the warm-up: not scored
+    "top_up.0.robot": "r2", "top_up.0.charger": "charger_1", "top_up.0.dispatched": "300.000", "top_up.0.started": "500.000", "top_up.0.ended": "500.000", "top_up.0.outcome": "docked",
+    # docked after a 360 s trip: free for jobs from then on, its charging there is no time out of service
+    "top_up.1.robot": "r0", "top_up.1.soc_dispatched": "47.60", "top_up.1.charger": "charger_1", "top_up.1.dispatched": "700.000", "top_up.1.started": "1060.000", "top_up.1.soc_start": "29.00", "top_up.1.ended": "1060.000", "top_up.1.outcome": "docked", "top_up.1.soc_end": "29.00",
+    # given up on its way after 100 s, to a robot queued to charge
+    "top_up.2.robot": "r1", "top_up.2.charger": "charger_2", "top_up.2.dispatched": "800.000", "top_up.2.ended": "900.000", "top_up.2.outcome": "abandoned", "top_up.2.reason": "yielded", "top_up.2.yielded_to": "r3",
+    # still on its way at the episode end
+    "top_up.3.robot": "r2", "top_up.3.charger": "charger_1", "top_up.3.dispatched": "1450.000",
+}
+
+
+def test_service_counts_each_top_up_trip_as_time_out_of_service() -> None:
+    s = infra.service({**LOG, **TOP_UPS}, warmup_s=420.0, episode_s=1500.0)
+    assert (s["top_ups"], s["top_up_s"]) == (3, pytest.approx(360.0 + 100.0))
+    assert [infra.top_up_trip_s(t) for t in infra.top_ups(TOP_UPS)] == [200.0, 360.0, 100.0, None]
+    # everything else as without the top-ups
+    plain = infra.service(LOG, warmup_s=420.0, episode_s=1500.0)
+    assert {**s, "top_ups": 0, "top_up_s": 0.0} == plain
+
+
+SITE = [("south_adult", "1", "adult", 500.0, 800.0), ("south_wheelchair", "2", "wheelchair_manual", 500.0, 900.0), ("north_long_cane", "3", "blind_white_cane", 600.0, 1100.0), ("south_adult", "9", "adult", 100.0, 300.0)]
+
+
+def test_cost_splits_the_extra_travel_time_into_element_and_traffic_parts() -> None:
+    site = _tracks(SITE)
+    # without robots: the adult 30 s and the wheelchair 40 s slower; with robots 20 s and 60 s more; the cane user does
+    # not finish with robots and drops; a locker visitor walks without and with robots
+    off = _tracks([("south_adult", "1", "adult", 500.0, 830.0), ("south_wheelchair", "2", "wheelchair_manual", 500.0, 940.0), ("north_long_cane", "3", "blind_white_cane", 600.0, 1100.0), ("south_locker_wheelchair", "7", "./types/locker_visitor__south_wheelchair.yaml", 450.0, 850.0)])
+    on = _tracks([("south_adult", "1", "adult", 500.0, 850.0), ("south_wheelchair", "2", "wheelchair_manual", 500.0, 1000.0), ("north_long_cane", "3", "blind_white_cane", 600.0, 1500.0), ("south_locker_wheelchair", "7", "./types/locker_visitor__south_wheelchair.yaml", 450.0, 950.0)])
+    c = infra.cost(site, off, on, visitor_sources=["south_locker_wheelchair"], warmup_s=420.0)
+    adult, chair = c["groups"]["adult"], c["groups"]["wheelchair"]
+    assert adult["peds"] == 1 and adult["total"] == pytest.approx(50.0 / 300.0) and adult["element"] == pytest.approx(30.0 / 300.0) and adult["traffic"] == pytest.approx(20.0 / 300.0)
+    assert chair["total"] == pytest.approx(100.0 / 400.0) and chair["element"] + chair["traffic"] == pytest.approx(chair["total"])
+    assert chair["delay_s"] == pytest.approx(100.0) and adult["site_travel_s"] == pytest.approx(300.0)
+    assert c["groups"]["long_cane"]["peds"] == 0 and c["groups"]["long_cane"]["dropped"] == 1 and c["groups"]["long_cane"]["total"] is None
+    assert (c["c_worst"], c["worst_group"]) == (pytest.approx(0.25), "wheelchair")
+    # the pedestrian spawned before the warm-up is left out, the visitor is reported apart
+    assert set(c["groups"]) == {"adult", "wheelchair", "long_cane"}
+    assert c["visitors"] == {"wheelchair": {"peds": 1, "walk_s": pytest.approx(400.0), "paired": 1, "traffic": pytest.approx(100.0 / 400.0)}}
+    # without the robot run, the total is the element part
+    element = infra.cost(site, off, None, warmup_s=420.0)
+    assert element["groups"]["adult"]["total"] == pytest.approx(30.0 / 300.0) and element["groups"]["adult"]["traffic"] is None
+
+
+def _table(rows: list[dict]) -> pl.DataFrame:
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _row(layout: str, roles: str, seed: int, t: float, c: dict[str, float], ranking: float | None = None, jam: float = 0.0) -> dict:
+    return {"layout_id": layout, "world": f"site__layout_{layout}", "seed": seed, "roles": roles, "ranking_score": ranking, "travel_m": 10.0, "complete": True, "task_time_s": t, "jam_share": jam, "success_rate": 1.0, **{f"C_{g}": v for g, v in c.items()}, "c_worst": max(c.values())}
+
+
+def test_the_pick_is_the_lowest_c_worst_joint_layout_and_flags_a_slow_one() -> None:
+    rows = []
+    for seed in (1, 2, 3):
+        rows += [
+            _row("robot", "robot_only", seed, 300.0 + seed, {"adult": 0.10, "wheelchair": 0.30, "long_cane": 0.20}, 9.0),
+            _row("fast", "joint", seed, 310.0, {"adult": 0.05, "wheelchair": 0.20, "long_cane": 0.10}, 1.0),
+            _row("best", "joint", seed, 312.0, {"adult": 0.05, "wheelchair": 0.08, "long_cane": 0.12}, 2.0),
+            _row("slow", "joint", seed, 400.0, {"adult": 0.01, "wheelchair": 0.01, "long_cane": 0.01}, 3.0),
+            _row("jammed", "joint", seed, 305.0, {"adult": 0.0, "wheelchair": 0.0, "long_cane": 0.0}, 4.0, jam=0.3),
+            _row("rand", "random", seed, 500.0, {"adult": 0.4, "wheelchair": 0.5, "long_cane": 0.6}, 8.0),
+        ]
+    means = infra.layout_means(_table(rows))
+    by = {r["layout_id"]: r for r in means.to_dicts()}
+    assert by["robot"]["task_time_s"] == pytest.approx(302.0) and by["robot"]["seeds"] == 3
+    assert by["best"]["c_worst_of_means"] == pytest.approx(0.12) and by["best"]["worst_group_of_means"] == "long_cane"
+    assert by["robot"]["T_lo"] <= 302.0 <= by["robot"]["T_hi"]
+    chosen = infra.pick(means)
+    assert chosen["robot_only"] == "robot" and chosen["task_time_cap_s"] == pytest.approx(1.05 * 302.0)
+    # equal service is the search's travel pre-filter: a slow layout is flagged, not dropped; jams still drop one
+    assert chosen["joint_pick"] == "slow" and chosen["joint_pick_t_over"] is True
+    by_id = {c["layout_id"]: c for c in chosen["joint"]}
+    assert by_id["jammed"]["excluded"].startswith("jams 30%") and by_id["slow"]["excluded"] is None and by_id["best"]["excluded"] is None
+    assert by_id["slow"]["t_over"] and not by_id["best"]["t_over"] and not by_id["fast"]["t_over"]
+    rows = [r for r in rows if r["layout_id"] != "slow"]
+    assert infra.pick(infra.layout_means(_table(rows)))["joint_pick"] == "best"
+    check = infra.forecaster_check(means)
+    assert check["layouts"] == 5 and check["spearman"] == pytest.approx(infra.spearman([1.0, 2.0, 3.0, 4.0, 8.0], [0.2, 0.12, 0.01, 0.0, 0.6]))
+
+
+def test_spearman_handles_ties_and_too_few_pairs() -> None:
+    assert infra.spearman([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
+    assert infra.spearman([1, 2, 3, 4], [4, 3, 2, 1]) == pytest.approx(-1.0)
+    assert infra.spearman([1, 1, 2, 3], [1, 2, 3, 4]) == pytest.approx(np.corrcoef([1.5, 1.5, 3, 4], [1, 2, 3, 4])[0, 1])
+    assert math.isnan(infra.spearman([1, 2], [1, 2])) and math.isnan(infra.spearman([1, 1, 1], [1, 2, 3]))
+
+
+def test_compare_takes_per_seed_differences_with_intervals_and_holm() -> None:
+    rows = []
+    rng = np.random.default_rng(1)
+    for seed in range(11, 21):
+        rows.append(_row("robot", "robot_only", seed, 300.0, {"adult": 0.10, "wheelchair": 0.40, "long_cane": 0.30}))
+        rows.append(_row("joint", "joint", seed, 300.0 + rng.normal(0, 2), {"adult": 0.09 + rng.normal(0, 0.005), "wheelchair": 0.15 + rng.normal(0, 0.01), "long_cane": 0.29 + rng.normal(0, 0.01)}))
+    result = infra.compare(_table(rows), {"joint": "joint", "robot_only": "robot"}, n_boot=2000)
+    assert result["seeds"] == list(range(11, 21))
+    d = result["delta_c_worst"]
+    assert d["ci_high"] < 0 and d["seeds"] == 10 and result["h1_holds"]
+    assert abs(result["delta_t_rel"]["estimate"]) < 0.05
+    wheel, cane = result["delta_aid_minus_adult"]["wheelchair"], result["delta_aid_minus_adult"]["long_cane"]
+    assert wheel["holds"] and wheel["ci_high"] < 0
+    assert not cane["holds"]
+    assert result["verdict"] == "lower" and result["delta"] == infra.DELTA
+    # equal service is the search's travel pre-filter: measured T is reported, it does not decide H1
+    slow = [{**r, "task_time_s": r["task_time_s"] * 1.2} if r["layout_id"] == "joint" else r for r in rows]
+    slowed = infra.compare(_table(slow), {"joint": "joint", "robot_only": "robot"}, n_boot=500)
+    assert slowed["h1_holds"] and slowed["delta_t_rel"]["estimate"] == pytest.approx(0.2, abs=0.02)
+
+
+def test_compare_calls_a_difference_within_the_margin_equivalent_and_a_wide_one_inconclusive() -> None:
+    rng = np.random.default_rng(2)
+    rows = []
+    for seed in range(11, 21):
+        base = {"adult": 0.10, "wheelchair": 0.20, "long_cane": 0.15}
+        rows.append(_row("robot", "robot_only", seed, 300.0, base))
+        rows.append(_row("joint", "joint", seed, 300.0, {g: v + rng.normal(0, 0.002) for g, v in base.items()}))
+        rows.append(_row("guide", "guideline", seed, 330.0, {g: v + 0.05 + rng.normal(0, 0.002) for g, v in base.items()}))
+        rows.append(_row("noisy", "joint", seed, 300.0, {g: v + rng.normal(0, 0.05) for g, v in base.items()}))
+    table = _table(rows)
+    same = infra.compare(table, {"joint": "joint", "robot_only": "robot", "guideline": "guide"}, n_boot=2000)
+    assert same["verdict"] == "equivalent" and not same["h1_holds"]
+    d90 = same["delta_c_worst_90"]
+    assert -infra.DELTA < d90["ci_low"] <= d90["ci_high"] < infra.DELTA
+    assert same["delta_c_worst"]["ci_low"] <= d90["ci_low"] and d90["ci_high"] <= same["delta_c_worst"]["ci_high"]  # 90 % inside 95 %
+    guide = same["guideline"]
+    assert set(guide) == {"joint_minus_guideline", "robot_only_minus_guideline"}
+    for c in guide.values():
+        assert c["verdict"] == "lower" and c["delta_c_worst"]["ci_high"] < 0 and c["p_holm"] < 0.05 and c["b"] == "guide"
+    assert guide["joint_minus_guideline"]["delta_t_rel"]["estimate"] == pytest.approx(-30.0 / 330.0, abs=1e-6)
+    wide = infra.compare(table, {"joint": "noisy", "robot_only": "robot"}, n_boot=2000)
+    assert wide["verdict"] == "inconclusive" and "guideline" not in wide
+
+
+def test_the_score_check_ranks_the_selection_layouts_by_predicted_exposure() -> None:
+    rows = []
+    for seed in (1, 2):
+        for i, (layout, roles) in enumerate([("robot", "robot_only"), *((f"j{k}", "joint") for k in range(10)), *((f"r{k}", "random") for k in range(5))]):
+            c = 0.01 * (i + 1)
+            row = _row(layout, roles, seed, 300.0, {"adult": c / 2, "wheelchair": c, "long_cane": c / 3}, ranking=float(i))
+            row |= {"pred_adult": 99.0, "pred_traffic_adult": float(i), "pred_traffic_wheelchair": float(-i), "pred_traffic_long_cane": float(i), **{f"C_{g}_traffic": c for g in ("adult", "wheelchair", "long_cane")}}
+            rows.append(row)
+    means = infra.layout_means(_table(rows))
+    check = infra.score_check(means, n_perm=2000)
+    assert check["layouts"] == 16 and check["spearman"] == pytest.approx(1.0) and check["p"] < 0.01 and check["holds"]
+    assert check["groups"]["adult"]["spearman"] == pytest.approx(1.0) and check["groups"]["wheelchair"]["spearman"] == pytest.approx(-1.0)
+    assert check["groups"]["wheelchair"]["p"] > 0.9 and check["groups"]["adult"]["predicted"] == "pred_traffic_adult"  # the traffic term, not the total
+    rho, p, n = infra.permutation_p([1.0, 2.0], [1.0, 2.0])
+    assert math.isnan(rho) and math.isnan(p) and n == 2
+    # one prediction of all walkers serves every group
+    rows = [{k: v for k, v in r.items() if not k.startswith("pred_")} | {"pred_traffic_all": r["ranking_score"]} for r in rows]
+    assert infra.score_check(infra.layout_means(_table(rows)), n_perm=200)["groups"]["long_cane"]["predicted"] == "pred_traffic_all"
+
+
+def test_conflict_exposure_counts_walkers_near_a_driving_robot() -> None:
+    # a robot drives along y = 0 at 1 m/s from t 400 to 600 s; walker a stands on its line at x = 100 (passed at 500 s),
+    # walker b stands 5 m off it, walker c (wheelchair) on the line at x = 150, spawned after the warm-up
+    rows = []
+    for t in np.arange(0.0, 1000.0, 0.5):
+        for i, (key, agent, x, y, start) in enumerate((("a", "adult", 100.0, 0.0, 0.0), ("b", "adult", 100.0, 5.0, 0.0), ("c", "wheelchair_manual", 150.0, 0.0, 450.0))):
+            if t >= start:
+                rows.append({"episode_id": 0, "time_ns": int((t + 50.0) * 1e9), "t": float(t), "agent_id": i, "key": key, "name": "", "source_name": "s", "source_seq": i, "agent_type": agent, "x": x, "y": y, "vx": 0.0, "vy": 0.0, "radius": 0.25})
+    tracks = pl.DataFrame(rows, schema=TRACK_SCHEMA)
+    times = np.arange(0.0, 1000.0, 0.1)
+    rx = np.clip(times - 400.0, 0.0, 200.0)
+    robot = pl.DataFrame({"time_ns": ((times + 50.0) * 1e9).astype(np.int64), "x": rx, "y": np.zeros_like(times)})
+    out = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": robot}, 420.0).iter_rows(named=True)}
+    # within 1 m of a robot at 1 m/s: 2 s for a, none for b (5 m off), 2 s for c
+    assert out["adult"]["walkers"] == 2 and out["adult"]["exposed_s"] == pytest.approx(2.0, abs=0.6) and out["adult"]["exposure_s"] == pytest.approx(1.0, abs=0.3)
+    assert out["wheelchair"]["walkers"] == 1 and out["wheelchair"]["exposure_s"] == pytest.approx(2.0, abs=0.6)
+    # within the joint ranking's 2 m band: 4 s for a and c, still none for b
+    wide = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": robot}, 420.0, band_m=infra.PREDICTION_BAND_M).iter_rows(named=True)}
+    assert wide["adult"]["exposed_s"] == pytest.approx(4.0, abs=0.6) and wide["wheelchair"]["exposure_s"] == pytest.approx(4.0, abs=0.6)
+    # a parked robot exposes nobody, and before the warm-up nothing counts
+    parked = robot.with_columns(pl.lit(100.0).alias("x"))
+    assert infra.conflict_exposure(tracks, {"jackal_0": parked}, 420.0)["exposed_s"].sum() == 0.0
+    assert infra.conflict_exposure(tracks, {"jackal_0": robot}, 700.0)["exposed_s"].sum() == 0.0
+    assert infra.conflict_exposure(tracks.head(0), {"jackal_0": robot}, 420.0).is_empty()
+    # a repeated stamp in a robot track changes nothing (deduplicated before the speed)
+    repeated = robot.with_columns(pl.when(pl.int_range(pl.len()) == 5001).then(pl.col("time_ns").shift(1)).otherwise(pl.col("time_ns")).alias("time_ns"))
+    assert repeated["time_ns"].n_unique() == len(repeated) - 1
+    again = {r["group"]: r for r in infra.conflict_exposure(tracks, {"jackal_0": repeated}, 420.0).iter_rows(named=True)}
+    assert again["adult"]["exposed_s"] == pytest.approx(out["adult"]["exposed_s"], abs=0.6)
+    # without robot tracks nothing is measured: None, not 0
+    none = infra.conflict_exposure(tracks, {}, 420.0)
+    assert none["exposed_s"].null_count() == len(none) and none["exposure_s"].null_count() == len(none) and none["walkers"].to_list() == [2, 1]
+
+
+def test_group_cells_sum_the_walker_seconds_per_group_and_cell(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = []
+    for t in np.arange(0.0, 10.0, 0.5):
+        rows.append({"episode_id": 0, "time_ns": int(t * 1e9), "t": float(t), "agent_id": 0, "key": "a", "name": "", "source_name": "s", "source_seq": 0, "agent_type": "adult", "x": 1.1, "y": 2.2, "vx": 0.0, "vy": 0.0, "radius": 0.25})
+        rows.append({"episode_id": 0, "time_ns": int(t * 1e9), "t": float(t), "agent_id": 1, "key": "w", "name": "", "source_name": "s", "source_seq": 1, "agent_type": "wheelchair_manual", "x": 1.4, "y": 2.4, "vx": 0.0, "vy": 0.0, "radius": 0.3})
+    tracks = pl.DataFrame(rows, schema=TRACK_SCHEMA)
+    cells = infra.group_cells(tracks, 0.5)
+    assert cells.sort("group").to_dicts() == [
+        {"group": "adult", "x": 1.25, "y": 2.25, "cell_m": 0.5, "ped_seconds": pytest.approx(10.0)},
+        {"group": "wheelchair", "x": 1.25, "y": 2.25, "cell_m": 0.5, "ped_seconds": pytest.approx(10.0)},
+    ]
+    site = _benchmark(tmp_path / "site", [("peds_only", "site__s1", 1, None), ("peds_only", "site__s2", 2, None)])
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda episode_dir, env: tracks)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
+    occ = infra.occupancy(site)
+    assert occ.columns == ["world", "stage", "planner", "group", "x", "y", "cell_m", "ped_seconds"]
+    assert sorted(set(occ["stage"])) == ["site__s1", "site__s2"] and set(occ["world"]) == {"site"} and occ["ped_seconds"].sum() == pytest.approx(40.0)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: False)
+    monkeypatch.setattr(infra, "track_problem", lambda episode_dir, env: "a copy")
+    with pytest.raises(FileNotFoundError, match="no walker tracks"):
+        infra.occupancy(site)
+
+
+def _premise_rows(narrow: dict, wide: dict) -> list[dict]:
+    """Premise rows at seeds 1-3: the narrow layout `n1` and the wide `w1` by their premise roles, with C_worst per seed
+    and the service fields in `narrow` and `wide`."""
+    rows = []
+    for seed, (a, b) in enumerate([(0.10, 0.30), (0.12, 0.31), (0.11, 0.29)], start=1):
+        rows.append({"layout_id": "n1", "roles": "narrow", "seed": seed, "c_worst": b, **narrow})
+        rows.append({"layout_id": "w1", "roles": "wide", "seed": seed, "c_worst": a, **wide})
+    return rows
+
+
+def test_the_premise_check_compares_c_worst_with_the_seed_spread_and_measures_the_rate_in_the_wide_layout() -> None:
+    rows = _premise_rows({"jobs_completed": 10, "busy_s_per_job": 400.0, "charge_s": 600.0}, {"jobs_completed": 10, "busy_s_per_job": 200.0, "charge_s": 300.0})
+    result = infra.premise(_table(rows))
+    assert result["c_worst_gap"] == pytest.approx(0.30 - 0.11) and not result["raise_density"]
+    # the wide layout: 200 s per job plus 900 s of charging over 30 jobs; the narrow one's capacity is reported beside it
+    assert result["rate_layout"] == "w1" and result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (200.0 + 30.0), 2))
+    assert result["layouts"]["n1"]["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (400.0 + 60.0), 2))
+    assert result["layouts"]["w1"]["roles"] == ["wide"] and result["layouts"]["n1"]["roles"] == ["narrow"]
+    close = [{**r, "c_worst": 0.2 + 0.05 * (r["seed"] % 2)} for r in rows]
+    assert infra.premise(_table(close))["raise_density"]
+
+
+def test_the_premise_capacity_counts_top_up_trips_as_time_out_of_service() -> None:
+    narrow, wide = {"jobs_completed": 10, "busy_s_per_job": 400.0, "charge_s": 600.0}, {"jobs_completed": 10, "busy_s_per_job": 200.0, "charge_s": 300.0}
+    result = infra.premise(_table(_premise_rows({**narrow, "top_up_s": 0.0}, {**wide, "top_up_s": 450.0})))
+    # the wide layout: 200 s per job plus 900 s of charging and 1350 s of top-up trips over 30 jobs
+    assert result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (200.0 + (900.0 + 1350.0) / 30), 2))
+    assert (result["layouts"]["w1"]["charge_s"], result["layouts"]["w1"]["top_up_s"]) == (900.0, 1350.0)
+    # without top-ups, or on a table from before they existed, the rate is the old one to the bit
+    old = infra.premise(_table(_premise_rows(narrow, wide)))
+    zero = infra.premise(_table(_premise_rows({**narrow, "top_up_s": 0.0}, {**wide, "top_up_s": 0.0})))
+    assert old["rate_per_h"] == zero["rate_per_h"] == round(0.75 * 4 * 3600 / (200.0 + 900.0 / 30), 2)
+    assert old["layouts"]["w1"]["busy_s_per_job"] == zero["layouts"]["w1"]["busy_s_per_job"]
+    assert old["layouts"]["n1"]["top_up_s"] == 0.0
+
+
+def test_the_premise_rate_comes_from_the_wide_layout_by_its_role_whichever_is_faster() -> None:
+    # the narrow layout measured faster here: the rate still comes from the wide one, not from the slower or the faster
+    rows = _premise_rows({"jobs_completed": 10, "busy_s_per_job": 150.0, "charge_s": 0.0}, {"jobs_completed": 10, "busy_s_per_job": 300.0, "charge_s": 0.0})
+    result = infra.premise(_table(rows))
+    assert result["rate_layout"] == "w1" and result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / 300.0, 2))
+
+
+def test_a_narrow_layout_without_a_completed_job_keeps_its_cost_in_the_premise_check() -> None:
+    rows = _premise_rows({"jobs_completed": 0, "busy_s_per_job": None, "charge_s": 1200.0}, {"jobs_completed": 9, "busy_s_per_job": 250.0, "charge_s": 900.0})
+    result = infra.premise(_table(rows))
+    assert result["layouts"]["n1"]["rate_per_h"] is None and result["layouts"]["n1"]["jobs_completed"] == 0
+    # its C_worst still counts in the gap
+    assert result["c_worst_gap"] == pytest.approx(0.30 - 0.11) and result["layouts"]["n1"]["c_worst"] == pytest.approx(0.30)
+    assert result["rate_layout"] == "w1" and result["rate_per_h"] == pytest.approx(round(0.75 * 4 * 3600 / (250.0 + 2700.0 / 27), 2))
+
+
+def test_the_premise_check_needs_exactly_one_wide_layout() -> None:
+    rows = _premise_rows({"jobs_completed": 10, "busy_s_per_job": 400.0, "charge_s": 0.0}, {"jobs_completed": 10, "busy_s_per_job": 200.0, "charge_s": 0.0})
+    with pytest.raises(ValueError, match="role 'wide', and 0 layouts have it"):
+        infra.premise(_table([{**r, "roles": "narrow"} for r in rows]))
+    with pytest.raises(ValueError, match="role 'wide', and 0 layouts have it"):
+        infra.premise(_table([{k: v for k, v in r.items() if k != "roles"} for r in rows]))
+    with pytest.raises(ValueError, match="role 'wide', and 2 layouts have it"):
+        infra.premise(_table([{**r, "roles": "wide"} for r in rows]))
+
+
+def test_the_figure_draws_one_point_per_layout(tmp_path: pathlib.Path) -> None:
+    rows = [_row(layout, roles, seed, t + seed, c) for seed in (1, 2) for layout, roles, t, c in (("robot", "robot_only", 300.0, {"adult": 0.1}), ("j", "joint", 310.0, {"adult": 0.05}), ("r", "random", 400.0, {"adult": 0.3}))]
+    means = infra.layout_means(_table(rows))
+    out = infra.figure(means, infra.pick(means), tmp_path / "plots" / infra.FIGURE_FILE)
+    assert out.is_file() and out.stat().st_size > 10_000
+
+
+def _episode(root: pathlib.Path, episode: int, planner: str, stage: str, *, robots: tuple[str, ...] | None = ("env_0_jackal_0", "env_0_jackal_1"), reference_type: str | None = None) -> pathlib.Path:
+    """One processed episode dir: its `episode_NNN.yaml` and, unless `robots` is None (an episode `evaluation process`
+    could not evaluate), its fact rows, one per robot."""
+    from arena_evaluation.storage.schemas import RunMetadata
+
+    episode_dir = root / "episodes" / f"episode_{episode:03d}"
+    (episode_dir / "topics").mkdir(parents=True, exist_ok=True)
+    reference = reference_type or ("unhindered_peds" if planner == "unhindered_peds" else None)
+    metadata = RunMetadata(benchmark_id=root.name, planner=planner, map="site", stage=stage, episode_id=episode, recording_started_at="2026-01-01T00:00:00", python_version="3.12", ros_distro="jazzy", modes={}, params={}, is_reference=reference is not None, reference_type=reference)
+    (episode_dir / f"episode_{episode:03d}.yaml").write_text(json.dumps(metadata.model_dump(mode="json")))
+    if robots is not None:
+        (episode_dir / "metrics").mkdir(exist_ok=True)
+        pl.DataFrame({"run_id": [root.name] * len(robots), "episode_id": [episode] * len(robots), "robot_id": list(robots)}).write_parquet(episode_dir / "metrics" / "fact_episodes.parquet")
+    return episode_dir
+
+
+def _benchmark(root: pathlib.Path, runs: list[tuple[str, str, int, pl.DataFrame | None]]) -> pathlib.Path:
+    """A processed benchmark dir: each episode's yaml (planner, stage), its fact rows (one per robot) and its task log
+    table; the tracks come from the monkeypatched track store."""
+    root.mkdir(parents=True)
+    for episode, (planner, stage, _, snapshot) in enumerate(runs):
+        topics = _episode(root, episode, planner, stage) / "topics"
+        if snapshot is not None:
+            # stamped on the sim clock, where the log's t0 (100 s in LOG) lies
+            snapshot.with_columns(pl.col("t_ns") + 100_000_000_000).write_parquet(topics / infra.FLEET_LOG_FILE)
+    return root
+
+
+def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    site = _benchmark(tmp_path / "site", [("peds_only", "site__s1", 1, None), ("peds_only", "site__s2", 2, None)])
+    layout_runs = []
+    tracks: dict[tuple[str, int], pl.DataFrame] = {}
+    for layout, slow in (("aaaa", 30.0), ("bbbb", 10.0)):
+        for seed in (1, 2):
+            layout_runs.append(("fleet_dwb", f"site__layout_{layout}__s{seed}", seed, _log({**LOG, "job.3.reason": "no path"})))
+            layout_runs.append(("unhindered_peds", f"site__layout_{layout}__s{seed}", seed, None))
+    layouts = _benchmark(tmp_path / "sel", layout_runs)
+    shift = {"aaaa": 30.0, "bbbb": 10.0}
+
+    def fake(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        bench = episode_dir.parent.parent
+        episode = int(episode_dir.name.split("_")[1])
+        if bench == site:
+            return _tracks(SITE)
+        planner, stage = layout_runs[episode][0], layout_runs[episode][1]
+        extra = shift[stage.split("_layout_")[1][:4]] * (2 if planner == "fleet_dwb" else 1)
+        return _tracks([(s, k, a, start, end + extra) for s, k, a, start, end in SITE])
+
+    monkeypatch.setattr(infra, "tracks_for_episode", fake)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
+    manifest = tmp_path / "infra_h1.layouts.json"
+    manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
+    args = argparse.Namespace(infra="pick", site=site, layouts=layouts, manifest=manifest, warmup=None, tau=None, output_dir=None, out=None, boot=200)
+    assert infra.infra_command(args) == 0
+    table = pl.read_parquet(layouts / infra.TABLE_FILE)
+    assert len(table) == 4 and table["complete"].all()
+    assert table.filter(pl.col("layout_id") == "aaaa")["C_adult"].to_list() == pytest.approx([60.0 / 300.0] * 2)
+    assert table.filter(pl.col("layout_id") == "aaaa")["C_adult_element"].to_list() == pytest.approx([30.0 / 300.0] * 2)
+    assert table["task_time_completed_s"].to_list() == pytest.approx([300.0] * 4)
+    assert table["task_time_s"].to_list() == pytest.approx([560.0] * 4)
+    chosen = json.loads((layouts / "infra_pick.json").read_text())
+    assert (chosen["robot_only"], chosen["joint_pick"]) == ("aaaa", "bbbb")
+    assert chosen["score_check"]["layouts"] <= 2 and "groups" in chosen["score_check"]
+    assert table.filter(pl.col("layout_id") == "aaaa")["exposure_adult_s"].to_list() == [None, None]  # no robot tracks: not measured
+    assert table.filter(pl.col("layout_id") == "aaaa")[f"exposure_adult_{infra.PREDICTION_BAND_TAG}_s"].to_list() == [None, None]
+    assert (layouts / "plots" / infra.FIGURE_FILE).is_file()
+    printed = capsys.readouterr().out
+    assert "joint pick: bbbb" in printed and "C_adult" in printed
+    with pytest.raises(FileNotFoundError, match="no episodes/"):
+        infra.runs(tmp_path)
+    # a stage the runner ran twice (the failed attempt kept its recording) is refused, not read silently
+    _episode(layouts, 99, "fleet_dwb", "site__layout_aaaa__s1")
+    with pytest.raises(ValueError, match="stage site__layout_aaaa__s1 has more than one usable run"):
+        infra.infra_command(args)
+
+
+def test_the_restricted_mean_counts_censored_jobs_up_to_the_horizon() -> None:
+    # no censoring: the mean of the times cut at the horizon
+    assert infra.restricted_mean([100.0, 300.0, 2000.0], [True, True, True], 1000.0) == pytest.approx((100.0 + 300.0 + 1000.0) / 3)
+    # a job censored at 500 s keeps the curve at its level beyond its last completion
+    assert infra.restricted_mean([100.0, 500.0], [True, False], 1000.0) == pytest.approx(100.0 + 0.5 * 900.0)
+    # dropping the open jobs (the plain mean) would read 100 s; ties put completions before censorings
+    assert infra.restricted_mean([200.0, 200.0], [True, False], 1000.0) == pytest.approx(200.0 + 0.5 * 800.0)
+    assert infra.restricted_mean([], [], 1000.0) is None
+
+
+def test_runs_leave_out_failed_attempts_and_robot_references_and_a_stage_run_twice_is_refused(tmp_path: pathlib.Path) -> None:
+    root = tmp_path / "bench"
+    # episode 0 has no fact rows (its processing failed, a failed attempt the runner retried); 3 is a run without any
+    # robot (the crowd-only contestant's: one fact row named by its env)
+    _episode(root, 0, "fleet_dwb", "w__s1", robots=None)
+    _episode(root, 1, "fleet_dwb", "w__s1", robots=("env_0_jackal_0",))
+    _episode(root, 2, "fleet_dwb_unobstructed_robot", "w__s1", robots=("env_0_jackal_0",), reference_type="unobstructed_robot")
+    _episode(root, 3, "unhindered_peds", "w__s1", robots=("env_0",))
+    _episode(root, 4, "unhindered_peds", "w__s2", robots=("env_0_jackal_0",))
+    _episode(root, 5, "unhindered_peds", "w__s2", robots=("env_0_jackal_0",))
+    found = infra.runs(root)
+    assert [(r.planner, r.stage, r.episode) for r in found] == [("fleet_dwb", "w__s1", 1), ("unhindered_peds", "w__s1", 3), ("unhindered_peds", "w__s2", 4), ("unhindered_peds", "w__s2", 5)]
+    assert infra.unique([r for r in found if r.stage == "w__s1" and r.planner == "fleet_dwb"], "here").episode == 1
+    assert infra.unique([], "here") is None
+    with pytest.raises(ValueError, match=r"stage w__s2 has more than one usable run \(episode_004 \(env_0\), episode_005 \(env_0\)\)"):
+        infra.unique([r for r in found if r.stage == "w__s2"], "here")
+
+
+def _selection(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: dict[str, tuple[str, ...]]) -> tuple[pathlib.Path, dict[str, pathlib.Path], pathlib.Path]:
+    """The site as is and a selection of layouts aaaa and bbbb, its runs split into run dirs by `parts` (dir name ->
+    layouts), with tracks from a monkeypatched store: a layout's walkers are slower by its shift, twice with the fleet."""
+    site = _benchmark(tmp_path / "site", [("peds_only", "site__s1", 1, None), ("peds_only", "site__s2", 2, None)])
+    shift = {"aaaa": 30.0, "bbbb": 10.0}
+    dirs: dict[str, pathlib.Path] = {}
+    layout_runs: dict[pathlib.Path, list[tuple[str, str, int, pl.DataFrame | None]]] = {}
+    for part, layouts in parts.items():
+        runs_here = []
+        for layout in layouts:
+            for seed in (1, 2):
+                runs_here.append(("fleet_dwb", f"site__layout_{layout}__s{seed}", seed, _log({**LOG, "job.3.reason": "no path"})))
+                runs_here.append(("unhindered_peds", f"site__layout_{layout}__s{seed}", seed, None))
+        dirs[part] = _benchmark(tmp_path / part, runs_here)
+        layout_runs[dirs[part]] = runs_here
+
+    def fake(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        bench = episode_dir.parent.parent
+        if bench == site:
+            return _tracks(SITE)
+        planner, stage = layout_runs[bench][int(episode_dir.name.split("_")[1])][:2]
+        extra = shift[stage.split("_layout_")[1][:4]] * (2 if planner == "fleet_dwb" else 1)
+        return _tracks([(s, k, a, start, end + extra) for s, k, a, start, end in SITE])
+
+    monkeypatch.setattr(infra, "tracks_for_episode", fake)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)  # the fake store holds every episode
+    manifest = tmp_path / "infra_h1.layouts.json"
+    manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
+    return site, dirs, manifest
+
+
+def _commits(run_dir: pathlib.Path, arena: str, humansim: str = "h" * 40, evaluation: str = "e" * 40) -> None:
+    import yaml
+
+    commits = {"arena": {"path": "/a", "commit": arena, "dirty": False}, "humansim": {"path": "/h", "commit": humansim, "dirty": False}, "arena_evaluation": {"path": "/e", "commit": evaluation, "dirty": True}}
+    (run_dir / "manifest.yaml").write_text(yaml.safe_dump({"run_id": run_dir.name, "commits": commits}))
+
+
+def test_a_suite_split_over_two_run_dirs_reads_as_one(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, one, manifest = _selection(tmp_path / "one", monkeypatch, {"sel": ("aaaa", "bbbb")})
+    whole = infra.layout_table(site, one["sel"], json.loads(manifest.read_text()))
+    site2, two, manifest2 = _selection(tmp_path / "two", monkeypatch, {"part1": ("aaaa",), "part2": ("bbbb",)})
+    for run_dir in (site2, *two.values()):
+        _commits(run_dir, "a" * 40)
+    split = infra.layout_table([site2], [two["part1"], two["part2"]], json.loads(manifest2.read_text()))
+    assert split.drop("world").equals(whole.drop("world")) and split["complete"].all()
+    # the command takes them as repeated --layouts, the outputs go to the first
+    import argparse
+
+    args = argparse.Namespace(infra="pick", site=[site2], layouts=[two["part1"], two["part2"]], manifest=manifest2, warmup=None, tau=None, output_dir=None, out=None, boot=200)
+    assert infra.infra_command(args) == 0
+    assert json.loads((two["part1"] / "infra_pick.json").read_text())["joint_pick"] == "bbbb"
+
+
+def test_run_dirs_of_different_commits_or_sharing_a_stage_are_refused(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"part1": ("aaaa",), "part2": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    with pytest.raises(ValueError, match=r"stage site__layout_aaaa__s1 has more than one usable run .* in .*part1.*; run dirs read together must not share a stage"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    for run_dir in (site, dirs["part1"]):
+        _commits(run_dir, "a" * 40)
+    _commits(dirs["part2"], "b" * 40)
+    with pytest.raises(ValueError, match="the run dirs ran different arena commits"):
+        infra.check_commits([site, dirs["part1"], dirs["part2"]])
+    _commits(dirs["part2"], "a" * 40, humansim="c" * 40)
+    with pytest.raises(ValueError, match="different humansim commits"):
+        infra.check_commits([site, dirs["part2"]])
+    # the runner (arena_evaluation) records the episodes: its commit is compared too
+    _commits(dirs["part2"], "a" * 40, evaluation="f" * 40)
+    with pytest.raises(ValueError, match=r"different arena_evaluation commits.*--allow-mixed-commits"):
+        infra.check_commits([site, dirs["part2"]])
+    infra.check_commits([site, dirs["part2"]], allow_mixed=True)  # warns
+    # a dirty checkout is compared by its commit (the manifests above record a dirty arena_evaluation)
+    infra.check_commits([site, dirs["part1"]])
+
+
+def test_kept_walker_times_let_a_copy_without_tracks_read_the_same(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+    import shutil
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    assert infra.infra_command(argparse.Namespace(infra="times", benchmark=[site, dirs["sel"]], manifest=manifest, warmup=None)) == 0
+    assert "kept the walker travel times of 10 runs (warm-up 420 s)" in capsys.readouterr().out
+    original = infra.layout_table(site, dirs["sel"], doc)
+    # copy only the small files, as from another machine
+    copies = []
+    for run_dir in (site, dirs["sel"]):
+        copy = tmp_path / "copy" / run_dir.name
+        for path in run_dir.rglob("*"):
+            rel = path.relative_to(run_dir)
+            if path.is_file() and _small(rel):
+                (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, copy / rel)
+        copies.append(copy)
+
+    def no_tracks(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        raise AssertionError(f"read the tracks of {episode_dir}")
+
+    monkeypatch.setattr(infra, "tracks_for_episode", no_tracks)
+    monkeypatch.setattr(infra, "has_tracks", _real_has_tracks)  # the copy has no extraction
+    copied = infra.layout_table(copies[0], copies[1], doc)
+    assert copied.equals(original)
+    # another warm-up needs the tracks, which the copy does not have: it says so
+    with pytest.raises(FileNotFoundError, match="no walker times of env_0 kept for a warm-up of 300 s"):
+        infra.layout_table(copies[0], copies[1], doc, warmup_s=300.0)
+
+
+_real_has_tracks = infra.has_tracks
+
+
+def _small(rel: pathlib.Path) -> bool:
+    """A file of a run dir that a small copy carries: per episode its yaml, fact rows, task log and kept times."""
+    return rel.name in (f"{rel.parent.name}.yaml", "fact_episodes.parquet", infra.FLEET_LOG_FILE) or "infra_times." in str(rel)
+
+
+def _small_copy(tmp_path: pathlib.Path, run_dirs: list[pathlib.Path]) -> list[pathlib.Path]:
+    """The small files of each run dir, and every episode's (empty) topics dir, as a copy made elsewhere."""
+    import shutil
+
+    copies = []
+    for run_dir in run_dirs:
+        copy = tmp_path / "copy" / run_dir.name
+        for path in run_dir.rglob("*"):
+            rel = path.relative_to(run_dir)
+            if path.is_file() and (_small(rel) or rel.name == "manifest.yaml"):
+                (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, copy / rel)
+        for episode in (run_dir / "episodes").iterdir():
+            (copy / "episodes" / episode.name / "topics").mkdir(parents=True, exist_ok=True)
+        copies.append(copy)
+    return copies
+
+
+def test_a_copy_without_times_for_the_warm_up_raises_with_the_real_track_store(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing import ped_track_store
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    assert infra.keep_times([site, dirs["sel"]], 420.0) == 10
+    original = infra.layout_table(site, dirs["sel"], doc)
+    copies = _small_copy(tmp_path, [site, dirs["sel"]])
+    # the reading machine's real track store: it reads a topics dir without an extraction as an episode without walkers
+    monkeypatch.setattr(infra, "tracks_for_episode", ped_track_store.tracks_for_episode)
+    monkeypatch.setattr(infra, "has_tracks", _real_has_tracks)
+    assert infra.layout_table(copies[0], copies[1], doc).equals(original)
+    with pytest.raises(FileNotFoundError, match=r"episode_000: no walker times of env_0 kept for a warm-up of 300 s .*no extraction of its recording .*evaluation infra times --benchmark <its run dir> --warmup 300"):
+        infra.layout_table(copies[0], copies[1], doc, warmup_s=300.0)
+    # nothing empty is kept for that warm-up
+    assert not list(copies[1].rglob(f"*.w{300.0!r}.parquet")) and not list(copies[0].rglob(f"*.w{300.0!r}.parquet"))
+    with pytest.raises(FileNotFoundError, match=r"kept the walker times of 0 runs, but could not keep 8: .*episode_000 \(env_0\): no walker times of env_0 kept for a warm-up of 300 s"):
+        infra.keep_times(copies[1], 300.0)
+
+
+def test_kept_times_name_the_track_store_and_their_code_and_record_the_commit(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing import ped_track_store
+
+    _, dirs, _ = _selection(tmp_path, monkeypatch, {"sel": ("aaaa",)})
+    episode = dirs["sel"] / "episodes" / "episode_000"
+    first = infra.walker_times(episode, "env_0", 420.0)
+    path = infra.times_path(episode, "env_0", 420.0)
+    assert path.is_file() and f".t{ped_track_store.TRACKS_VERSION}." in path.parent.name and path.name == "env_0.w420.0.parquet"
+    provenance = infra.times_provenance(path)
+    assert provenance["tracks_version"] == ped_track_store.TRACKS_VERSION and provenance["times_version"] == infra.TIMES_VERSION and provenance["warmup_s"] == 420.0
+    assert set(provenance["arena_evaluation"]) >= {"path", "commit", "dirty"} and provenance["code"] == infra._times_code()
+    # new tracks after a track store bump are never read through the old kept times
+    monkeypatch.setattr(ped_track_store, "TRACKS_VERSION", ped_track_store.TRACKS_VERSION + 1)
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda d, e: _tracks([("south_adult", "1", "adult", 500.0, 1000.0)]))
+    assert infra.times_path(episode, "env_0", 420.0) != path
+    again = infra.walker_times(episode, "env_0", 420.0)
+    assert not again.equals(first) and again["travel_s"].to_list() == [500.0]
+
+
+def test_walker_times_kept_by_different_commits_are_refused(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"part1": ("aaaa",), "part2": ("bbbb",)})
+    doc = json.loads(manifest.read_text())
+    for run_dir, commit in ((site, "a" * 40), (dirs["part1"], "a" * 40), (dirs["part2"], "b" * 40)):
+        monkeypatch.setattr(infra, "_processing", lambda c=commit: {"path": "/e", "commit": c, "dirty": False})
+        infra.keep_times(run_dir, 420.0)
+    with pytest.raises(ValueError, match=r"walker times kept by different arena_evaluation commits: aaaaaaaaaaaa in .*bbbbbbbbbbbb in .*part2"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc, allow_mixed_commits=True)["complete"].all()
+
+
+def test_kept_conflict_exposure_records_its_provenance_and_is_never_read_as_walker_times(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import pyarrow.parquet as pq
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "a" * 40, "dirty": False})
+    infra.keep_times([site, dirs["sel"]], 420.0)
+    episode = dirs["sel"] / "episodes" / "episode_000"  # the fleet run of aaaa at seed 1
+    path, times = infra.exposure_path(episode, "env_0", 420.0), infra.times_path(episode, "env_0", 420.0)
+    assert path.is_file() and path.parent == times.parent
+    provenance = infra.exposure_provenance(path)
+    assert provenance["exposure_version"] == infra.EXPOSURE_VERSION and provenance["warmup_s"] == 420.0 and provenance["band_m"] == infra.CONFLICT_BAND_M
+    assert provenance["code"] == infra._exposure_code() and provenance["arena_evaluation"]["commit"] == "a" * 40
+    assert provenance["prediction_band_m"] == infra.PREDICTION_BAND_M == 2.0 and infra.PREDICTION_BAND_TAG == "2m" and path.name == f"env_0.exposure{infra.EXPOSURE_VERSION}.w420.0.parquet"
+    assert {"exposed_s", "exposure_s", "exposed_2m_s", "exposure_2m_s"} <= set(pl.read_parquet(path).columns)
+    assert infra.times_provenance(path) is None and infra.exposure_provenance(times) is None
+    # the commit check reads the exposure file as exposure, so one release gives no warning about times without a commit
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    assert "without a readable" not in capsys.readouterr().err
+    # exposure kept by two releases is refused as mixed, by its kind; the times of one release are not called mixed
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "b" * 40, "dirty": False})
+    infra.run_exposure(episode, "env_0", 420.0, recompute=True)
+    with pytest.raises(ValueError, match=r"^conflict exposure kept by different arena_evaluation commits: \w{12} in .*sel, \w{12} in .*sel; keep them again") as raised:
+        infra.layout_table(site, dirs["sel"], doc)
+    assert "walker times kept by different" not in str(raised.value)
+    # an exposure file without provenance is not compared and, in a copy without tracks, not read, with warnings
+    pq.write_table(pq.read_table(path).replace_schema_metadata({}), path)
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: False)
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    err = capsys.readouterr().err
+    assert "conflict exposure kept without its provenance" in err and f"{path.name} was kept by other code (no provenance" in err
+
+
+def test_exposure_kept_later_by_a_newer_release_never_makes_the_times_mixed(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    # times kept by release a with an older exposure version beside them; the analysis at release b computes the
+    # current exposure on first read: times of a and exposure of b are each of one release
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "a" * 40, "dirty": False})
+    infra.keep_times([site, dirs["sel"]], 420.0)
+    for path in dirs["sel"].rglob(f"*.exposure{infra.EXPOSURE_VERSION}.w420.0.parquet"):
+        pl.read_parquet(path).select("group", "walkers", "exposed_s", "exposure_s").write_parquet(path.with_name(path.name.replace(f"exposure{infra.EXPOSURE_VERSION}", "exposure2")))
+        path.unlink()
+    monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": "b" * 40, "dirty": False})
+    capsys.readouterr()
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    episode = dirs["sel"] / "episodes" / "episode_000"
+    assert infra.exposure_provenance(infra.exposure_path(episode, "env_0", 420.0))["arena_evaluation"]["commit"] == "b" * 40
+    assert infra.times_provenance(infra.times_path(episode, "env_0", 420.0))["arena_evaluation"]["commit"] == "a" * 40
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()  # read again: still not mixed
+    assert "different arena_evaluation commits" not in capsys.readouterr().err
+
+
+def test_exposure_of_an_older_version_or_other_code_is_computed_again_or_left_out_with_a_warning(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import pyarrow.parquet as pq
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    infra.keep_times([site, dirs["sel"]], 420.0)
+    episode = dirs["sel"] / "episodes" / "episode_000"
+    path = infra.exposure_path(episode, "env_0", 420.0)
+    # a current-version file of other code (a change without a version bump) is computed again where the tracks are
+    table = pq.read_table(path)
+    meta = json.loads(table.schema.metadata[infra.EXPOSURE_META])
+    pq.write_table(table.replace_schema_metadata({infra.EXPOSURE_META: json.dumps({**meta, "code": "0" * 10}).encode()}), path)
+    assert infra.run_exposure(episode, "env_0", 420.0) is not None and infra.exposure_provenance(path)["code"] == infra._exposure_code()
+    # ... and without the tracks it is left out with a warning that names it, never read as current
+    pq.write_table(table.replace_schema_metadata({infra.EXPOSURE_META: json.dumps({**meta, "code": "0" * 10}).encode()}), path)
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: False)
+    capsys.readouterr()
+    assert infra.run_exposure(episode, "env_0", 420.0) is None
+    assert f"{path.name} was kept by other code (0000000000" in capsys.readouterr().err
+    # a copy that holds only an older exposure version gives no exposure columns, with a warning, not silently
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: True)
+    for kept in dirs["sel"].rglob(f"*.exposure{infra.EXPOSURE_VERSION}.w420.0.parquet"):
+        kept.rename(kept.with_name(kept.name.replace(f"exposure{infra.EXPOSURE_VERSION}", "exposure2")))
+    copies = _small_copy(tmp_path, [site, dirs["sel"]])
+    monkeypatch.setattr(infra, "has_tracks", _real_has_tracks)
+    capsys.readouterr()
+    copied = infra.layout_table(copies[0], copies[1], doc)
+    err = capsys.readouterr().err
+    assert copied["complete"].all() and not [c for c in copied.columns if c.startswith("exposure_")]
+    assert "is not measured: only an older version is kept (env_0.exposure2.w420.0.parquet)" in err
+
+
+def test_the_kept_exposure_measures_both_bands(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # a robot drives along y = 0 at 1 m/s from t 400 to 600 s, a second one stays parked at (100, 5.5); walkers: a on the
+    # line at x = 100, b 1.5 m off it at x = 120 (inside 2 m, outside 1 m), d 5 m off at x = 100 (0.5 m from the parked
+    # robot), c (wheelchair) on the line at x = 150 from 450 s; walkers read every 0.5 s, band edges included
+    rows = []
+    for t in np.arange(0.0, 1000.0, 0.5):
+        for i, (key, agent, x, y, start) in enumerate((("a", "adult", 100.0, 0.0, 0.0), ("b", "adult", 120.0, 1.5, 0.0), ("d", "adult", 100.0, 5.0, 0.0), ("c", "wheelchair_manual", 150.0, 0.0, 450.0))):
+            if t >= start:
+                rows.append({"episode_id": 0, "time_ns": int((t + 50.0) * 1e9), "t": float(t), "agent_id": i, "key": key, "name": "", "source_name": "s", "source_seq": i, "agent_type": agent, "x": x, "y": y, "vx": 0.0, "vy": 0.0, "radius": 0.25})
+    tracks = pl.DataFrame(rows, schema=TRACK_SCHEMA)
+    times = np.arange(0.0, 1000.0, 0.1)
+    episode = tmp_path / "run" / "episodes" / "episode_000"
+    (episode / "topics").mkdir(parents=True)
+    robots = []
+    for robot, (x, y) in {"jackal_0": (np.clip(times - 400.0, 0.0, 200.0), np.zeros_like(times)), "jackal_1": (np.full_like(times, 100.0), np.full_like(times, 5.5))}.items():
+        robots.append(pl.DataFrame({"t_ns": ((times + 50.0) * 1e9).astype(np.int64), "env_id": "env_0", "robot_id": f"env_0_{robot}", "x": x, "y": y}))
+    # another env's robot on the walkers' line is not this env's
+    robots.append(pl.DataFrame({"t_ns": ((times + 50.0) * 1e9).astype(np.int64), "env_id": "env_1", "robot_id": "env_1_jackal_0", "x": np.clip(times - 400.0, 0.0, 200.0), "y": np.zeros_like(times)}))
+    pl.concat(robots).write_parquet(episode / "topics" / "robot_tracks.parquet")
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda episode_dir, env: tracks)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
+    out = {r["group"]: r for r in infra.run_exposure(episode, "env_0", 420.0).iter_rows(named=True)}
+    # 1 m: a 2.5 s (x 99-101), b and d none; 2 m: a 4.5 s (x 98-102) + b 2.5 s (|x - 120| <= 1.32), d none (the parked robot)
+    assert out["adult"]["walkers"] == 3 and out["adult"]["exposed_s"] == pytest.approx(2.5) and out["adult"]["exposed_2m_s"] == pytest.approx(7.0)
+    assert out["adult"]["exposure_s"] == pytest.approx(2.5 / 3) and out["adult"]["exposure_2m_s"] == pytest.approx(7.0 / 3)
+    assert out["wheelchair"]["walkers"] == 1 and out["wheelchair"]["exposed_s"] == pytest.approx(2.5) and out["wheelchair"]["exposed_2m_s"] == pytest.approx(4.5)
+    assert pl.read_parquet(infra.exposure_path(episode, "env_0", 420.0)).sort("group").equals(infra.run_exposure(episode, "env_0", 420.0).sort("group"))
+
+
+def test_walker_times_and_the_cost_are_the_same_bits_in_any_row_order() -> None:
+    rng = np.random.default_rng(0)
+    peds = [("south_adult" if i % 3 else "north_wheel", str(i), "adult" if i % 3 else "wheelchair_manual", 430.0 + float(rng.uniform(0, 50)), 430.0 + float(rng.uniform(100, 900))) for i in range(1500)]
+    tracks = _tracks(peds)
+    orders = {tuple(infra._times(tracks, 420.0)["key"].to_list()) for _ in range(10)}
+    assert len(orders) == 1 and list(next(iter(orders))) == sorted(next(iter(orders)))
+    site = infra._times(tracks, 420.0)
+    off = site.with_columns(pl.col("travel_s") * 1.0373)
+    on = site.with_columns(pl.col("travel_s") * 1.0911)
+    base = infra.cost_from_times(site, off, on)
+    for k in range(10):
+        shuffled = infra.cost_from_times(site.sample(fraction=1.0, shuffle=True, seed=k), off.sample(fraction=1.0, shuffle=True, seed=k + 100), on)
+        assert shuffled == base
+
+
+def _extraction(episode_dir: pathlib.Path, tables: dict[str, pl.DataFrame]) -> pathlib.Path:
+    """A current extraction of an episode holding `tables`, as `evaluation process` writes it."""
+    from arena_evaluation.processing.parquet_store import TopicParquetStore
+
+    topics = episode_dir / "topics"
+    topics.mkdir(parents=True)
+    for name, frame in tables.items():
+        frame.write_parquet(topics / f"{name}.parquet")
+    TopicParquetStore.mark_complete(topics)
+    return topics
+
+
+def test_an_extraction_without_pedestrian_tables_or_of_an_older_format_gives_no_times(tmp_path: pathlib.Path) -> None:
+    from arena_evaluation.processing.parquet_store import TopicParquetStore
+
+    episode = tmp_path / "run" / "episodes" / "episode_000"
+    # a recording of env_0 without any pedestrian table, and one of env_1 with them
+    lifecycle = pl.DataFrame({"t_ns": [1, 2], "env_id": ["env_0", "env_1"], "episode_id": [0, 0], "outcome_state": [1, 1]})
+    peds = pl.DataFrame({"t_ns": [1], "env_id": ["env_1"], "ped_id": ["Pedestrian_1"], "x": [0.0], "y": [0.0]})
+    topics = _extraction(episode, {"episode_lifecycle": lifecycle, "pedestrian_agent_states": peds, "robot_odom": pl.DataFrame({"t_ns": [1, 2], "env_id": "env_0", "robot_id": "env_0_jackal_0", "odom_x": [0.0, 1.0]})})
+    assert TopicParquetStore.is_current(topics) and not infra.has_tracks(episode, "env_0") and infra.has_tracks(episode, "env_1")
+    assert "holds no pedestrian table for env_0" in infra.track_problem(episode, "env_0")
+    assert "holds no env_2" in infra.track_problem(episode, "env_2")
+    with pytest.raises(FileNotFoundError, match=r"no tracks to compute them from: its extraction holds no pedestrian table .*re-run `evaluation process`"):
+        infra.walker_times(episode, "env_0", 420.0)
+    assert not infra.times_path(episode, "env_0", 420.0).exists()
+    (topics / TopicParquetStore.VERSION_FILE).write_text("0\n")
+    assert "older format; re-run `evaluation process`" in infra.track_problem(episode, "env_0")
+
+
+def test_empty_tracks_are_refused_and_not_kept(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing.ped_track_store import empty_tracks
+
+    episode = tmp_path / "run" / "episodes" / "episode_000"
+    (episode / "topics").mkdir(parents=True)
+    monkeypatch.setattr(infra, "has_tracks", lambda d, e: True)
+    monkeypatch.setattr(infra, "tracks_for_episode", lambda d, e: empty_tracks())
+    with pytest.raises(ValueError, match="the tracks of env_0 hold no walker"):
+        infra.walker_times(episode, "env_0", 420.0)
+    assert not infra.times_path(episode, "env_0", 420.0).exists()
+
+
+def test_recompute_keeps_the_times_again_and_mends_mixed_commits(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"part1": ("aaaa",), "part2": ("bbbb",)})
+    doc = json.loads(manifest.read_text())
+
+    def at(commit: str | None) -> None:
+        monkeypatch.setattr(infra, "_processing", lambda: {"path": "/e", "commit": commit, "dirty": False})
+
+    at("a" * 40)
+    infra.keep_times([site, dirs["part1"]], 420.0)
+    at("b" * 40)
+    infra.keep_times(dirs["part2"], 420.0)
+    with pytest.raises(ValueError, match=r"different arena_evaluation commits.*evaluation infra times --recompute --benchmark <run dir>"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    infra.keep_times([site, dirs["part1"]], 420.0)  # without --recompute the kept times stay as they are
+    with pytest.raises(ValueError, match="different arena_evaluation commits"):
+        infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)
+    assert infra.keep_times([site, dirs["part1"]], 420.0, recompute=True) == 6
+    path = infra.times_path(dirs["part1"] / "episodes" / "episode_000", "env_0", 420.0)
+    assert infra.times_provenance(path)["arena_evaluation"]["commit"] == "b" * 40
+    assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)["complete"].all()
+    # times whose commit git could not read are not compared, with a warning
+    at(None)
+    infra.keep_times([site, dirs["part1"], dirs["part2"]], 420.0, recompute=True)
+    capsys.readouterr()
+    assert infra.layout_table(site, [dirs["part1"], dirs["part2"]], doc)["complete"].all()
+    assert "walker times kept without a readable arena_evaluation commit" in capsys.readouterr().err
+
+
+def test_an_unreadable_code_source_warns(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import inspect
+
+    def unreadable(obj: object) -> str:
+        raise OSError("no source")
+
+    monkeypatch.setattr(inspect, "getsource", unreadable)
+    assert infra._times_code.__wrapped__() == "nosource"
+    assert "kept walker times are not re-keyed when that code changes" in capsys.readouterr().err
+
+
+def test_the_visitors_are_the_same_bits_in_any_row_order() -> None:
+    rng = np.random.default_rng(1)
+    peds = [("south_locker_wheelchair" if i < 600 else ("south_adult" if i % 3 else "north_wheel"), str(i), "adult" if i % 3 else "wheelchair_manual", 430.0 + float(rng.uniform(0, 50)), 430.0 + float(rng.uniform(100, 900))) for i in range(1500)]
+    site = infra._times(_tracks(peds), 420.0)
+    off = site.with_columns(pl.col("travel_s") * 1.0373)
+    on = site.with_columns(pl.col("travel_s") * 1.0911)
+    base = infra.cost_from_times(site, off, on, visitor_sources=["south_locker_wheelchair"])["visitors"]
+    for k in range(10):
+        shuffled = infra.cost_from_times(site, off.sample(fraction=1.0, shuffle=True, seed=k), on.sample(fraction=1.0, shuffle=True, seed=k + 1), visitor_sources=["south_locker_wheelchair"])["visitors"]
+        assert shuffled == base
+
+
+def test_a_row_without_a_completing_walker_is_not_complete(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    site, dirs, manifest = _selection(tmp_path, monkeypatch, {"sel": ("aaaa", "bbbb")})
+    doc = json.loads(manifest.read_text())
+    assert infra.layout_table(site, dirs["sel"], doc)["complete"].all()
+    # every walker spawns before a 1,500 s warm-up: tracks, but no walker times
+    late = infra.layout_table(site, dirs["sel"], doc, warmup_s=1500.0)
+    assert not late["complete"].any() and late["c_worst"].is_null().all()
+    assert set(late["incomplete"].to_list()) == {"no walker spawned after the 1500 s warm-up and finished: the site as is, without robots, with the fleet"}
+    # the command says why
+    args = argparse.Namespace(infra="table", site=site, layouts=dirs["sel"], manifest=manifest, warmup=1500.0, tau=None, output_dir=None, out=None)
+    assert infra.infra_command(args) == 0
+    assert "4 (layout, seed) rows not complete (no walker spawned after the 1500 s warm-up and finished" in capsys.readouterr().out
+    # a missing run says so too
+    rows = infra.layout_table(site, dirs["sel"], {**doc, "seeds": [1, 2, 3]})
+    assert rows.filter(pl.col("seed") == 3)["incomplete"].to_list() == ["missing runs: the site as is, without robots, with the fleet"] * 2
+
+
+def test_kept_times_of_the_layout_before_this_version_are_never_read() -> None:
+    assert infra.TIMES_VERSION == 3 and infra.times_dir().startswith("infra_times.v3.")
+
+
+def test_keep_times_keeps_going_past_a_run_without_walkers_and_names_it(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from arena_evaluation.processing.ped_track_store import empty_tracks
+
+    _, dirs, _ = _selection(tmp_path, monkeypatch, {"sel": ("aaaa",)})
+    real = infra.tracks_for_episode
+
+    def one_empty(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        return empty_tracks() if episode_dir.name == "episode_001" else real(episode_dir, env)
+
+    monkeypatch.setattr(infra, "tracks_for_episode", one_empty)
+    with pytest.raises(ValueError, match=r"kept the walker times of 3 runs, but could not keep 1: .*episode_001 \(env_0\): the tracks of env_0 hold no walker"):
+        infra.keep_times(dirs["sel"], 420.0)
+    kept = sorted(p.parent.parent.parent.parent.name for p in dirs["sel"].rglob("env_0.w420.0.parquet"))
+    assert kept == ["episode_000", "episode_002", "episode_003"]
+
+
+def test_the_cost_without_the_run_without_robots_pairs_the_site_as_is_and_the_fleet_run() -> None:
+    site = _tracks(SITE)
+    # the wheelchair user does not finish the run without robots, the cane user not the fleet run
+    off = _tracks([("south_adult", "1", "adult", 500.0, 830.0), ("north_long_cane", "3", "blind_white_cane", 600.0, 1100.0), ("south_locker_wheelchair", "7", "./types/locker_visitor__south_wheelchair.yaml", 450.0, 850.0)])
+    on = _tracks([("south_adult", "1", "adult", 500.0, 850.0), ("south_wheelchair", "2", "wheelchair_manual", 500.0, 1000.0), ("north_long_cane", "3", "blind_white_cane", 600.0, 1500.0), ("south_locker_wheelchair", "7", "./types/locker_visitor__south_wheelchair.yaml", 450.0, 950.0)])
+    two = infra.cost(site, None, on, visitor_sources=["south_locker_wheelchair"], warmup_s=420.0)
+    adult, chair = two["groups"]["adult"], two["groups"]["wheelchair"]
+    assert adult["peds"] == 1 and adult["total"] == pytest.approx(50.0 / 300.0) and adult["delay_s"] == pytest.approx(50.0)
+    assert adult["element"] is None and adult["traffic"] is None
+    assert (chair["peds"], chair["dropped"]) == (1, 0) and chair["total"] == pytest.approx(100.0 / 400.0)
+    assert two["groups"]["long_cane"]["peds"] == 0 and two["groups"]["long_cane"]["dropped"] == 1
+    assert (two["c_worst"], two["worst_group"]) == (pytest.approx(0.25), "wheelchair") and two["visitors"] == {}
+    # the three runs pair fewer walkers: the wheelchair user drops for the run without robots alone
+    three = infra.cost(site, off, on, visitor_sources=["south_locker_wheelchair"], warmup_s=420.0)
+    assert (three["groups"]["wheelchair"]["peds"], three["groups"]["wheelchair"]["dropped"]) == (0, 1)
+    assert three["groups"]["adult"]["total"] == adult["total"] and three["groups"]["adult"]["element"] == pytest.approx(30.0 / 300.0)
+    with pytest.raises(ValueError, match="needs the layout's run without robots or its run with the fleet"):
+        infra.cost(site, None, None)
+
+
+VISITOR = ("south_locker_wheelchair", "7", "./types/locker_visitor__south_wheelchair.yaml", 450.0, 850.0)
+
+
+def _layout_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: dict[str, list[tuple]], lost: tuple[str, ...] = (), *, walkers: list[tuple[str, str, str, float, float]] = SITE, logs: dict[str, pl.DataFrame | None] | None = None, visitor: bool = False) -> tuple[pathlib.Path, dict[str, pathlib.Path], dict]:
+    """The site as is on seeds 1 and 2 and layout runs in run dirs by `parts` (dir name -> (contestant, seed) of layout
+    aaaa, or (contestant, seed, layout) with layout bbbb), with tracks from a monkeypatched store: in aaaa the `walkers`
+    are 30 s slower without robots and 60 s with the fleet (`fleet_dwb`), in bbbb 10 and 20 s, and the walkers with a
+    key in `lost` do not finish the runs without the fleet. A `fleet_dwb` run records a fleet log, any other contestant
+    none, unless `logs` gives the contestant's semantic snapshot. With `visitor`, a locker visitor walks in the layout
+    runs. The manifest names no seeds without robots."""
+    site = _benchmark(tmp_path / "site", [("peds_only", "site__s1", 1, None), ("peds_only", "site__s2", 2, None)])
+    shift = {"aaaa": 30.0, "bbbb": 10.0}
+    dirs: dict[str, pathlib.Path] = {}
+    recorded: dict[pathlib.Path, list[tuple[str, str, int, pl.DataFrame | None]]] = {}
+    for part, runs_here in parts.items():
+        listed = []
+        for planner, seed, *layout in runs_here:
+            snapshot = (logs or {}).get(planner, _log(LOG) if planner == "fleet_dwb" else None)
+            listed.append((planner, f"site__layout_{layout[0] if layout else 'aaaa'}__s{seed}", seed, snapshot))
+        dirs[part] = _benchmark(tmp_path / part, listed)
+        recorded[dirs[part]] = listed
+
+    def fake(episode_dir: pathlib.Path, env: str) -> pl.DataFrame:
+        bench = episode_dir.parent.parent
+        if bench == site:
+            return _tracks(walkers)
+        planner, stage = recorded[bench][int(episode_dir.name.split("_")[1])][:2]
+        fleet = planner == "fleet_dwb"
+        extra = shift[stage.split("_layout_")[1][:4]] * (2 if fleet else 1)
+        return _tracks([(s, k, a, start, end + extra) for s, k, a, start, end in [*walkers, *([VISITOR] if visitor else [])] if fleet or k not in lost])
+
+    monkeypatch.setattr(infra, "tracks_for_episode", fake)
+    monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
+    layouts = sorted({layout[0] if layout else "aaaa" for runs_here in parts.values() for _, _, *layout in runs_here})
+    roles = {"aaaa": "robot_only", "bbbb": "joint"}
+    doc = {"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [VISITOR[0]] if visitor else [], "runs": [{"role": roles[layout], "layout_id": layout, "travel_m": 10.0} for layout in layouts], "worlds": {layout: f"/x/site__layout_{layout}" for layout in layouts}}
+    return site, dirs, doc
+
+
+def test_the_run_without_robots_is_optional_on_the_seeds_that_are_not_named(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2)]})
+    # nothing names the seeds: every seed needs the three runs, and seed 2 has no cost
+    old = infra.layout_table(site, dirs["runs"], doc)
+    assert old["complete"].to_list() == [True, False] and old["incomplete"].to_list() == [None, "missing runs: without robots"]
+    assert old["C_adult"].to_list() == [pytest.approx(60.0 / 300.0), None] and "split" not in old.columns
+    # seed 1 named: seed 2 is complete with its delay against the site as is, and the parts come from seed 1
+    new = infra.layout_table(site, dirs["runs"], {**doc, "without_robots_seeds": [1]})
+    assert new["complete"].all() and new["incomplete"].to_list() == [None, None] and new["split"].to_list() == [True, False]
+    assert new["C_adult"].to_list() == pytest.approx([60.0 / 300.0] * 2) and new["delay_adult_s"].to_list() == pytest.approx([60.0] * 2)
+    assert new["c_worst"].to_list() == pytest.approx([60.0 / 300.0] * 2) and new["peds_adult"].to_list() == [1, 1]
+    assert new["C_adult_element"].to_list() == [pytest.approx(30.0 / 300.0), None] and new["C_adult_traffic"].to_list() == [pytest.approx(30.0 / 300.0), None]
+    assert new["peds_adult_split"].to_list() == [1, None] and new["dropped_adult_split"].to_list() == [0, None]
+    assert infra.layout_table(site, dirs["runs"], doc, split_seeds=[1]).equals(new)
+    means = infra.layout_means(new)
+    assert (means["seeds"].to_list(), means["split_seeds"].to_list(), means["complete"].to_list()) == ([2], [1], [True])
+    assert means["C_adult"].to_list() == pytest.approx([60.0 / 300.0]) and means["C_adult_element"].to_list() == pytest.approx([30.0 / 300.0])
+    # a named seed whose run is missing is not complete and keeps its total
+    lost = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    assert lost["complete"].to_list() == [True, False] and lost["incomplete"].to_list() == [None, "missing runs: without robots"]
+    assert lost["C_adult"].to_list() == pytest.approx([60.0 / 300.0] * 2) and lost["split"].to_list() == [True, False]
+    # a run without robots at a seed that is not named is refused, and so is a named seed the manifest does not run
+    with pytest.raises(ValueError, match="stage site__layout_aaaa__s1 has a run without robots"):
+        infra.layout_table(site, dirs["runs"], doc, split_seeds=[])
+    with pytest.raises(ValueError, match=r"seeds \[3\] are named as seeds with a run without robots"):
+        infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 3])
+    # the command takes the seeds, and says over how many the parts are
+    manifest = tmp_path / "infra_rd.layouts.json"
+    manifest.write_text(json.dumps(doc))
+    args = argparse.Namespace(infra="table", site=site, layouts=dirs["runs"], manifest=manifest, warmup=None, tau=None, output_dir=tmp_path / "out", out=None, without_robots_seeds=[1])
+    assert infra.infra_command(args) == 0
+    assert pl.read_parquet(tmp_path / "out" / infra.TABLE_FILE).equals(new)
+    printed = capsys.readouterr().out
+    assert "element and traffic over the seeds with a walker in all three runs: adult 1, wheelchair 1, long_cane 1 of 1 with a run without robots" in printed and "not complete" not in printed
+
+
+def test_on_a_named_seed_the_total_pairs_two_runs_and_the_parts_pair_three(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    every = [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2), ("unhindered_peds", 2)]
+    # the wheelchair user does not finish the runs without robots
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": every}, lost=("2",))
+    old = infra.layout_table(site, dirs["runs"], doc)
+    new = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    assert old["complete"].all() and new["complete"].all() and new["split"].all()
+    # the three runs paired drop the wheelchair user from the total; the site as is and the fleet run paired keep it
+    assert old["C_wheelchair"].to_list() == [None, None] and old["dropped_wheelchair"].to_list() == [1, 1]
+    assert new["C_wheelchair"].to_list() == pytest.approx([60.0 / 400.0] * 2) and new["dropped_wheelchair"].to_list() == [0, 0]
+    assert new["C_wheelchair_element"].to_list() == [None, None] and new["peds_wheelchair_split"].to_list() == [0, 0] and new["dropped_wheelchair_split"].to_list() == [1, 1]
+    assert old["worst_group"].to_list() == ["adult"] * 2 and new["worst_group"].to_list() == ["adult"] * 2
+    # a group that loses no walker for the run without robots has the same total and parts either way, to the bit
+    for column in ("C_adult", "C_adult_element", "C_adult_traffic", "delay_adult_s", "peds_adult", "C_long_cane", "C_long_cane_element", "C_long_cane_traffic", "task_time_s"):
+        assert new[column].to_list() == old[column].to_list()
+    assert (new["C_adult_element"] + new["C_adult_traffic"]).to_list() == pytest.approx(new["C_adult"].to_list())
+    assert new["peds_adult_split"].to_list() == new["peds_adult"].to_list()
+
+
+def test_a_layout_stage_recorded_with_the_crowd_only_contestant_is_its_run_without_robots(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, dirs, doc = _layout_runs(tmp_path / "reference", monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2), ("unhindered_peds", 2)]})
+    reference = infra.layout_table(site, dirs["runs"], doc)
+    assert reference["complete"].all() and reference["C_adult_element"].to_list() == pytest.approx([30.0 / 300.0] * 2)
+    # the fleet stages in one run dir, the same stages without robots under `peds_only` in another
+    site, dirs, doc = _layout_runs(tmp_path / "crowd", monkeypatch, {"fleet": [("fleet_dwb", 1), ("fleet_dwb", 2)], "crowd": [("peds_only", 1), ("peds_only", 2)]})
+    crowd = infra.layout_table(site, [dirs["fleet"], dirs["crowd"]], doc)
+    assert crowd.equals(reference)
+    assert infra.layout_table(site, [dirs["fleet"], dirs["crowd"]], doc, split_seeds=[1, 2])["C_adult_element"].to_list() == reference["C_adult_element"].to_list()
+    # it is never read as the fleet run: without the fleet run dir the rows miss it
+    alone = infra.layout_table(site, dirs["crowd"], doc)
+    assert not alone["complete"].any() and set(alone["incomplete"].to_list()) == {"missing runs: with the fleet"} and "task_time_s" not in alone.columns
+    # no conflict exposure is kept for it
+    assert infra.keep_times(dirs["crowd"], 420.0) == 2 and not list(dirs["crowd"].rglob("*.exposure*"))
+    # the reference run and a crowd-only run of one stage are a stage run twice
+    site, dirs, doc = _layout_runs(tmp_path / "both", monkeypatch, {"fleet": [("fleet_dwb", 1), ("unhindered_peds", 1)], "crowd": [("peds_only", 1)]})
+    with pytest.raises(ValueError, match="stage site__layout_aaaa__s1 has more than one usable run"):
+        infra.layout_table(site, [dirs["fleet"], dirs["crowd"]], {**doc, "seeds": [1]})
+
+
+def test_the_seed_list_reads_numbers_ranges_and_none() -> None:
+    assert infra._seed_list("51-55") == [51, 52, 53, 54, 55] and infra._seed_list("51, 53-54") == [51, 53, 54] and infra._seed_list("none") == []
+    assert infra._seed_list("51,51,52,51-53") == [51, 52, 53]
+    for bad in ("", "a", "5-3", "1-", "-2", "1,,2", "51 - 55", "5e1", "1.0", "\u0665\u0661", "51-5500000000"):
+        with pytest.raises(ValueError, match="seeds are whole numbers and ranges"):
+            infra._seed_list(bad)
+    # a range is never built beyond the bound
+    with pytest.raises(ValueError, match="names more than 10000 seeds"):
+        infra._seed_list("1-999999999")
+    with pytest.raises(ValueError, match="names more than 10000 seeds"):
+        infra._seed_list("1-6000,7001-12000")
+
+
+def test_the_named_seeds_are_whole_numbers_and_the_option_never_replaces_the_manifests(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    doc = {"seeds": [1, 2]}
+    assert infra.without_robots_seeds(doc) is None and infra.without_robots_seeds({**doc, "without_robots_seeds": None}) is None
+    assert infra.without_robots_seeds({**doc, "without_robots_seeds": []}) == frozenset() and infra.without_robots_seeds(doc, []) == frozenset()
+    assert infra.without_robots_seeds({**doc, "without_robots_seeds": [1, 1]}) == {1} and infra.without_robots_seeds(doc, np.array([2])) == {2}
+    for bad in ("1", "1-2", "none", 1, 1.0, {"1": 2}):
+        with pytest.raises(ValueError, match="is a list of seeds"):
+            infra.without_robots_seeds({**doc, "without_robots_seeds": bad})
+    for bad in (["1"], [1.0], [1.5], [True], [None]):
+        with pytest.raises(ValueError, match="holds whole numbers only"):
+            infra.without_robots_seeds({**doc, "without_robots_seeds": bad})
+        with pytest.raises(ValueError, match="holds whole numbers only"):
+            infra.without_robots_seeds(doc, bad)
+    # the same seeds from both are fine; other seeds from the option are refused, whichever names more
+    assert infra.without_robots_seeds({**doc, "without_robots_seeds": [1]}, [1]) == {1}
+    for key, option in (([1, 2], [1]), ([1], [1, 2]), ([1], []), ([], [1])):
+        with pytest.raises(ValueError, match="they differ"):
+            infra.without_robots_seeds({**doc, "without_robots_seeds": key}, option)
+    # so a seed whose planned run is missing is never made complete by the option
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2)]})
+    with pytest.raises(ValueError, match=r"names seeds \[1, 2\] and --without-robots-seeds names \[1\]"):
+        infra.layout_table(site, dirs["runs"], {**doc, "without_robots_seeds": [1, 2]}, split_seeds=[1])
+    planned = infra.layout_table(site, dirs["runs"], {**doc, "without_robots_seeds": [1, 2]})
+    assert planned["complete"].to_list() == [True, False] and planned["incomplete"].to_list() == [None, "missing runs: without robots"]
+
+
+def test_the_option_reaches_the_table_through_the_parser_and_none_names_no_seed(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import argparse
+
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": [("fleet_dwb", 1), ("fleet_dwb", 2)]})
+    manifest = tmp_path / "infra_rd.layouts.json"
+    manifest.write_text(json.dumps(doc))
+    parser = argparse.ArgumentParser()
+    infra.add_infra_parser(parser.add_subparsers(dest="command"))
+    base = ["infra", "table", "--site", str(site), "--layouts", str(dirs["runs"]), "--manifest", str(manifest), "--output-dir", str(tmp_path / "out")]
+    assert parser.parse_args(base).without_robots_seeds is None
+    assert parser.parse_args([*base, "--without-robots-seeds", "1-2"]).without_robots_seeds == [1, 2]
+    args = parser.parse_args([*base, "--without-robots-seeds", "none"])
+    assert args.without_robots_seeds == []
+    # no seed has a run without robots: every row is complete with its total, none has parts
+    assert infra.infra_command(args) == 0
+    table = pl.read_parquet(tmp_path / "out" / infra.TABLE_FILE)
+    assert table["complete"].all() and not table["split"].any() and table["C_adult"].to_list() == pytest.approx([60.0 / 300.0] * 2)
+    assert table["C_adult_element"].null_count() == 2 and "C_adult_split" not in table.columns and "split_seeds" in infra.layout_means(table).columns
+    assert "of 0 with a run without robots" in capsys.readouterr().out
+    # without the option the same run dirs miss the run without robots on every seed
+    assert infra.infra_command(parser.parse_args(base)) == 0
+    assert "2 (layout, seed) rows not complete (missing runs: without robots)" in capsys.readouterr().out
+    # a seed list that does not parse is refused with its reason, not with the type's name
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--without-robots-seeds", "51-"])
+    assert "seeds are whole numbers and ranges like 51-55,60 or `none`, not '51-'" in capsys.readouterr().err
+
+
+def test_the_fleet_mode_ran_where_its_log_was_reset_in_the_episode() -> None:
+    episode_ns = 3_096_400_000_000
+    # the latched copy is recorded first (its message index is the lower)
+    latched = _message({"t0": "1595.303", "job.0.kind": "delivery", "job.0.outcome": "completed"}, episode_ns)
+    reset = _message({"t0": "3096.401", "job.0.kind": "delivery"}, episode_ns)
+    assert infra.fleet_ran_in(reset) and infra.fleet_ran_in(pl.concat([latched, reset]))
+    # a recorder that joins 16 s into the episode stamps the reset message that much later: still this episode's
+    assert infra.fleet_ran_in(pl.concat([latched, _message({"t0": "3096.401"}, episode_ns + 16_000_000_000)]))
+    # the log an earlier fleet episode left latched is all a later run without robots records: not a fleet run,
+    # though the log reads as full
+    assert not infra.fleet_ran_in(latched) and infra.log_from_snapshot(latched)["job.0.outcome"] == "completed"
+    # the latched copy can come without a stamp (infra_eval_s2_h1 episode_010: every fleet row at 0, t0 13569.550)
+    assert not infra.fleet_ran_in(_message({"t0": "13569.550", "job.0.kind": "delivery"}, 0)) and not infra.fleet_ran_in(_message({"t0": "5.200"}, 0))
+    assert infra.fleet_ran_in(pl.concat([_message({"t0": "13569.550"}, 0), _message({"t0": "15071.300"}, 15_071_200_000_000)], how="vertical_relaxed"))
+    assert not infra.fleet_ran_in(pl.DataFrame()) and not infra.fleet_ran_in(_log({}))
+    # a fleet log without t0 cannot be told apart and counts as a fleet run
+    assert infra.fleet_ran_in(_message({"job.0.kind": "delivery"}, episode_ns))
+
+
+def test_a_run_without_robots_is_never_the_fleet_run_whatever_its_contestant_is_called(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # crowd-only runs under a name the analysis does not know, and no seed named to have a run without robots
+    site, dirs, doc = _layout_runs(tmp_path / "alone", monkeypatch, {"crowd": [("crowd_only", 1), ("crowd_only", 2)]})
+    for named in (None, []):
+        alone = infra.layout_table(site, dirs["crowd"], doc, split_seeds=named)
+        assert not alone["complete"].any() and "C_adult" not in alone.columns and "jobs_released" not in alone.columns
+        assert all("with the fleet" in reason and "the run under crowd_only (episode_00" in reason and "is not read as the fleet run" in reason for reason in alone["incomplete"].to_list())
+    # the same with the log of the lane's earlier fleet episode still latched in the recording
+    latched = _message({"t0": "100.000", "job.0.kind": "delivery", "job.0.released": "500.000", "job.0.ended": "700.000", "job.0.outcome": "completed"}, 1_500_000_000_000)
+    site, dirs, doc = _layout_runs(tmp_path / "latched", monkeypatch, {"crowd": [("crowd_only", 1), ("unhindered_peds", 1)]}, logs={"crowd_only": latched, "unhindered_peds": latched})
+    row = infra.layout_table(site, dirs["crowd"], {**doc, "seeds": [1]}).to_dicts()[0]
+    assert row["complete"] is False and row["incomplete"].startswith("missing runs: with the fleet; the run under crowd_only") and "jobs_released" not in row
+    assert row["C_adult"] == pytest.approx(30.0 / 300.0) and row["C_adult_traffic"] is None  # the element part alone, as for any row without its fleet run
+    # beside the fleet run it is a second run of the stage, refused
+    site, dirs, doc = _layout_runs(tmp_path / "beside", monkeypatch, {"fleet": [("fleet_dwb", 1)], "crowd": [("crowd_only", 1)]})
+    with pytest.raises(ValueError, match="stage site__layout_aaaa__s1 has more than one usable run"):
+        infra.layout_table(site, [dirs["fleet"], dirs["crowd"]], {**doc, "seeds": [1]}, split_seeds=[1])
+    # a run named as a run without robots in which the fleet mode ran is not read as one
+    site, dirs, doc = _layout_runs(tmp_path / "named", monkeypatch, {"runs": [("fleet_dwb", 1), ("peds_only", 1)]}, logs={"peds_only": _log(LOG)})
+    row = infra.layout_table(site, dirs["runs"], {**doc, "seeds": [1]}).to_dicts()[0]
+    assert row["complete"] is False and row["incomplete"].startswith("missing runs: without robots; the run under peds_only") and "C_adult" not in row
+    # a fleet contestant's run that recorded no fleet log is not the fleet run either, also where nothing names the seeds
+    site, dirs, doc = _layout_runs(tmp_path / "nolog", monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1)]}, logs={"fleet_dwb": None})
+    row = infra.layout_table(site, dirs["runs"], {**doc, "seeds": [1]}).to_dicts()[0]
+    assert row["complete"] is False and "the run under fleet_dwb (episode_000) holds no fleet task log reset in its episode" in row["incomplete"]
+
+
+def test_the_parts_sum_to_the_total_of_the_walkers_in_all_three_runs_not_to_the_seeds_total(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # two adults; the second does not finish the runs without robots
+    walkers = [*SITE, ("south_adult", "4", "adult", 600.0, 1000.0)]
+    every = [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2), ("unhindered_peds", 2)]
+    site, dirs, doc = _layout_runs(tmp_path, monkeypatch, {"runs": every}, lost=("4", "2"), walkers=walkers)
+    table = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    assert table["peds_adult"].to_list() == [2, 2] and table["peds_adult_split"].to_list() == [1, 1] and table["dropped_adult_split"].to_list() == [1, 1]
+    assert table["C_adult"].to_list() == pytest.approx([120.0 / 700.0] * 2) and table["C_adult_split"].to_list() == pytest.approx([60.0 / 300.0] * 2)
+    assert (table["C_adult_element"] + table["C_adult_traffic"]).to_list() == table["C_adult_split"].to_list()
+    assert table["C_adult_element"].to_list() == pytest.approx([30.0 / 300.0] * 2)
+    # the wheelchair user is in no three-run pair: a total, no parts, though the rows have the three runs
+    assert table["split"].all() and table["C_wheelchair"].to_list() == pytest.approx([60.0 / 400.0] * 2)
+    assert table["C_wheelchair_split"].to_list() == [None, None] and table["C_wheelchair_element"].to_list() == [None, None]
+    means = infra.layout_means(table)
+    assert (means["split_seeds"].to_list(), means["split_seeds_adult"].to_list(), means["split_seeds_wheelchair"].to_list(), means["split_seeds_long_cane"].to_list()) == ([2], [2], [0], [2])
+    assert "C_wheelchair_element" not in means.columns and means["C_adult_split"].to_list() == pytest.approx([60.0 / 300.0]) and means["C_adult"].to_list() == pytest.approx([120.0 / 700.0])
+    # where the three runs pair everything (nothing named) the total is the split's total
+    old = infra.layout_table(site, dirs["runs"], doc)
+    assert old["C_adult"].to_list() == table["C_adult_split"].to_list() and "C_adult_split" not in old.columns and "split_seeds" not in infra.layout_means(old).columns
+
+
+def test_named_seeds_report_the_visitors_and_miss_what_their_runs_miss(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    site, dirs, doc = _layout_runs(tmp_path / "visitors", monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("fleet_dwb", 2)]}, visitor=True)
+    table = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1])
+    # the visitor is reported on the seed with a run without robots, and is no through-walker on either
+    assert table["visitor_wheelchair_peds"].to_list() == [1, None] and table["visitor_wheelchair_walk_s"].to_list() == [pytest.approx(430.0), None]
+    assert table["visitor_wheelchair_traffic"].to_list() == [pytest.approx(30.0 / 430.0), None] and table["peds_wheelchair"].to_list() == [1, 1]
+    assert table["C_wheelchair"].to_list() == pytest.approx([60.0 / 400.0] * 2)
+    # every walker spawns before a 1,500 s warm-up: no row is complete, and each names the runs it read
+    late = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1], warmup_s=1500.0)
+    assert not late["complete"].any() and late["c_worst"].is_null().all()
+    assert late["incomplete"].to_list() == ["no walker spawned after the 1500 s warm-up and finished: the site as is, without robots, with the fleet", "no walker spawned after the 1500 s warm-up and finished: the site as is, with the fleet"]
+    # a named seed with its run without robots but no fleet run has no total and no parts
+    site, dirs, doc = _layout_runs(tmp_path / "nofleet", monkeypatch, {"runs": [("fleet_dwb", 1), ("unhindered_peds", 1), ("unhindered_peds", 2)]})
+    table = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    assert table["complete"].to_list() == [True, False] and table["incomplete"].to_list() == [None, "missing runs: with the fleet"]
+    assert table["split"].to_list() == [True, False] and table["C_adult"].to_list() == [pytest.approx(60.0 / 300.0), None] and table["C_adult_element"].to_list() == [pytest.approx(30.0 / 300.0), None]
+
+
+def test_compare_reads_the_two_run_totals_whether_or_not_a_seed_has_the_split(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fleet = [("fleet_dwb", seed, layout) for layout in ("aaaa", "bbbb") for seed in (1, 2)]
+    picks = {"joint": "bbbb", "robot_only": "aaaa"}
+    site, dirs, doc = _layout_runs(tmp_path / "some", monkeypatch, {"runs": [*fleet, ("unhindered_peds", 1, "aaaa"), ("unhindered_peds", 1, "bbbb")]})
+    some = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1])
+    assert some["complete"].all() and some["split"].to_list() == [True, False, True, False]
+    site, dirs, doc = _layout_runs(tmp_path / "every", monkeypatch, {"runs": [*fleet, *[("unhindered_peds", seed, layout) for layout in ("aaaa", "bbbb") for seed in (1, 2)]]})
+    every = infra.layout_table(site, dirs["runs"], doc, split_seeds=[1, 2])
+    unnamed = infra.layout_table(site, dirs["runs"], doc)
+    results = [infra._plain(infra.compare(table, picks, n_boot=500)) for table in (some, every, unnamed)]
+    assert results[0] == results[1] == results[2]
+    assert results[0]["seeds"] == [1, 2] and results[0]["delta_c_worst"]["estimate"] == pytest.approx(20.0 / 300.0 - 60.0 / 300.0) and results[0]["verdict"] == "lower"
+    assert results[0]["delta_aid_minus_adult"]["wheelchair"]["seeds"] == 2
+
+
+def test_the_seed_bootstrap_is_the_percentile_one_its_p_agrees_with_its_interval() -> None:
+    rng = np.random.default_rng(3)
+    for values in (rng.normal(0.02, 0.01, 10), rng.normal(0.0, 0.01, 10), rng.normal(-0.01, 0.02, 6)):
+        estimate, low, high, p = infra.seed_bootstrap(values, n_boot=4000, rng=np.random.default_rng(0))
+        assert estimate == pytest.approx(float(np.mean(values)))
+        assert (p < 0.05) == (low > 0.0 or high < 0.0)
+        # the same draws give the same interval and p
+        assert infra.seed_bootstrap(values, n_boot=4000, rng=np.random.default_rng(0)) == (estimate, low, high, p)
+    assert all(math.isnan(v) for v in infra.seed_bootstrap(np.array([np.nan]), n_boot=10, rng=np.random.default_rng(0)))

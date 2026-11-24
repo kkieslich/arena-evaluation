@@ -115,6 +115,9 @@ Examples:
 
   # Check a suite or contest definition without running it:
   evaluation validate --suite configs/suites/basic
+
+  # INFRA: service and cost per layout, the premise check, the pick, the comparison (see processing/infra.py):
+  evaluation infra pick --site <site run> --layouts <selection run> --manifest <suites>/infra_h1.layouts.json
 """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -265,10 +268,21 @@ Examples:
     )
 
     from arena_evaluation.cli_acoustic import add_acoustic_commands
+    from arena_evaluation.processing.infra import add_infra_parser
 
     add_acoustic_commands(subparsers)
+    add_infra_parser(subparsers)
 
     args = parser.parse_args(argv)
+
+    if args.command == "infra":
+        from arena_evaluation.processing.infra import infra_command
+
+        try:
+            return infra_command(args)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     if args.list_manifests:
         from arena_evaluation.presentation.manifest_registry import available_manifests

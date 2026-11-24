@@ -1,0 +1,1597 @@
+"""INFRA measures (study design §6, §8, §10, §12) over processed benchmark runs of `flowedit infra`'s suites.
+
+Inputs are benchmark directories `evaluation process` has run on (each episode's fact table
+`metrics/fact_episodes.parquet` and its extracted `topics/`) and the `<suite>.layouts.json` manifest `flowedit infra` writes beside a layout suite. One suite's
+runs may lie in several run dirs (its parts recorded on several machines): they are read as one, their manifests must
+name the same Arena and humansim commits (`check_commits`), and a stage two of them hold is refused like a stage run
+twice. What the measures read of an episode is small once `evaluation infra times` has kept each run's walker travel
+times beside its tracks (`walker_times`): the run dir's `manifest.yaml`, and per episode its `episode_NNN.yaml`,
+`metrics/fact_episodes.parquet`, `topics/episode_fleet_log.parquet` and `topics/.derived/infra_times.*/`; such a copy of a run dir reads like the
+original without its recording or its tracks, for the warm-up the times were kept for (another one raises). Kept times
+name the track store's version and a digest of their code, and record the arena_evaluation commit that computed them:
+times of other code are never read, and times of different commits are refused like runs of different commits.
+
+- **Robot service** (§6), from the fleet mode's task log (the `fleet` semantic entity, schema in kkieslich/Arena's
+  `task_generator/tasks/robots/README.md#fleet-task-log`, extracted to `episode_fleet_log`): `T` = the restricted mean task time (release to
+  completion) of the jobs released after the warm-up, up to a horizon fixed per study (default the episode minus the
+  warm-up), from the Kaplan-Meier estimate with the jobs not completed censored at their elapsed time, so the slow jobs
+  an episode cuts off still count (`restricted_mean`); the plain mean over completed jobs, the completed and censored
+  shares are reported beside it; success rate = completed over released after the warm-up (jobs still open at the
+  episode end apart); charger queue time (`dispatched - queued`); tasks per hour; failed and abandoned jobs, and the
+  jobs failed by jams (`reason: jam`, §8); the time a job waited for a robot (`assigned - released`) and the time its
+  robot held in place before busy docks (`wait_s`), both part of T.
+- **Pedestrian cost** (§6): per group, `C_g` = mean extra travel time per pedestrian over the group's mean travel time
+  in the site as is (a ratio of means), through-walkers only, paired by `(source_name, source_seq)`, counted when
+  spawned after the warm-up and finished in all three runs: the site as is, the layout without robots and the layout
+  with the fleet. The element part pairs the layout without robots with the site, the traffic part the layout with
+  robots with the one without; all divide by the same reference travel time, so element + traffic = total.
+  `C_worst` = max over groups. Locker visitors (the layout's own sources) are reported apart: their walk in the layout
+  without robots and their traffic part. A study may record the run without robots on some seeds only
+  (`without_robots_seeds` in the manifest, or `--without-robots-seeds`): `C_g` then pairs the site as is and the fleet
+  run on every seed, and the element and traffic parts come from the named seeds, of the walkers that finished all
+  three runs (`layout_table`). Those are fewer walkers than the total's, so the parts sum to their own total
+  (`C_<group>_split`), which on recorded data differs from `C_g` in most rows. Without the key every seed needs the
+  three runs, as above. The run without robots is the runner's `unhindered_peds` reference of the fleet stage, or the
+  same stage recorded on its own with the crowd-only contestant (`peds_only`), which starts no robot stack. A run is
+  the fleet run only if the fleet mode reset its task log in it (`fleet_ran`), whatever its contestant is called.
+- **The premise check** (§10) on the narrowest and the widest layout: their `C_worst` gap against the seed spread,
+  over both layouts, and the task rate the selection runs at, 75 % of the fleet's measured capacity in the wide layout
+  (`RATE_ROLE`); the narrow layout's capacity is reported, its service and cost count as layout cost. The capacity
+  counts a robot out of service while it charges (the `charge` table) and while it drives to a charger to top up (the
+  `top_up` table, which takes no job meanwhile).
+- **The pick** (§5, §6): among the joint top 10, the layout with the lowest `C_worst` as the mean over the selection
+  seeds. Equal service is held by the search's travel pre-filter (modelled travel within 1.05 times the robot-only
+  pick's); a joint layout whose measured `T` exceeds 1.05 times the robot-only pick's beyond its 95 % seed interval is
+  flagged, not dropped (an episode completes about two jobs at the study rate, too few to decide on). A layout with more
+  than 20 % of its tasks failed by jams is dropped (§8).
+- **The comparison** (§12) on the evaluation seeds: per seed the difference joint pick - robot-only pick of `C_worst`,
+  `T` (relative to the robot-only pick's) and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds
+  (`seed_bootstrap`, a seed per cluster: a percentile interval and its p) and Holm across the two aid groups. The decision has
+  three outcomes: `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies below 0, `equivalent` when
+  its 90 % interval lies within +-`DELTA` (the smallest cost of interest, 0.01), else `inconclusive`. With the guideline
+  layout among the picks (a practice-based baseline, not held to the travel margin), the secondary contrasts joint -
+  guideline and robot-only - guideline get the same rule; Holm across the two applies to their `lower` claims, and
+  `equivalent` uses each one's unadjusted 90 % interval. Both intervals come from one set of bootstrap draws.
+- **The score check** (§12): Spearman between the predicted worst-group conflict exposure (the joint ranking's score,
+  `ranking_score`) and the measured `C_worst` over the selection layouts (robot-only, joint top 10, random), one-sided
+  permutation p; per group, the predicted traffic term (the time near driving robots) against the measured traffic
+  part. The older forecaster check (joint top 10 and random only) is reported beside it.
+- **Conflict exposure** (§11), measured per fleet run: per walker group, the seconds a walker spends within
+  `CONFLICT_BAND_M` (1 m) of a driving robot after the warm-up, over the group's walkers seen after it
+  (`conflict_exposure`, kept beside the walker times by `evaluation infra times`); beside it the same measure within
+  `PREDICTION_BAND_M` (2 m, the joint ranking's band), for the predicted-vs-measured figure.
+- **Group cells** (`evaluation infra occupancy`): per walker group, the walker-seconds per 0.5 m cell of a run dir's
+  runs (`infra_occupancy.parquet`), the per-group occupancy the joint ranking reads (`flowedit infra layouts
+  --group-occupancy`).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import functools
+import json
+import math
+import pathlib
+import re
+import typing
+
+import numpy as np
+import polars as pl
+
+from arena_evaluation.processing.metrics.social.paired_peds import _travel_times
+from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group
+from arena_evaluation.processing import ped_track_store
+from arena_evaluation.processing.benchmark_runs import FACTS_FILE, episode_runs
+from arena_evaluation.processing.parquet_store import TopicParquetStore
+from arena_evaluation.processing.ped_track_store import DERIVED_DIR, TOPICS_DIR, topics_envs, tracks_for_episode
+
+#: The warm-up the analysis leaves out and the episode length (Kolja, 9 Nov: 25 min with 7 min warm-up)
+WARMUP_S = 420.0
+#: §6: equal robot service is a mean task time within 5 % of the robot-only pick's
+SERVICE_SLACK = 1.05
+#: §8: a layout with more than this share of its tasks failed by jams is dropped
+JAM_DROP = 0.20
+#: The groups (§9) and the aid groups the comparison contrasts with adults (§12)
+GROUPS = ("adult", "wheelchair", "long_cane")
+AID_GROUPS = ("wheelchair", "long_cane")
+#: The runner's contestant of the runs without robots, and the site-as-is suite's contestant
+NO_ROBOTS = "unhindered_peds"
+SITE_PLANNER = "peds_only"
+#: The contestants of a layout's run without robots: the runner's reference of the fleet stage (the robot stack up, the
+#: robots parked off the map), or the stage recorded on its own with the crowd-only contestant
+WITHOUT_ROBOTS = (NO_ROBOTS, SITE_PLANNER)
+#: The manifest key naming the seeds that have a run without robots; without it every seed has one
+WITHOUT_ROBOTS_SEEDS = "without_robots_seeds"
+#: A fleet task log was reset in an episode when the first stamped message that carries its last `t0` is stamped
+#: within this many seconds of that `t0` [s]. Recorded fleet runs: 0.00 to 0.13 s. The copy a lane's earlier fleet
+#: episode left latched, which a later run without robots records at its start: an episode length (about 1500 s), or a
+#: message without a stamp
+FLEET_RESET_SLACK_S = 60.0
+#: The most seeds a seed list may name (`_seed_list`)
+MAX_SEEDS = 10_000
+FLEET_KIND = "fleet"
+TABLE_FILE = "infra_layouts.parquet"
+FIGURE_FILE = "infra_service_cost.png"
+_STAGE = re.compile(r"^(?P<world>.+)__s(?P<seed>\d+)$")
+#: the checkouts whose commits the run dirs read together must share (`check_commits`): the code that recorded them
+#: (arena_evaluation is the runner: it records the episodes and sets their seeds)
+SAME_COMMITS = ("arena", "humansim", "arena_evaluation")
+#: the runner's manifest of a run dir
+RUN_MANIFEST = "manifest.yaml"
+#: version of the kept walker travel times' layout (`walker_times`); their dir also names the track store's version and a
+#: digest of the code that computes them (`times_dir`)
+TIMES_VERSION = 3
+#: the parquet metadata key of a kept times file's provenance
+TIMES_META = b"infra_times"
+#: §12: the smallest cost of interest, the equivalence margin of the C_worst difference (the wheelchair users' element
+#: cost of every element at the narrowest section, premise check), and the level of the equivalence interval
+DELTA = 0.01
+EQUIVALENCE_LEVEL = 0.90
+#: §12: permutations of the score check's one-sided p
+SCORE_PERMUTATIONS = 10_000
+#: §11: a walker within this distance of a driving robot (faster than `MOVING_MPS`) counts as exposed to it [m], [m/s]
+CONFLICT_BAND_M = 1.0
+MOVING_MPS = 0.1
+#: the conflict exposure reads the walkers every this many seconds [s]
+EXPOSURE_STEP_S = 0.5
+#: the joint ranking's conflict band (flowedit search `CONFLICT_BAND_M`) [m]: the exposure measured within it is kept
+#: beside §11's, as `exposed_<tag>_s` / `exposure_<tag>_s` (tag `PREDICTION_BAND_TAG`), for the predicted-vs-measured figure
+PREDICTION_BAND_M = 2.0
+PREDICTION_BAND_TAG = f"{PREDICTION_BAND_M:g}m".replace(".", "p")
+#: version of the kept conflict exposure's layout (2: robot tracks deduplicated by stamp, no robot tracks gives None;
+#: 3: also the exposure within `PREDICTION_BAND_M`)
+EXPOSURE_VERSION = 3
+#: the parquet metadata key of a kept conflict exposure file's provenance
+EXPOSURE_META = b"infra_exposure"
+#: group cells: the file `evaluation infra occupancy` writes into a run dir, and the cell size
+OCCUPANCY_FILE = "infra_occupancy.parquet"
+OCCUPANCY_CELL_M = 0.5
+_VISITOR = re.compile(r"_locker_(?P<group>.+)$")
+
+
+# --- runs ------------------------------------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Run:
+    """One recorded run of a stage: its contestant, world and seed, and where its episode's tracks are."""
+
+    planner: str
+    stage: str
+    world: str
+    seed: int
+    episode: int
+    env: str
+    episode_dir: pathlib.Path
+
+
+def runs(benchmark_dir: pathlib.Path) -> list[Run]:
+    """Every usable run of a processed benchmark dir whose stage is `<world>__s<seed>`, one per (planner, stage,
+    episode, env) (`benchmark_runs.episode_runs`: an episode with fact rows, or a crowd-only one; an episode without a
+    recording or whose processing failed, a failed attempt the runner retried, is left out), and of the reference
+    episodes only the runs without robots (`unhindered_peds`). Check for a stage run twice with `unique`."""
+    out: dict[tuple[str, str, int, str], Run] = {}
+    for run in episode_runs(benchmark_dir):
+        match = _STAGE.match(run.stage)
+        if match is None:
+            continue
+        if run.is_reference and str(run.reference_type or run.planner) != NO_ROBOTS:
+            continue
+        key = (run.planner, run.stage, run.episode, run.env)
+        if key not in out:
+            out[key] = Run(key[0], key[1], match["world"], int(match["seed"]), key[2], key[3], run.episode_dir)
+    return sorted(out.values(), key=lambda r: (r.world, r.seed, r.planner, r.episode, r.env))
+
+
+def runs_of(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path]) -> list[Run]:
+    """Every usable run of one or several processed benchmark dirs (`runs`), in one list."""
+    out: list[Run] = []
+    for benchmark_dir in _dirs(benchmark_dirs):
+        out.extend(runs(benchmark_dir))
+    return sorted(out, key=lambda r: (r.world, r.seed, r.planner, str(r.episode_dir), r.env))
+
+
+def _dirs(value: pathlib.Path | str | typing.Sequence[pathlib.Path | str]) -> list[pathlib.Path]:
+    """One run dir or several, as a list of paths."""
+    if isinstance(value, (str, pathlib.Path)):
+        return [pathlib.Path(value)]
+    return [pathlib.Path(v) for v in value]
+
+
+def unique(candidates: typing.Sequence[Run], what: str) -> Run | None:
+    """The one run of `candidates`, None without any; ValueError naming the stage and its episodes when a stage was
+    run more than once (a retried step whose failed attempt still has a recording, or a stage two run dirs read
+    together both hold): the analysis never guesses."""
+    if not candidates:
+        return None
+    if len({(r.episode_dir, r.env) for r in candidates}) > 1:
+        several = len({r.episode_dir.parent.parent for r in candidates}) > 1
+        episodes = ", ".join(f"episode_{r.episode:03d} ({r.env})" + (f" in {r.episode_dir.parent.parent}" if several else "") for r in candidates)
+        raise ValueError(f"{what}: stage {candidates[0].stage} has more than one usable run ({episodes}); remove the failed attempt or re-process" + ("; run dirs read together must not share a stage" if several else ""))
+    return candidates[0]
+
+
+_WARNED: set[str] = set()
+
+
+def _warn(message: str) -> None:
+    """A warning on stderr, once per process."""
+    import sys
+
+    if message not in _WARNED:
+        _WARNED.add(message)
+        print(f"warning: {message}", file=sys.stderr)
+
+
+def check_commits(run_dirs: typing.Sequence[pathlib.Path], *, allow_mixed: bool = False) -> None:
+    """Fail when the manifests of `run_dirs` (the site and layout dirs alike) name different commits of a SAME_COMMITS
+    checkout: their runs ran other code and do not belong in one comparison; `allow_mixed` warns instead.
+
+    A run dir without a manifest, or with one that records no commits or not this checkout's, is not compared, with a
+    warning. A dirty checkout is compared by its commit, with a warning: git counts untracked files (local worlds, run
+    data) as dirty, so most study checkouts are, and refusing them would refuse every run; the check therefore refuses
+    runs of different releases, it does not prove that two runs ran the same code."""
+    import yaml
+
+    seen: dict[str, dict[pathlib.Path, str]] = {}
+    for run_dir in run_dirs:
+        path = pathlib.Path(run_dir) / RUN_MANIFEST
+        doc = yaml.safe_load(path.read_text()) if path.is_file() else None
+        commits = doc.get("commits") if isinstance(doc, dict) else None
+        if not isinstance(commits, dict):
+            _warn(f"{run_dir}: " + (f"no {RUN_MANIFEST}" if doc is None else f"its {RUN_MANIFEST} records no commits") + ", so its Arena and humansim commits are not compared")
+            continue
+        for name in SAME_COMMITS:
+            entry = commits.get(name) if isinstance(commits.get(name), dict) else {}
+            if not entry.get("commit"):
+                _warn(f"{run_dir}: no {name} commit recorded ({entry.get('reason') or 'not in the manifest'}), so it is not compared")
+                continue
+            if entry.get("dirty"):
+                _warn(f"{run_dir}: its {name} checkout ({entry.get('path')}) was dirty at {str(entry['commit'])[:12]}, so the commit does not pin the code that ran")
+            seen.setdefault(name, {})[pathlib.Path(run_dir)] = str(entry["commit"])
+    for name, found in seen.items():
+        if len(set(found.values())) > 1:
+            message = f"the run dirs ran different {name} commits: " + ", ".join(f"{d} {c[:12]}" for d, c in found.items()) + "; read only runs of one Arena release together"
+            if not allow_mixed:
+                raise ValueError(message + " (--allow-mixed-commits reads them anyway)")
+            _warn(message)
+
+
+def check_kept_times(run_dirs: typing.Sequence[pathlib.Path], warmup_s: float, *, allow_mixed: bool = False) -> None:
+    """Fail when the walker times kept in `run_dirs` for `warmup_s` (`walker_times`) were computed by different
+    arena_evaluation commits, or the conflict exposure kept there (`run_exposure`) was: each machine keeps its own runs'
+    times and exposure, and each kind must come from one release. The two kinds are compared separately: exposure kept
+    later by a newer release (it is computed on first read where the tracks are) never makes the times mixed.
+    `allow_mixed` warns instead. A dirty checkout is compared by its commit, with a warning, as in `check_commits`; a
+    kept file whose commit git could not read, or an exposure file that records no provenance, is not compared, with a
+    warning; an exposure file of other code (`_exposure_code`) is not read as current (`run_exposure` computes it again
+    or leaves it out), so it is not compared either. The commit is the one that computed the times or the exposure from
+    the tracks (`evaluation infra times` or the analysis), not the one that extracted the topics and built the tracks,
+    which can be older: the track store's version in the times' dir name covers that. The times files are
+    `<env>.w<warm-up>.parquet` only; the exposure files beside them (`<env>.exposure<version>.w<warm-up>.parquet`) are
+    read as exposure, never as times."""
+    found: dict[str, dict[str, list[pathlib.Path]]] = {"walker times": {}, "conflict exposure": {}}
+    key = _warmup_key(warmup_s)
+    code = _exposure_code()
+    for run_dir in run_dirs:
+        kept = pathlib.Path(run_dir).glob(f"episodes/*/{TOPICS_DIR}/{DERIVED_DIR}/{times_dir()}/*.w{key}.parquet")
+        for path in sorted(kept):
+            env = path.name.split(".", 1)[0]
+            if path.name == f"{env}.w{key}.parquet":
+                what, processing = "walker times", (times_provenance(path) or {}).get("arena_evaluation") or {}
+            elif path.name == f"{env}.exposure{EXPOSURE_VERSION}.w{key}.parquet":
+                provenance = exposure_provenance(path)
+                if provenance is None:
+                    _warn(f"{run_dir}: conflict exposure kept without its provenance, so its code is not compared")
+                    continue
+                if provenance.get("code") != code:
+                    continue
+                what, processing = "conflict exposure", provenance.get("arena_evaluation") or {}
+            else:
+                continue
+            if not processing.get("commit"):
+                _warn(f"{run_dir}: {what} kept without a readable arena_evaluation commit ({processing.get('reason') or 'git could not read the checkout'}), so their code is not compared")
+                continue
+            commit = str(processing["commit"])
+            if processing.get("dirty"):
+                _warn(f"{run_dir}: {what} kept by a dirty arena_evaluation checkout at {commit[:12]}, so the commit does not pin the code that computed them")
+            found[what].setdefault(commit, []).append(pathlib.Path(run_dir))
+    mixed = [f"{what} kept by different arena_evaluation commits: " + ", ".join(f"{c[:12]} in {', '.join(sorted({str(d) for d in dirs}))}" for c, dirs in commits.items()) for what, commits in found.items() if len(commits) > 1]
+    if mixed:
+        message = "; ".join(mixed) + "; keep them again with one release: `evaluation infra times --recompute --benchmark <run dir>` where each run's tracks are"
+        if not allow_mixed:
+            raise ValueError(message + " (--allow-mixed-commits reads them anyway)")
+        _warn(message)
+
+
+def restricted_mean(times: typing.Sequence[float], completed: typing.Sequence[bool], tau_s: float) -> float | None:
+    """The restricted mean of a time to completion up to `tau_s` from the Kaplan-Meier estimate: the area under the
+    survival curve S(t) (the share not yet completed) from 0 to `tau_s`. A time with `completed` False is right-censored
+    there (a job still open at the episode end, or one that failed or was abandoned: its task time exceeds what was
+    seen). At a tie, completions go before censorings; S stays at its last value up to `tau_s`. None without times."""
+    pairs = sorted((float(t), bool(c)) for t, c in zip(times, completed, strict=True) if t is not None and math.isfinite(t))
+    if not pairs:
+        return None
+    at_risk, survival, area, last = len(pairs), 1.0, 0.0, 0.0
+    i = 0
+    while i < len(pairs) and pairs[i][0] < tau_s:
+        t = max(pairs[i][0], 0.0)
+        area += survival * (t - last)
+        last = t
+        j, events = i, 0
+        while j < len(pairs) and pairs[j][0] == pairs[i][0]:
+            events += pairs[j][1]
+            j += 1
+        if events:
+            survival *= 1.0 - events / at_risk
+        at_risk -= j - i
+        i = j
+    return area + survival * (tau_s - last)
+
+
+# --- robot service ---------------------------------------------------------------------------------------------------
+
+
+#: The extracted task log of the fleet mode (`episode_fleet_log`: one row per field per semantic snapshot message)
+FLEET_LOG_FILE = "episode_fleet_log.parquet"
+
+
+def _fleet_table(episode_dir: pathlib.Path) -> pl.DataFrame | None:
+    path = pathlib.Path(episode_dir) / TOPICS_DIR / FLEET_LOG_FILE
+    return pl.read_parquet(path) if path.is_file() else None
+
+
+def fleet_log(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, str]:
+    """The fleet mode's task log of `env` in an extracted episode: the last value of each field of its `fleet` entity
+    since the episode's reset (`log_from_snapshot`), {} without one."""
+    table = _fleet_table(episode_dir)
+    return {} if table is None else log_from_snapshot(table, env)
+
+
+def fleet_ran(episode_dir: pathlib.Path, env: str = "env_0") -> bool:
+    """Whether the fleet mode ran in an extracted episode of `env` (`fleet_ran_in`); False without a fleet log table."""
+    table = _fleet_table(episode_dir)
+    return table is not None and fleet_ran_in(table, env)
+
+
+def _fleet_rows(snapshot: pl.DataFrame, env: str) -> pl.DataFrame:
+    """The task log rows of `env` (all of them when the table holds one env) in recording order: by stamp, and at one
+    stamp by message."""
+    rows = snapshot
+    if "env_id" in rows.columns and rows["env_id"].n_unique() > 1:
+        rows = rows.filter(pl.col("env_id") == env)
+    return rows.sort("t_ns", "msg_index", maintain_order=True)
+
+
+def fleet_ran_in(snapshot: pl.DataFrame, env: str = "env_0") -> bool:
+    """Whether the fleet mode ran in the episode of a task log table (`episode_fleet_log`): it holds rows of `env`, and
+    the task log was reset in this episode. The fleet mode writes `t0`, the reset's time, on every reset, so the first
+    stamped message that carries the last `t0` is stamped at about that time (`FLEET_RESET_SLACK_S`, either way). A run
+    without robots recorded after a fleet episode of its lane starts with that episode's log still latched, and that is
+    not a fleet run: its only `t0` is an episode older than the message's stamp, or the message has no stamp at all (0;
+    both occur in recorded runs). A table without any row is not one either. A fleet log without a `t0` row cannot be
+    told apart this way and counts as a fleet run, as it always did."""
+    if len(snapshot) == 0 or "field_name" not in snapshot.columns:
+        return False
+    rows = _fleet_rows(snapshot, env)
+    if len(rows) == 0:
+        return False
+    t0 = rows.filter(pl.col("field_name") == "t0")
+    if len(t0) == 0:
+        return True
+    last = t0["value_str"][-1]
+    reset_s = _f(last)
+    carried = t0.filter((pl.col("value_str") == last) & (pl.col("t_ns") > 0))
+    return reset_s is not None and len(carried) > 0 and abs(reset_s - carried["t_ns"][0] / 1e9) <= FLEET_RESET_SLACK_S
+
+
+def log_from_snapshot(snapshot: pl.DataFrame, env: str = "env_0") -> dict[str, str]:
+    """The task log of `env`'s `fleet` entity in a task log table (`episode_fleet_log`): the last value of each field
+    from the episode's reset on. A recording starts with the semantic state its lane's previous episode left latched,
+    that episode's whole task log; the fleet mode writes `t0` on every reset, so the rows before the first one with the
+    last `t0` belong to an earlier episode and are left out (else a field this episode never wrote, a charge's `ended`,
+    a job's `outcome`, would keep the earlier episode's value).
+
+    The boundary lies in recording order, not at a stamp: the latched copy and the reset message can carry one stamp,
+    and the latched copy comes first. The table keeps every message apart (`msg_index`, the messages in recording
+    order), so the boundary is the message that holds the first row with the last `t0`."""
+    if len(snapshot) == 0 or "field_name" not in snapshot.columns:
+        return {}
+    rows = _fleet_rows(snapshot, env)
+    t0 = rows.filter(pl.col("field_name") == "t0")
+    if len(t0):
+        first = t0.filter(pl.col("value_str") == t0["value_str"][-1]).row(0, named=True)
+        rows = rows.filter((pl.col("t_ns") > first["t_ns"]) | ((pl.col("t_ns") == first["t_ns"]) & (pl.col("msg_index") >= first["msg_index"])))
+    return {field: value for field, value in rows.select("field_name", pl.col("value_str").fill_null("")).iter_rows()}
+
+
+def _table(log: typing.Mapping[str, str], prefix: str) -> list[dict[str, typing.Any]]:
+    """The `<prefix>.<i>.<field>` records of a task log, by index."""
+    out: dict[int, dict[str, typing.Any]] = {}
+    for key, value in log.items():
+        head, _, rest = key.partition(".")
+        if head != prefix:
+            continue
+        index, _, field = rest.partition(".")
+        out.setdefault(int(index), {"index": int(index)})[field] = value
+    return [out[i] for i in sorted(out)]
+
+
+def _f(value: object) -> float | None:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def jobs(log: typing.Mapping[str, str]) -> list[dict[str, typing.Any]]:
+    """The jobs of a task log: index, kind, release, robot, assignment, load, end, outcome and reason, times as floats."""
+    return [{**job, **{k: _f(job.get(k)) for k in ("released", "assigned", "loaded", "ended", "energy_wh", "timeout_0", "timeout_1", "wait_s")}} for job in _table(log, "job")]
+
+
+def charges(log: typing.Mapping[str, str]) -> list[dict[str, typing.Any]]:
+    """The charges of a task log, times and charges as floats."""
+    return [{**c, **{k: _f(c.get(k)) for k in ("queued", "dispatched", "started", "ended", "soc_start", "soc_end")}} for c in _table(log, "charge")]
+
+
+def top_ups(log: typing.Mapping[str, str]) -> list[dict[str, typing.Any]]:
+    """The top-ups of a task log (opportunistic charging trips, which no queue sends), times and charges as floats."""
+    return [{**t, **{k: _f(t.get(k)) for k in ("dispatched", "started", "ended", "soc_dispatched", "soc_start", "soc_end")}} for t in _table(log, "top_up")]
+
+
+def top_up_trip_s(top_up: typing.Mapping[str, typing.Any]) -> float | None:
+    """Seconds a top-up kept its robot out of service: from `dispatched` to `started` (docked: free for jobs from then
+    on, charging while parked), or to `ended` for one abandoned on its way; None while it is still on its way."""
+    end = top_up["started"] if top_up["started"] is not None else top_up["ended"]
+    return None if top_up["dispatched"] is None or end is None else end - top_up["dispatched"]
+
+
+def service(log: typing.Mapping[str, str], *, warmup_s: float = WARMUP_S, episode_s: float | None = None, tau_s: float | None = None) -> dict[str, typing.Any]:
+    """Robot service of one run (§6) over the jobs released after `warmup_s`.
+
+    T (`task_time_s`) is the restricted mean task time up to `tau_s` (default `episode_s` - `warmup_s`) from the
+    Kaplan-Meier estimate of the time from release to completion (`restricted_mean`): a completed job counts at
+    `ended - released`, a job that failed or was abandoned is censored at `ended - released`, and a job still open at the
+    episode end at `episode_s - released`. So the slow jobs an episode cuts off still count. The plain mean over the
+    completed jobs is `task_time_completed_s`, and `completed_share` and `censored_share` say how many there were. Also:
+    success rate (completed over those that ended), counts by outcome and of jam failures, the time a job waited for a
+    robot and for docks, the charger queue time of charges queued after the warm-up, the seconds charged (`charge_s`,
+    `dispatched` to `ended` of the charges queued after the warm-up that `charged`) and on top-up trips (`top_up_s`,
+    `top_up_trip_s` of the top-ups dispatched after the warm-up that docked or were abandoned), which the premise's
+    capacity counts as time out of service, and completed tasks per hour of the scored time (`episode_s` - `warmup_s`).
+    Without `episode_s` the open jobs are left out of T."""
+    scored = [j for j in jobs(log) if j["released"] is not None and j["released"] >= warmup_s]
+    ended = [j for j in scored if j["ended"] is not None]
+    completed = [j for j in ended if j.get("outcome") == "completed"]
+    jam = [j for j in ended if j.get("outcome") != "completed" and j.get("reason") == "jam"]
+    queued = [c for c in charges(log) if c["queued"] is not None and c["queued"] >= warmup_s]
+    waits = [c["dispatched"] - c["queued"] for c in queued if c["dispatched"] is not None]
+    busy = [j["ended"] - j["assigned"] for j in completed if j["assigned"] is not None]
+    assign_waits = [j["assigned"] - j["released"] for j in completed if j["assigned"] is not None]
+    dock_waits = [j["wait_s"] for j in completed if j["wait_s"] is not None]
+    charging = [c["ended"] - c["dispatched"] for c in queued if c["dispatched"] is not None and c["ended"] is not None and c.get("outcome") == "charged"]
+    topped = [t for t in top_ups(log) if t["dispatched"] is not None and t["dispatched"] >= warmup_s]
+    trips = [trip for trip in map(top_up_trip_s, topped) if trip is not None]
+    hours = None if episode_s is None or episode_s <= warmup_s else (episode_s - warmup_s) / 3600.0
+    tau = tau_s if tau_s is not None else (episode_s - warmup_s if episode_s is not None else None)
+    observed = [(j["ended"] - j["released"], j.get("outcome") == "completed") for j in ended]
+    if episode_s is not None:
+        observed += [(episode_s - j["released"], False) for j in scored if j["ended"] is None]
+    rmst = restricted_mean([t for t, _ in observed], [c for _, c in observed], tau) if tau is not None and observed else None
+    return {
+        "task_time_s": rmst,
+        "task_time_completed_s": float(np.mean([j["ended"] - j["released"] for j in completed])) if completed else None,
+        "task_time_tau_s": tau,
+        "completed_share": len(completed) / len(scored) if scored else None,
+        "censored_share": (len(scored) - len(completed)) / len(scored) if scored else None,
+        "jobs_released": len(scored),
+        "jobs_completed": len(completed),
+        "jobs_failed": sum(j.get("outcome") == "failed" for j in ended),
+        "jobs_abandoned": sum(j.get("outcome") == "abandoned" for j in ended),
+        "jobs_open": len(scored) - len(ended),
+        "jobs_jammed": len(jam),
+        "busy_s_per_job": float(np.mean(busy)) if busy else None,
+        "assign_wait_s": float(np.mean(assign_waits)) if assign_waits else None,
+        "dock_wait_s": float(np.mean(dock_waits)) if dock_waits else None,
+        "success_rate": len(completed) / len(ended) if ended else None,
+        "jam_share": len(jam) / len(ended) if ended else None,
+        "charges": len(queued),
+        "charger_queue_s": float(np.mean(waits)) if waits else None,
+        "charge_s": float(np.sum(charging)) if charging else 0.0,
+        "top_ups": len(topped),
+        "top_up_s": float(np.sum(trips)) if trips else 0.0,
+        "tasks_per_h": len(completed) / hours if hours else None,
+        "empty_batteries": len(_table(log, "empty")),
+    }
+
+
+# --- pedestrian cost -------------------------------------------------------------------------------------------------
+
+
+def _times(tracks: pl.DataFrame, warmup_s: float) -> pl.DataFrame:
+    """key, source_name, agent_type and travel time of each pedestrian spawned after the warm-up that finished."""
+    cut = tracks.filter(pl.col("t") >= warmup_s) if len(tracks) else tracks
+    done = _travel_times(cut)
+    sources = cut.group_by("key").agg(pl.col("source_name").first()) if len(cut) else pl.DataFrame(schema={"key": pl.String, "source_name": pl.String})
+    # by key: group_by keeps no order, and the cost sums floats in row order, so the same tracks give the same bits
+    return done.join(sources, on="key", how="left").sort("key")
+
+
+_TIMES_SCHEMA = {"key": pl.String, "agent_type": pl.String, "travel_s": pl.Float64, "source_name": pl.String}
+
+
+@functools.lru_cache(maxsize=1)
+def _times_code() -> str:
+    """A digest of the code the kept walker times come from (`_times`, `_travel_times`): changing it re-keys them."""
+    import hashlib
+    import inspect
+
+    from arena_evaluation.processing.metrics.social import paired_peds
+
+    try:
+        source = inspect.getsource(_times) + inspect.getsource(paired_peds._travel_times)
+    except (OSError, TypeError):
+        _warn("the source of _times and _travel_times cannot be read, so kept walker times are not re-keyed when that code changes")
+        return "nosource"
+    return hashlib.sha1(source.encode()).hexdigest()[:10]
+
+
+def times_dir() -> str:
+    """The dir name of the kept walker times: their layout's version, the track store's version and the code digest, so
+    times kept by other code are never read as current."""
+    return f"infra_times.v{TIMES_VERSION}.t{ped_track_store.TRACKS_VERSION}.{_times_code()}"
+
+
+def _warmup_key(warmup_s: float) -> str:
+    return repr(float(warmup_s))
+
+
+def times_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathlib.Path:
+    """Where the kept walker travel times of `env` in an episode lie for a warm-up of `warmup_s`, beside its tracks."""
+    return pathlib.Path(episode_dir) / TOPICS_DIR / DERIVED_DIR / times_dir() / f"{env}.w{_warmup_key(warmup_s)}.parquet"
+
+
+@functools.lru_cache(maxsize=1)
+def _processing() -> dict[str, typing.Any]:
+    """{path, commit, dirty} of the arena_evaluation checkout this code runs from, as the runner's manifests record
+    checkouts (`benchmark.state.commit_of`, not imported here: it needs ROS); commit None where git cannot tell."""
+    import subprocess
+
+    here = pathlib.Path(__file__).resolve()
+    checkout = next((d for d in here.parents if (d / ".git").exists()), None)
+    if checkout is None:
+        return {"path": None, "commit": None, "dirty": None, "reason": f"{here} lies in no git checkout"}
+
+    def git(*args: str) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    commit, status = git("rev-parse", "HEAD"), git("status", "--porcelain")
+    return {"path": str(checkout), "commit": commit, "dirty": None if status is None else bool(status)}
+
+
+def times_provenance(path: pathlib.Path) -> dict[str, typing.Any] | None:
+    """What a kept times file records of the code that computed it, None for a file without it."""
+    import pyarrow.parquet as pq
+
+    meta = pq.read_schema(path).metadata or {}
+    return json.loads(meta[TIMES_META]) if TIMES_META in meta else None
+
+
+def exposure_provenance(path: pathlib.Path) -> dict[str, typing.Any] | None:
+    """What a kept conflict exposure file records of the code that computed it, None for a file without it."""
+    import pyarrow.parquet as pq
+
+    meta = pq.read_schema(path).metadata or {}
+    return json.loads(meta[EXPOSURE_META]) if EXPOSURE_META in meta else None
+
+
+#: the extracted tables the walker tracks are built from (`ped_track_store.TRACK_TOPICS`): one of them must be there
+_PED_TABLES = (ped_track_store.ENGINE_TABLE, ped_track_store.ARENA_TABLE)
+
+
+def _env_rows(topics: pathlib.Path, table: str, env: str) -> bool:
+    path = topics / f"{table}.parquet"
+    return path.is_file() and pl.scan_parquet(path).filter(pl.col("env_id") == env).head(1).collect().height > 0
+
+
+def track_problem(episode_dir: pathlib.Path, env: str) -> str | None:
+    """Why an episode cannot give the walker tracks of `env`, None when it can: a current extraction of its recording
+    with that env and a pedestrian table. Without one, the track store would read the episode as one without walkers."""
+    topics = pathlib.Path(episode_dir) / TOPICS_DIR
+    if not (topics / TopicParquetStore.VERSION_FILE).is_file():
+        return "no extraction of its recording (a copy of the run dir); run `evaluation infra times --benchmark <its run dir> --warmup <s>` where the run's tracks are, and copy the run dir again"
+    if not TopicParquetStore.is_current(topics):
+        return "its extraction is of an older format; re-run `evaluation process` on the run dir"
+    if env not in topics_envs(topics):
+        return f"its extraction holds no {env}; re-run `evaluation process` on the run dir"
+    if not any(_env_rows(topics, table, env) for table in _PED_TABLES):
+        return f"its extraction holds no pedestrian table for {env}; re-run `evaluation process` on the run dir"
+    return None
+
+
+def has_tracks(episode_dir: pathlib.Path, env: str) -> bool:
+    """Whether an episode can give the walker tracks of `env` (`track_problem`)."""
+    return track_problem(episode_dir, env) is None
+
+
+def walker_times(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame:
+    """`_times` of an episode's tracks of `env`, kept beside the tracks (`times_path`, with the computing code's
+    provenance) and read from there afterwards, so a copy of a run dir without its tracks reads the same; `recompute`
+    computes and keeps them again from the tracks. Raises FileNotFoundError when nothing is kept for this warm-up (or
+    `recompute`) and the episode cannot give its tracks (`track_problem`), and ValueError for empty tracks: every INFRA
+    episode has walkers, so an episode is never scored as one without them."""
+    path = times_path(episode_dir, env, warmup_s)
+    if path.is_file() and not recompute:
+        return pl.read_parquet(path)
+    if not has_tracks(episode_dir, env):
+        problem = (track_problem(episode_dir, env) or "no tracks").replace("--warmup <s>", f"--warmup {warmup_s:g}")
+        raise FileNotFoundError(f"{episode_dir}: no walker times of {env} kept for a warm-up of {warmup_s:g} s ({TOPICS_DIR}/{DERIVED_DIR}/{times_dir()}/) and no tracks to compute them from: {problem}")
+    tracks = tracks_for_episode(episode_dir, env)
+    if len(tracks) == 0:
+        raise ValueError(f"{episode_dir}: the tracks of {env} hold no walker; an INFRA episode always has them, re-run `evaluation process` on the run dir")
+    times = _times(tracks, warmup_s)
+    times = times.select([pl.col(c).cast(t) if c in times.columns else pl.lit(None, dtype=t).alias(c) for c, t in _TIMES_SCHEMA.items()])
+    _keep_times(path, times, warmup_s)
+    return times
+
+
+# --- conflict exposure and group cells ------------------------------------------------------------------------------
+
+
+def robot_tracks(episode_dir: pathlib.Path, env: str = "env_0") -> dict[str, pl.DataFrame]:
+    """Each robot's ground-truth track of `env` in an extracted episode (`topics/robot_tracks.parquet`): time_ns, x, y,
+    in the env's frame, by robot name (its id without the `<env>_` prefix); {} without one."""
+    path = pathlib.Path(episode_dir) / TOPICS_DIR / "robot_tracks.parquet"
+    if not path.is_file():
+        return {}
+    rows = pl.scan_parquet(path).filter(pl.col("env_id") == env).select("robot_id", pl.col("t_ns").alias("time_ns"), "x", "y").collect()
+    out = {}
+    for robot in sorted(rows["robot_id"].unique().to_list()):
+        table = rows.filter(pl.col("robot_id") == robot).drop("robot_id").sort("time_ns")
+        out[str(robot).removeprefix(f"{env}_")] = table
+    return out
+
+
+def _dedupe(track: pl.DataFrame) -> pl.DataFrame:
+    """A robot track with one row per stamp (the first), sorted: a repeated stamp would make its speed undefined."""
+    return track.sort("time_ns").unique(subset="time_ns", keep="first", maintain_order=True)
+
+
+def conflict_exposure(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataFrame], warmup_s: float, *, band_m: float = CONFLICT_BAND_M, moving_mps: float = MOVING_MPS, step_s: float = EXPOSURE_STEP_S) -> pl.DataFrame:
+    """§11's conflict exposure: per walker group, the seconds a walker spends within `band_m` of a robot that drives
+    faster than `moving_mps`, from the warm-up on, over the group's walkers seen then (`walkers`); `exposed_s` is the
+    group's sum. Walker tracks (`ped_track_store`: t from the episode start, time_ns) are read every `step_s`, robot
+    positions interpolated at those times from their ground-truth tracks (the same sim clock; one row per stamp).
+    Without any robot track, exposed_s and exposure_s are None (not measured), not 0. Columns group, walkers, exposed_s,
+    exposure_s."""
+    schema = {"group": pl.String, "walkers": pl.Int64, "exposed_s": pl.Float64, "exposure_s": pl.Float64}
+    cut = tracks.filter(pl.col("t") >= warmup_s) if len(tracks) else tracks
+    if len(cut) == 0:
+        return pl.DataFrame(schema=schema)
+    cut = cut.with_columns(pl.struct("agent_type", "source_name").map_elements(lambda r: _group(r["agent_type"], r["source_name"]), return_dtype=pl.String).alias("group"))
+    walkers = cut.group_by("group").agg(pl.col("key").n_unique().alias("walkers"))
+    t0 = float((cut["time_ns"][0] / 1e9) - cut["t"][0])
+    times = np.unique(cut["t"].to_numpy())
+    period = float(np.median(np.diff(times))) if len(times) > 1 else step_s
+    stride = max(1, round(step_s / period)) if period > 0 else 1
+    kept = times[::stride]
+    dt = period * stride
+    sample = cut.filter(pl.col("t").is_in(kept.tolist()))
+    exposed: dict[str, float] = {}
+    measured = any(len(track) >= 2 for track in robots.values())
+    if measured and len(sample):
+        t = sample["t"].to_numpy()
+        x, y = sample["x"].to_numpy(), sample["y"].to_numpy()
+        near = np.zeros(len(sample), dtype=bool)
+        for track in robots.values():
+            track = _dedupe(track)
+            if len(track) < 2:
+                continue
+            rt = track["time_ns"].to_numpy() / 1e9 - t0
+            rx, ry = track["x"].to_numpy(), track["y"].to_numpy()
+            speed = np.hypot(np.gradient(rx, rt), np.gradient(ry, rt))
+            px, py, pv = np.interp(t, rt, rx), np.interp(t, rt, ry), np.interp(t, rt, speed)
+            inside = (t >= rt[0]) & (t <= rt[-1])
+            near |= inside & (pv > moving_mps) & (np.hypot(x - px, y - py) <= band_m)
+        groups = sample["group"].to_numpy()
+        for group in np.unique(groups):
+            exposed[str(group)] = float(near[groups == group].sum() * dt)
+    rows = []
+    for r in walkers.sort("group").iter_rows(named=True):
+        value = exposed.get(r["group"], 0.0) if measured else None
+        rows.append({"group": r["group"], "walkers": int(r["walkers"]), "exposed_s": value, "exposure_s": None if value is None or not r["walkers"] else value / r["walkers"]})
+    return pl.DataFrame(rows, schema=schema)
+
+
+def exposure_path(episode_dir: pathlib.Path, env: str, warmup_s: float) -> pathlib.Path:
+    """Where the kept conflict exposure of `env` in an episode lies for a warm-up of `warmup_s`: beside the kept walker
+    times (`times_dir`), so a copy of a run dir with them carries it too."""
+    return pathlib.Path(episode_dir) / TOPICS_DIR / DERIVED_DIR / times_dir() / f"{env}.exposure{EXPOSURE_VERSION}.w{_warmup_key(warmup_s)}.parquet"
+
+
+def run_exposure(episode_dir: pathlib.Path, env: str, warmup_s: float, *, recompute: bool = False) -> pl.DataFrame | None:
+    """`conflict_exposure` of an episode, kept beside its tracks and read from there afterwards; None when nothing
+    current is kept and the episode cannot give its tracks (a copy of the run dir without them). Beside §11's columns
+    it holds the same measure within `PREDICTION_BAND_M`: `exposed_<tag>_s`, `exposure_<tag>_s` (tag
+    `PREDICTION_BAND_TAG`). A kept file is current when its version (`EXPOSURE_VERSION`, in its name) and its code
+    digest (`_exposure_code`, in its provenance) are this code's; any other is computed again from the tracks, and
+    without them it is left out with a warning that names it, never read as current."""
+    path = exposure_path(episode_dir, env, warmup_s)
+    stale = None
+    if path.is_file() and not recompute:
+        provenance = exposure_provenance(path)
+        if provenance is not None and provenance.get("code") == _exposure_code():
+            return pl.read_parquet(path)
+        stale = f"{path.name} was kept by other code ({(provenance or {}).get('code') or 'no provenance'}, this code {_exposure_code()})"
+    if not has_tracks(episode_dir, env):
+        key = _warmup_key(warmup_s)
+        older = [p.name for p in sorted(path.parent.glob(f"{env}.exposure*.w{key}.parquet")) if p != path and p.name.removeprefix(f"{env}.exposure").removesuffix(f".w{key}.parquet").isdigit()]
+        why = stale or (f"only an older version is kept ({', '.join(older)})" if older else None)
+        if why is not None:
+            _warn(f"{episode_dir}: the conflict exposure of {env} is not measured: {why}, and the episode has no tracks to compute it again, so its columns are left out; keep it again with `evaluation infra times --recompute --benchmark <run dir>` where the tracks are")
+        return None
+    out = _exposure_table(tracks_for_episode(episode_dir, env), robot_tracks(episode_dir, env), warmup_s)
+    meta = {"exposure_version": EXPOSURE_VERSION, "tracks_version": ped_track_store.TRACKS_VERSION, "code": _exposure_code(), "warmup_s": float(warmup_s), "band_m": CONFLICT_BAND_M, "prediction_band_m": PREDICTION_BAND_M, "moving_mps": MOVING_MPS, "step_s": EXPOSURE_STEP_S, "arena_evaluation": _processing()}
+    _write_kept(path, out, EXPOSURE_META, meta, "conflict exposure")
+    return out
+
+
+def _exposure_table(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataFrame], warmup_s: float) -> pl.DataFrame:
+    """The kept conflict exposure of one episode: §11's measure within `CONFLICT_BAND_M` (group, walkers, exposed_s,
+    exposure_s) and the same within `PREDICTION_BAND_M` (`exposed_<tag>_s`, `exposure_<tag>_s`), by group."""
+    out = conflict_exposure(tracks, robots, warmup_s, band_m=CONFLICT_BAND_M)
+    wide = conflict_exposure(tracks, robots, warmup_s, band_m=PREDICTION_BAND_M)
+    tag = PREDICTION_BAND_TAG
+    return out.join(wide.select("group", pl.col("exposed_s").alias(f"exposed_{tag}_s"), pl.col("exposure_s").alias(f"exposure_{tag}_s")), on="group", how="left").sort("group")
+
+
+def _exposure_code() -> str:
+    """A digest of the code the kept conflict exposure comes from (`conflict_exposure`, `robot_tracks`, `_dedupe`,
+    `_exposure_table`) and of the constants it reads (the two bands, the moving speed, the step), so a kept file of
+    other code is never read as current (`run_exposure`)."""
+    import hashlib
+    import inspect
+
+    try:
+        source = "".join(inspect.getsource(f) for f in (conflict_exposure, robot_tracks, _dedupe, _exposure_table))
+    except (OSError, TypeError):
+        _warn("the source of conflict_exposure cannot be read, so kept conflict exposure is not re-keyed when that code changes")
+        return "nosource"
+    constants = f"{CONFLICT_BAND_M!r}|{PREDICTION_BAND_M!r}|{PREDICTION_BAND_TAG}|{MOVING_MPS!r}|{EXPOSURE_STEP_S!r}"
+    return hashlib.sha1((source + constants).encode()).hexdigest()[:10]
+
+
+def group_cells(tracks: pl.DataFrame, cell_m: float = OCCUPANCY_CELL_M) -> pl.DataFrame:
+    """Per walker group and `cell_m` cell (centres x, y on a grid from the origin), the walker-seconds of `tracks`: each
+    sample counts the tracks' sample period. Columns group, x, y, cell_m, ped_seconds."""
+    schema = {"group": pl.String, "x": pl.Float64, "y": pl.Float64, "cell_m": pl.Float64, "ped_seconds": pl.Float64}
+    if len(tracks) == 0:
+        return pl.DataFrame(schema=schema)
+    times = np.unique(tracks["t"].to_numpy())
+    period = float(np.median(np.diff(times))) if len(times) > 1 else 0.0
+    grouped = tracks.with_columns(
+        pl.struct("agent_type", "source_name").map_elements(lambda r: _group(r["agent_type"], r["source_name"]), return_dtype=pl.String).alias("group"),
+        (pl.col("x") / cell_m).floor().cast(pl.Int64).alias("j"),
+        (pl.col("y") / cell_m).floor().cast(pl.Int64).alias("i"),
+    )
+    cells = grouped.group_by("group", "i", "j").agg(pl.len().alias("n")).sort("group", "i", "j")
+    return cells.select(
+        pl.col("group"),
+        ((pl.col("j").cast(pl.Float64) + 0.5) * cell_m).alias("x"),
+        ((pl.col("i").cast(pl.Float64) + 0.5) * cell_m).alias("y"),
+        pl.lit(float(cell_m)).alias("cell_m"),
+        (pl.col("n").cast(pl.Float64) * period).alias("ped_seconds"),
+    )
+
+
+def occupancy(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], cell_m: float = OCCUPANCY_CELL_M) -> pl.DataFrame:
+    """The group cells (`group_cells`) of every usable run of `benchmark_dirs` (the site as is), with its world, stage
+    and planner, warm-up included as in the flow cells: what `flowedit infra layouts --group-occupancy` reads."""
+    frames = []
+    for run in runs_of(benchmark_dirs):
+        if not has_tracks(run.episode_dir, run.env):
+            raise FileNotFoundError(f"{run.episode_dir}: no walker tracks of {run.env}: {track_problem(run.episode_dir, run.env)}")
+        cells = group_cells(tracks_for_episode(run.episode_dir, run.env), cell_m)
+        frames.append(cells.with_columns(pl.lit(run.world).alias("world"), pl.lit(run.stage).alias("stage"), pl.lit(run.planner).alias("planner")))
+    if not frames:
+        raise ValueError(f"{', '.join(map(str, _dirs(benchmark_dirs)))}: no usable run")
+    return pl.concat(frames).select("world", "stage", "planner", "group", "x", "y", "cell_m", "ped_seconds")
+
+
+def _keep_times(path: pathlib.Path, times: pl.DataFrame, warmup_s: float) -> None:
+    """Write kept times with their provenance; a run dir it cannot write to (a read-only copy) keeps none, with a warning."""
+    meta = {"times_version": TIMES_VERSION, "tracks_version": ped_track_store.TRACKS_VERSION, "code": _times_code(), "warmup_s": float(warmup_s), "arena_evaluation": _processing()}
+    _write_kept(path, times, TIMES_META, meta, "walker times")
+
+
+def _write_kept(path: pathlib.Path, frame: pl.DataFrame, key: bytes, meta: typing.Mapping[str, typing.Any], what: str) -> None:
+    """Write a kept file with its provenance (`meta` under the parquet metadata `key`) through a temporary file, so a
+    reader never sees half of it; a run dir it cannot write to (a read-only copy) keeps none, with a warning."""
+    import os
+
+    import pyarrow.parquet as pq
+
+    table = frame.to_arrow()
+    table = table.replace_schema_metadata({**(table.schema.metadata or {}), key: json.dumps(meta).encode()})
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, temp)
+        temp.replace(path)
+    except OSError as e:
+        temp.unlink(missing_ok=True)
+        _warn(f"{path}: {what} not kept ({e}); computed again on the next read")
+
+
+def _group(agent_type: str, source_name: str | None) -> str:
+    """A pedestrian's group: a locker visitor's from its source name (`<end>_locker_<group>`), else its agent type's."""
+    match = _VISITOR.search(source_name or "")
+    return match["group"] if match else agent_group(agent_type)
+
+
+def cost(site: pl.DataFrame, without: pl.DataFrame | None, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = (), warmup_s: float = WARMUP_S) -> dict[str, typing.Any]:
+    """The pedestrian cost of one layout at one seed (§6) from the track tables of the site as is, the layout without
+    robots (None for a seed that has no such run) and the layout with robots (None for a premise or element-only
+    check): per group the paired through-walkers, the total, element and traffic parts of `C_g`, the absolute delay, and
+    the drops; `C_worst` and its group; the locker visitors' walk without robots and their traffic part."""
+    return cost_from_times(_times(site, warmup_s), _times(without, warmup_s) if without is not None else None, _times(robots, warmup_s) if robots is not None else None, visitor_sources=visitor_sources)
+
+
+def cost_from_times(site: pl.DataFrame, without: pl.DataFrame | None, robots: pl.DataFrame | None, *, visitor_sources: typing.Collection[str] = ()) -> dict[str, typing.Any]:
+    """`cost` from the walker travel times (`_times`, `walker_times`) of the three runs in place of their tracks.
+
+    Without the run without robots (`without` None) the through-walkers pair the site as is and the fleet run alone:
+    the total is the delay against the site as is, there is no element or traffic part and no visitor record.
+    ValueError without both layout runs."""
+    if without is None and robots is None:
+        raise ValueError("the cost needs the layout's run without robots or its run with the fleet")
+    visitors = set(visitor_sources)
+    ref = site.filter(~pl.col("source_name").is_in(list(visitors)) & (pl.col("source_name") != ""))
+    off = without
+    on = robots
+    joined = ref.select("key", "agent_type", "source_name", pl.col("travel_s").alias("site_s"))
+    if off is not None:
+        joined = joined.join(off.select("key", pl.col("travel_s").alias("off_s")), on="key", how="left")
+    if on is not None:
+        joined = joined.join(on.select("key", pl.col("travel_s").alias("on_s")), on="key", how="left")
+    joined = joined.sort("key")  # sums in one order, whatever order the inputs come in
+    groups: dict[str, dict[str, typing.Any]] = {}
+    for row in joined.iter_rows(named=True):
+        group = _group(row["agent_type"], row["source_name"])
+        g = groups.setdefault(group, {"peds": 0, "dropped": 0, "site_s": 0.0, "off_s": 0.0, "on_s": 0.0})
+        # a through-walker that finished the site as is but not a layout run drops from the pair (§6), counted per group
+        if (off is not None and row["off_s"] is None) or (on is not None and row["on_s"] is None):
+            g["dropped"] += 1
+            continue
+        g["peds"] += 1
+        g["site_s"] += row["site_s"]
+        if off is not None:
+            g["off_s"] += row["off_s"]
+        g["on_s"] += row["on_s"] if on is not None else row["off_s"]
+    out: dict[str, typing.Any] = {"groups": {}}
+    for group, g in sorted(groups.items()):
+        ref_s = g["site_s"]
+        record = {"peds": g["peds"], "dropped": g["dropped"], "site_travel_s": ref_s / g["peds"] if g["peds"] else None}
+        if ref_s > 0:
+            record["element"] = (g["off_s"] - ref_s) / ref_s if off is not None else None
+            record["traffic"] = (g["on_s"] - g["off_s"]) / ref_s if on is not None and off is not None else None
+            record["total"] = (g["on_s"] - ref_s) / ref_s if on is not None else record["element"]
+            record["delay_s"] = ((g["on_s"] if on is not None else g["off_s"]) - ref_s) / g["peds"]
+        else:
+            record.update(element=None, traffic=None, total=None, delay_s=None)
+        out["groups"][group] = record
+    totals = {group: r["total"] for group, r in out["groups"].items() if r["total"] is not None}
+    out["c_worst"] = max(totals.values()) if totals else None
+    out["worst_group"] = max(totals, key=lambda g: totals[g]) if totals else None
+    delays = {group: r["delay_s"] for group, r in out["groups"].items() if r["delay_s"] is not None}
+    out["worst_group_delay_s"] = max(delays, key=lambda g: delays[g]) if delays else None
+    out["visitors"] = _visitors(off, on, visitors) if off is not None else {}
+    return out
+
+
+def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> dict[str, typing.Any]:
+    """The locker visitors who finished without robots: their count and mean walk per group, and their traffic part
+    (with robots against without, over their own walk) where they finished both."""
+    if not sources:
+        return {}
+    mine = off.filter(pl.col("source_name").is_in(list(sources))).sort("key")  # sums in one order, as the cost's
+    out: dict[str, typing.Any] = {}
+    for row in mine.iter_rows(named=True):
+        g = out.setdefault(_group(row["agent_type"], row["source_name"]), {"peds": 0, "walk_s": 0.0, "paired": 0, "off_s": 0.0, "on_s": 0.0})
+        g["peds"] += 1
+        g["walk_s"] += row["travel_s"]
+    if on is not None and len(mine):
+        both = mine.select("key", "agent_type", "source_name", pl.col("travel_s").alias("off_s")).join(on.select("key", pl.col("travel_s").alias("on_s")), on="key").sort("key")
+        for row in both.iter_rows(named=True):
+            g = out[_group(row["agent_type"], row["source_name"])]
+            g["paired"] += 1
+            g["off_s"] += row["off_s"]
+            g["on_s"] += row["on_s"]
+    return {group: {"peds": g["peds"], "walk_s": g["walk_s"] / g["peds"], "paired": g["paired"], "traffic": (g["on_s"] - g["off_s"]) / g["off_s"] if g["off_s"] > 0 else None} for group, g in sorted(out.items())}
+
+
+# --- tables ----------------------------------------------------------------------------------------------------------
+
+
+def _whole_seeds(named: typing.Any, what: str) -> frozenset[int]:
+    """`named` as a set of seeds; ValueError unless it is a list of whole numbers (no string, no float, no bool)."""
+    import numbers
+
+    if isinstance(named, (str, bytes, typing.Mapping)) or not isinstance(named, typing.Iterable):
+        raise ValueError(f"{what} is a list of seeds like [51, 52, 53], not {named!r}")
+    seeds = list(named)
+    bad = [s for s in seeds if isinstance(s, bool) or not isinstance(s, numbers.Integral)]
+    if bad:
+        raise ValueError(f"{what} holds whole numbers only, not {bad!r}")
+    return frozenset(int(s) for s in seeds)
+
+
+def without_robots_seeds(manifest: typing.Mapping[str, typing.Any], seeds: typing.Collection[int] | None = None) -> frozenset[int] | None:
+    """The seeds that have a run without robots: the manifest's `without_robots_seeds`, or `seeds` (the option) where
+    the manifest names none; None when neither names them (every seed has one, and the three runs pair as §6 says).
+    ValueError when both name them and differ: the manifest records the study's plan, and an option that silently
+    replaced it could make a seed whose planned run is missing read as complete. ValueError too for a value that is not
+    a list of whole numbers, and for a seed the manifest does not run."""
+    key = manifest.get(WITHOUT_ROBOTS_SEEDS)
+    planned = None if key is None else _whole_seeds(key, f"the manifest's {WITHOUT_ROBOTS_SEEDS}")
+    asked = None if seeds is None else _whole_seeds(seeds, "the seeds named with a run without robots")
+    if planned is not None and asked is not None and planned != asked:
+        raise ValueError(f"the manifest's {WITHOUT_ROBOTS_SEEDS} names seeds {sorted(planned)} and --without-robots-seeds names {sorted(asked)}: they differ; leave the option out to read the manifest's seeds, or correct the manifest")
+    chosen = planned if planned is not None else asked
+    if chosen is None:
+        return None
+    runs_seeds = _whole_seeds(manifest.get("seeds") or [], "the manifest's seeds")
+    unknown = sorted(chosen - runs_seeds)
+    if unknown:
+        raise ValueError(f"seeds {unknown} are named as seeds with a run without robots, but the manifest runs seeds {sorted(runs_seeds)}")
+    return chosen
+
+
+def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts_dir: pathlib.Path | typing.Sequence[pathlib.Path], manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None, allow_mixed_commits: bool = False, split_seeds: typing.Collection[int] | None = None) -> pl.DataFrame:
+    """One row per layout of `manifest` and seed: its roles, the service of its fleet run, its pedestrian cost against
+    the site as is at that seed (`cost`), flattened (`C_<group>`, `C_<group>_element`, `C_<group>_traffic`,
+    `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`). `site_dir` and
+    `layouts_dir` may each be several run dirs (a suite's parts recorded on several machines), read as one; all of them
+    must name the same commits (`check_commits`) and hold walker times kept by one release (`check_kept_times`).
+
+    Which run is which. A layout's run without robots is its stage under a `WITHOUT_ROBOTS` contestant; its fleet run
+    is its stage under another contestant in which the fleet mode ran (`fleet_ran`: the task log was reset in the
+    episode). A run under another contestant without that is not read as the fleet run, and a `WITHOUT_ROBOTS` run in
+    which the fleet mode ran is not read as a run without robots: the row then misses that run and says why. A run
+    without robots is so never scored as the fleet run, whatever its contestant is called.
+
+    Where the manifest or `split_seeds` names the seeds that have a run without robots (`without_robots_seeds`), the
+    run is optional per seed. On every seed `C_<group>`, the delay, the counts and `c_worst` pair the site as is and
+    the fleet run alone, so a seed's total does not depend on whether it has the run. On the named seeds
+    `C_<group>_element` and `C_<group>_traffic` are the parts of the walkers that finished all three runs
+    (`peds_<group>_split` of them, `dropped_<group>_split` dropped), and `C_<group>_split` is the total of those
+    walkers: element + traffic = `C_<group>_split`. That is not `C_<group>`: a walker that finishes the site as is and
+    the fleet run but not the run without robots counts in `C_<group>` only, and on recorded data some walker does in
+    most rows (seeds 31-50 of the first study: `C_adult_split` differs from `C_adult` in 55 of 60 rows, by up to
+    5e-4; `C_wheelchair_split` in 7, by up to 7e-3). The visitors are reported on the named seeds; `split` says whether
+    a row has the three runs, and a group without a walker in all three has no parts in that row. A named seed without
+    the run is not complete and keeps its total; a run without robots at a seed that is not named is refused.
+
+    Where nothing names the seeds, every seed needs the three runs and pairs them as before, and a seed without one of
+    them has no cost."""
+    warmup = float(manifest.get("warmup_s", WARMUP_S) if warmup_s is None else warmup_s)
+    episode_s = float(manifest.get("episode_s") or 0.0) or None
+    visitor_sources = list(manifest.get("visitor_sources") or [])
+    split = without_robots_seeds(manifest, split_seeds)
+    site_dirs, layout_dirs = _dirs(site_dir), _dirs(layouts_dir)
+    check_commits([*site_dirs, *layout_dirs], allow_mixed=allow_mixed_commits)
+    site_what, layouts_what = ", ".join(map(str, site_dirs)), ", ".join(map(str, layout_dirs))
+    site_runs = runs_of(site_dirs)
+    layout_runs = runs_of(layout_dirs)
+    roles: dict[str, list[str]] = {}
+    ranking: dict[str, float | None] = {}
+    travel: dict[str, float | None] = {}
+    predicted: dict[str, dict[str, float]] = {}
+    predicted_traffic: dict[str, dict[str, float]] = {}
+    for record in manifest.get("runs") or []:
+        roles.setdefault(record["layout_id"], []).append(record["role"])
+        ranking.setdefault(record["layout_id"], record.get("ranking_score"))
+        travel.setdefault(record["layout_id"], record.get("travel_m"))
+        predicted.setdefault(record["layout_id"], dict(record.get("exposure") or {}))
+        predicted_traffic.setdefault(record["layout_id"], dict(record.get("exposure_traffic") or {}))
+    world_of = {layout_id: pathlib.Path(path).name for layout_id, path in (manifest.get("worlds") or {}).items()}
+    rows = []
+    site_name = str(manifest["site"])
+    for layout_id, world in world_of.items():
+        for seed in manifest.get("seeds") or []:
+            off = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner in WITHOUT_ROBOTS], f"{layouts_what} (without robots)")
+            on = unique([r for r in layout_runs if r.world == world and r.seed == seed and r.planner not in WITHOUT_ROBOTS and (fleet is None or r.planner == fleet)], f"{layouts_what} (with the fleet)")
+            ref = unique([r for r in site_runs if r.world == site_name and r.seed == seed], f"{site_what} (the site as is)")
+            notes = []
+            snapshot = None
+            if on is not None:
+                snapshot = _fleet_table(on.episode_dir)
+                if snapshot is None or not fleet_ran_in(snapshot, on.env):
+                    notes.append(f"the run under {on.planner} (episode_{on.episode:03d}) holds no fleet task log reset in its episode, so it is not read as the fleet run")
+                    on = snapshot = None
+            if off is not None and fleet_ran(off.episode_dir, off.env):
+                notes.append(f"the run under {off.planner} (episode_{off.episode:03d}) holds a fleet task log reset in its episode, so it is not read as a run without robots")
+                off = None
+            needs_off = split is None or int(seed) in split
+            if off is not None and not needs_off:
+                raise ValueError(f"{layouts_what}: stage {off.stage} has a run without robots (episode_{off.episode:03d}), but seed {seed} is not among the seeds named to have one ({sorted(split or ())}); name the seed in the manifest's {WITHOUT_ROBOTS_SEEDS} or with --without-robots-seeds, or leave the run's dir out")
+            complete = on is not None and ref is not None and (off is not None or not needs_off)
+            row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": complete, "incomplete": None if complete else "; ".join(["missing runs: " + ", ".join(what for what, r, needed in (("the site as is", ref, True), ("without robots", off, needs_off), ("with the fleet", on, True)) if needed and r is None), *notes])}
+            if split is not None:
+                row["split"] = off is not None and on is not None and ref is not None
+            row.update({f"pred_{group}": value for group, value in predicted.get(layout_id, {}).items()})
+            row.update({f"pred_traffic_{group}": value for group, value in predicted_traffic.get(layout_id, {}).items()})
+            if on is not None:
+                row.update(service(log_from_snapshot(snapshot, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
+                measured_exposure = run_exposure(on.episode_dir, on.env, warmup)
+                if measured_exposure is not None:
+                    row.update({f"exposure_{r['group']}_s": r["exposure_s"] for r in measured_exposure.iter_rows(named=True)})
+                    row.update({f"exposure_{r['group']}_{PREDICTION_BAND_TAG}_s": r.get(f"exposure_{PREDICTION_BAND_TAG}_s") for r in measured_exposure.iter_rows(named=True)})
+            times: dict[str, pl.DataFrame | None] = {}
+            if split is None and off is not None and ref is not None:
+                times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": walker_times(off.episode_dir, off.env, warmup), "with the fleet": None if on is None else walker_times(on.episode_dir, on.env, warmup)}
+                measured = cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)
+                row.update(_flatten(measured))
+            elif split is not None and on is not None and ref is not None:
+                times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": None if off is None else walker_times(off.episode_dir, off.env, warmup), "with the fleet": walker_times(on.episode_dir, on.env, warmup)}
+                row.update(_flatten(cost_from_times(times["the site as is"], None, times["with the fleet"], visitor_sources=visitor_sources)))
+                if off is not None:
+                    row.update(_flatten_split(cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)))
+            # a run without a walker that spawned after the warm-up and finished has no cost to give: not complete
+            empty = [what for what, t in times.items() if t is not None and len(t) == 0]
+            if empty:
+                row["complete"] = False
+                row["incomplete"] = f"no walker spawned after the {warmup:g} s warm-up and finished: " + ", ".join(empty)
+            rows.append(row)
+    check_kept_times([*site_dirs, *layout_dirs], warmup, allow_mixed=allow_mixed_commits)
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _flatten(measured: typing.Mapping[str, typing.Any]) -> dict[str, typing.Any]:
+    out: dict[str, typing.Any] = {"c_worst": measured["c_worst"], "worst_group": measured["worst_group"], "worst_group_delay_s": measured["worst_group_delay_s"]}
+    for group, r in measured["groups"].items():
+        out |= {f"C_{group}": r["total"], f"C_{group}_element": r["element"], f"C_{group}_traffic": r["traffic"], f"delay_{group}_s": r["delay_s"], f"peds_{group}": r["peds"], f"dropped_{group}": r["dropped"], f"site_travel_{group}_s": r["site_travel_s"]}
+    for group, r in (measured.get("visitors") or {}).items():
+        out |= {f"visitor_{group}_peds": r["peds"], f"visitor_{group}_walk_s": r["walk_s"], f"visitor_{group}_traffic": r["traffic"]}
+    return out
+
+
+def _flatten_split(measured: typing.Mapping[str, typing.Any]) -> dict[str, typing.Any]:
+    """Of a cost that pairs the three runs, what a row with the run without robots adds to its total against the site
+    as is: the element and traffic parts, the total they sum to (`C_<group>_split`, of the walkers that finished all
+    three runs), the walkers they pair and drop, and the visitors."""
+    out: dict[str, typing.Any] = {}
+    for group, r in measured["groups"].items():
+        out |= {f"C_{group}_split": r["total"], f"C_{group}_element": r["element"], f"C_{group}_traffic": r["traffic"], f"peds_{group}_split": r["peds"], f"dropped_{group}_split": r["dropped"]}
+    for group, r in (measured.get("visitors") or {}).items():
+        out |= {f"visitor_{group}_peds": r["peds"], f"visitor_{group}_walk_s": r["walk_s"], f"visitor_{group}_traffic": r["traffic"]}
+    return out
+
+
+def _interval(values: np.ndarray, n_boot: int = 2000, seed: int = 0) -> tuple[float, float]:
+    """The 95 % percentile bootstrap interval of the mean over seeds, (nan, nan) for fewer than 2 values."""
+    values = values[np.isfinite(values)]
+    if len(values) < 2:
+        return math.nan, math.nan
+    rng = np.random.default_rng(seed)
+    draws = rng.choice(values, size=(n_boot, len(values)), replace=True).mean(axis=1)
+    lo, hi = np.quantile(draws, [0.025, 0.975])
+    return float(lo), float(hi)
+
+
+def layout_means(table: pl.DataFrame) -> pl.DataFrame:
+    """One row per layout: the equal-weight mean over its seeds of `T` (`task_time_s`), every `C_<group>` and the
+    service counts, `C_worst` as the max over the groups' means, the seeds counted, and 95 % seed-bootstrap intervals of
+    `T` and of the per-seed `c_worst` (the figure's error bars). A mean is over the seeds that have the value: where
+    the run without robots is recorded on some seeds only (`layout_table`), `split_seeds` counts the seeds with the
+    three runs, and a group's element and traffic parts and `C_<group>_split` are means over the
+    `split_seeds_<group>` seeds in which a walker of the group finished all three (it can be fewer, or none)."""
+    if len(table) == 0:
+        return table
+    numeric = [c for c, dtype in table.schema.items() if dtype.is_numeric() and c not in ("seed",)]
+    counts = [pl.len().alias("seeds"), pl.col("complete").all()]
+    if "split" in table.columns:
+        counts.append(pl.col("split").sum().alias("split_seeds"))
+        counts.extend(pl.col(f"C_{g}_split").is_not_null().sum().alias(f"split_seeds_{g}") for g in GROUPS if f"C_{g}_split" in table.columns)
+    means = table.group_by("layout_id", "world", "roles", maintain_order=True).agg(*(pl.col(c).mean() for c in numeric), *counts)
+    groups = [g for g in GROUPS if f"C_{g}" in means.columns]
+    means = means.with_columns(pl.max_horizontal([pl.col(f"C_{g}") for g in groups]).alias("c_worst_of_means") if groups else pl.lit(None).alias("c_worst_of_means"))
+    if groups:
+        means = means.with_columns(pl.concat_list([pl.col(f"C_{g}") for g in groups]).list.arg_max().map_elements(lambda i: groups[i] if i is not None else None, return_dtype=pl.String).alias("worst_group_of_means"))
+    intervals = []
+    for layout_id in means["layout_id"].to_list():
+        sub = table.filter(pl.col("layout_id") == layout_id)
+        t = _interval(sub["task_time_s"].cast(pl.Float64).to_numpy() if "task_time_s" in sub.columns else np.array([]))
+        c = _interval(sub["c_worst"].cast(pl.Float64).to_numpy() if "c_worst" in sub.columns else np.array([]))
+        intervals.append({"layout_id": layout_id, "T_lo": t[0], "T_hi": t[1], "c_worst_lo": c[0], "c_worst_hi": c[1]})
+    return means.join(pl.DataFrame(intervals), on="layout_id", how="left")
+
+
+def pick(means: pl.DataFrame, *, slack: float = SERVICE_SLACK, jam_drop: float = JAM_DROP) -> dict[str, typing.Any]:
+    """The selection pick (§5, §6): among the joint top 10 not dropped for jams, the one with the lowest `C_worst` (the
+    max over the groups' means). Equal service is held by the search's travel pre-filter, so measured `T` drops no
+    layout; a joint layout whose `T` exceeds `slack` times the robot-only pick's beyond its 95 % seed interval (`T_lo`
+    above the cap) is flagged (`t_over`). ValueError without a robot-only run or a joint layout."""
+    rows = means.to_dicts()
+    robot = next((r for r in rows if "robot_only" in str(r["roles"]).split(",")), None)
+    if robot is None:
+        raise ValueError("no robot-only layout among the runs")
+    t_robot = robot.get("task_time_s")
+    t_cap = None if t_robot is None else slack * float(t_robot)
+    considered = []
+    for r in rows:
+        if "joint" not in str(r["roles"]).split(","):
+            continue
+        reasons = []
+        if r.get("c_worst_of_means") is None:
+            reasons.append("not measured")
+        elif (r.get("jam_share") or 0.0) > jam_drop:
+            reasons.append(f"jams {r['jam_share']:.0%} of tasks")
+        t_lo = r.get("T_lo")
+        t_over = bool(t_cap is not None and t_lo is not None and math.isfinite(t_lo) and t_lo > t_cap)
+        considered.append({"layout_id": r["layout_id"], "task_time_s": r.get("task_time_s"), "T_lo": t_lo, "T_hi": r.get("T_hi"), "t_over": t_over, "c_worst": r.get("c_worst_of_means"), "worst_group": r.get("worst_group_of_means"), "excluded": "; ".join(reasons) or None})
+    eligible = [c for c in considered if c["excluded"] is None]
+    if not considered:
+        raise ValueError("no joint layout among the runs")
+    best = min(eligible, key=lambda c: (c["c_worst"], c["layout_id"])) if eligible else None
+    return {
+        "robot_only": robot["layout_id"],
+        "robot_only_task_time_s": t_robot,
+        "robot_only_c_worst": robot.get("c_worst_of_means"),
+        "task_time_cap_s": t_cap,
+        "joint_pick": None if best is None else best["layout_id"],
+        "joint_pick_task_time_s": None if best is None else best["task_time_s"],
+        "joint_pick_c_worst": None if best is None else best["c_worst"],
+        "joint_pick_t_over": None if best is None else best["t_over"],
+        "joint": considered,
+    }
+
+
+def spearman(x: typing.Sequence[float], y: typing.Sequence[float]) -> float:
+    """Spearman's rank correlation with average ranks for ties, nan for fewer than 3 pairs or a constant side."""
+    pairs = [(a, b) for a, b in zip(x, y, strict=True) if a is not None and b is not None and math.isfinite(a) and math.isfinite(b)]
+    if len(pairs) < 3:
+        return math.nan
+
+    def ranks(values: list[float]) -> np.ndarray:
+        order = np.argsort(values, kind="stable")
+        out = np.empty(len(values))
+        sorted_values = np.asarray(values)[order]
+        i = 0
+        while i < len(values):
+            j = i
+            while j + 1 < len(values) and sorted_values[j + 1] == sorted_values[i]:
+                j += 1
+            out[order[i : j + 1]] = (i + j) / 2.0 + 1.0
+            i = j + 1
+        return out
+
+    rx, ry = ranks([p[0] for p in pairs]), ranks([p[1] for p in pairs])
+    if rx.std() == 0 or ry.std() == 0:
+        return math.nan
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def forecaster_check(means: pl.DataFrame) -> dict[str, typing.Any]:
+    """§12's forecaster check: Spearman between the ranking score and the full-episode `C_worst` over the joint top 10
+    and the random layouts."""
+    rows = [r for r in means.to_dicts() if {"joint", "random"} & set(str(r["roles"]).split(","))]
+    return {"layouts": len(rows), "spearman": spearman([r.get("ranking_score") for r in rows], [r.get("c_worst_of_means") for r in rows])}
+
+
+def permutation_p(x: typing.Sequence[float | None], y: typing.Sequence[float | None], *, n_perm: int = SCORE_PERMUTATIONS, seed: int = 0) -> tuple[float, float, int]:
+    """Spearman's rho of the finite pairs of `x` and `y`, the one-sided permutation p of a rho at least as large
+    ((1 + permutations reaching it) / (1 + n_perm), y shuffled), and the pairs used; (nan, nan, n) below 3 pairs."""
+    pairs = [(float(a), float(b)) for a, b in zip(x, y, strict=True) if a is not None and b is not None and math.isfinite(a) and math.isfinite(b)]
+    rho = spearman([p[0] for p in pairs], [p[1] for p in pairs])
+    if not math.isfinite(rho):
+        return math.nan, math.nan, len(pairs)
+    rng = np.random.default_rng(seed)
+    xs, ys = [p[0] for p in pairs], np.array([p[1] for p in pairs])
+    reached = sum(1 for _ in range(n_perm) if spearman(xs, rng.permutation(ys).tolist()) >= rho - 1e-12)
+    return rho, (1 + reached) / (1 + n_perm), len(pairs)
+
+
+def score_check(means: pl.DataFrame, *, n_perm: int = SCORE_PERMUTATIONS, seed: int = 0) -> dict[str, typing.Any]:
+    """§12's score check over the selection layouts (robot-only, joint, random): Spearman between the joint ranking's
+    predicted worst-group conflict exposure (`ranking_score`) and the measured `C_worst` (the max over the groups'
+    means), one-sided permutation p; it holds when p < 0.05. Per group: the predicted traffic term (`pred_traffic_<group>`,
+    the time near driving robots, or the one prediction of all walkers, `pred_traffic_all`) against the group's measured
+    traffic part `C_<group>_traffic`."""
+    rows = [r for r in means.to_dicts() if {"robot_only", "joint", "random"} & set(str(r["roles"]).split(","))]
+    rho, p, n = permutation_p([r.get("ranking_score") for r in rows], [r.get("c_worst_of_means") for r in rows], n_perm=n_perm, seed=seed)
+    out: dict[str, typing.Any] = {"layouts": n, "spearman": rho, "p": p, "holds": bool(math.isfinite(p) and p < 0.05), "groups": {}}
+    for group in GROUPS:
+        key = f"pred_traffic_{group}" if any(r.get(f"pred_traffic_{group}") is not None for r in rows) else "pred_traffic_all"
+        g_rho, g_p, g_n = permutation_p([r.get(key) for r in rows], [r.get(f"C_{group}_traffic") for r in rows], n_perm=n_perm, seed=seed)
+        out["groups"][group] = {"predicted": key, "layouts": g_n, "spearman": g_rho, "p": g_p}
+    return out
+
+
+def _verdict(d95: typing.Mapping[str, typing.Any], d90: typing.Mapping[str, typing.Any], delta: float) -> str:
+    """§12's three outcomes of a C_worst difference: `lower` when its 95 % interval lies below 0, `equivalent` when its
+    90 % interval lies within +-`delta`, else `inconclusive`."""
+    if math.isfinite(d95["ci_high"]) and d95["ci_high"] < 0:
+        return "lower"
+    if math.isfinite(d90["ci_low"]) and math.isfinite(d90["ci_high"]) and d90["ci_low"] > -delta and d90["ci_high"] < delta:
+        return "equivalent"
+    return "inconclusive"
+
+
+def seed_bootstrap(values: np.ndarray, *, n_boot: int, rng: np.random.Generator, level: float = 0.95) -> tuple[float, float, float, float]:
+    """§12's bootstrap over seeds: (mean, percentile interval at `level`, two-sided p) of per-seed differences, each
+    seed a cluster of one. The p is `2 min(P(draw <= 0), P(draw >= 0))` over the same draws, so it lies below 1 -
+    `level` exactly when the interval excludes 0, and the interval is the plain percentile one. This is the study's
+    pre-registered statistic, kept here apart from `experiments.stats.cluster_bootstrap` (which tests a shifted null
+    with its own draws and widens the interval to hold the estimate), so the study's decisions do not move with it."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+    clusters = [np.array([v]) for v in values]
+    estimate = float(np.mean(np.concatenate(clusters)))
+    k = len(clusters)
+    draws = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, k, size=k)
+        draws[i] = float(np.mean(np.concatenate([clusters[j] for j in idx])))
+    draws = draws[np.isfinite(draws)]
+    if len(draws) == 0:
+        return estimate, float("nan"), float("nan"), float("nan")
+    tail = (1.0 - level) / 2.0
+    lo, hi = np.quantile(draws, [tail, 1.0 - tail])
+    p = min(1.0, 2.0 * min(np.mean(draws <= 0.0), np.mean(draws >= 0.0)))
+    return estimate, float(lo), float(hi), float(p)
+
+
+def compare(table: pl.DataFrame, picks: typing.Mapping[str, str], *, slack: float = SERVICE_SLACK, delta: float = DELTA, n_boot: int = 10_000, seed: int = 0) -> dict[str, typing.Any]:
+    """§12 on the evaluation seeds. The primary contrast joint pick - robot-only pick, per seed: `c_worst`, `T` over the
+    robot-only pick's `T`, and `C_aid - C_adult` per aid group, with bootstrap intervals over seeds and Holm across the
+    aid groups. Its verdict (`_verdict`): `lower` (H1 holds) when the 95 % interval of the `C_worst` difference lies
+    below 0, `equivalent` when the 90 % interval lies within +-`delta`, else `inconclusive`; the relative `T` difference
+    is reported (equal service is the search's travel pre-filter). Both intervals come from one set of bootstrap draws,
+    so the 90 % one lies inside the 95 % one. With a `guideline` pick, the secondary contrasts joint - guideline and
+    robot-only - guideline get the same rule: Holm (across the two) applies to their `lower` claims, which also need a
+    Holm-adjusted p below 0.05; `equivalent` uses each one's unadjusted 90 % interval. "Most for aid users" holds for an
+    aid group whose Holm-adjusted p < 0.05 with its interval below 0."""
+    from arena_evaluation.experiments.stats import holm
+
+    rng = np.random.default_rng(seed)
+
+    def boot(values: np.ndarray, level: float = 0.95) -> dict[str, typing.Any]:
+        values = values[np.isfinite(values)]
+        estimate, ci_low, ci_high, p = seed_bootstrap(values, n_boot=n_boot, rng=rng, level=level)
+        return {"estimate": estimate, "ci_low": ci_low, "ci_high": ci_high, "p": p, "seeds": len(values)}
+
+    def boot_both(values: np.ndarray) -> tuple[dict[str, typing.Any], dict[str, typing.Any]]:
+        """The 95 % and the `EQUIVALENCE_LEVEL` interval from one set of draws, so the narrower lies inside the wider."""
+        state = rng.bit_generator.state
+        wide = boot(values, 0.95)
+        rng.bit_generator.state = state
+        return wide, boot(values, EQUIVALENCE_LEVEL)
+
+    def contrast(a: str, b: str) -> tuple[dict[str, typing.Any], pl.DataFrame]:
+        pairs = table.filter(pl.col("layout_id") == picks[a]).join(table.filter(pl.col("layout_id") == picks[b]), on="seed", suffix="_b")
+
+        def col(name: str) -> np.ndarray:
+            return pairs[name].cast(pl.Float64).fill_null(float("nan")).to_numpy() if name in pairs.columns else np.full(len(pairs), np.nan)
+
+        d95, d90 = boot_both(col("c_worst") - col("c_worst_b"))
+        out = {"a": picks[a], "b": picks[b], "seeds": pairs["seed"].to_list(), "delta_c_worst": d95, "delta_c_worst_90": d90, "delta_t_rel": boot((col("task_time_s") - col("task_time_s_b")) / col("task_time_s_b")), "verdict": _verdict(d95, d90, delta)}
+        for group in AID_GROUPS:
+            out.setdefault("delta_aid_minus_adult", {})[group] = boot((col(f"C_{group}") - col(f"C_{group}_b")) - (col("C_adult") - col("C_adult_b")))
+        return out, pairs
+
+    main, pairs = contrast("joint", "robot_only")
+    aid = main["delta_aid_minus_adult"]
+    adjusted = holm([aid[g]["p"] for g in AID_GROUPS])
+    for group, p in zip(AID_GROUPS, adjusted, strict=True):
+        aid[group]["p_holm"] = p
+        aid[group]["holds"] = bool(aid[group]["ci_high"] < 0 and p < 0.05) if math.isfinite(aid[group]["ci_high"]) and math.isfinite(p) else False
+    out: dict[str, typing.Any] = {"picks": dict(picks), "seeds": main["seeds"], "delta": delta, **{k: main[k] for k in ("delta_c_worst", "delta_c_worst_90", "delta_t_rel", "delta_aid_minus_adult", "verdict")}}
+    out["h1_holds"] = main["verdict"] == "lower"
+    if picks.get("guideline"):
+        secondary = {f"{a}_minus_guideline": contrast(a, "guideline")[0] for a in ("joint", "robot_only")}
+        adjusted = holm([c["delta_c_worst"]["p"] for c in secondary.values()])
+        for c, p in zip(secondary.values(), adjusted, strict=True):
+            c["p_holm"] = p
+            if c["verdict"] == "lower" and not (math.isfinite(p) and p < 0.05):
+                d90 = c["delta_c_worst_90"]
+                c["verdict"] = "equivalent" if math.isfinite(d90["ci_low"]) and math.isfinite(d90["ci_high"]) and -delta < d90["ci_low"] and d90["ci_high"] < delta else "inconclusive"
+        out["guideline"] = secondary
+    return out
+
+
+def figure(means: pl.DataFrame, picks: typing.Mapping[str, typing.Any], out: pathlib.Path) -> pathlib.Path:
+    """§12's figure: robot task time T against C_worst, one point per selection layout with 95 % seed intervals, the
+    robot-only and the joint pick marked, the site as is the line C = 0."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.4), dpi=150)
+    ax.axhline(0.0, color="0.45", lw=1.0, ls="--", zorder=1)
+    ax.text(0.99, 0.0, "site as is (C = 0)", color="0.35", fontsize=8, ha="right", va="bottom", transform=ax.get_yaxis_transform())
+    styles = {"random": ("o", "#9aa0a6", "random valid"), "joint": ("s", "#4c78a8", "joint top 10"), "robot_only": ("D", "#e45756", "robot-only pick")}
+    seen: set[str] = set()
+    for r in means.to_dicts():
+        if r.get("task_time_s") is None or r.get("c_worst_of_means") is None:
+            continue
+        roles = str(r["roles"]).split(",")
+        role = "robot_only" if "robot_only" in roles else ("joint" if "joint" in roles else "random")
+        marker, colour, label = styles[role]
+        x, y = r["task_time_s"] / 60.0, r["c_worst_of_means"]
+        xerr = None if r.get("T_lo") is None or not math.isfinite(r["T_lo"]) else [[x - r["T_lo"] / 60.0], [r["T_hi"] / 60.0 - x]]
+        yerr = None if r.get("c_worst_lo") is None or not math.isfinite(r["c_worst_lo"]) else [[max(0.0, y - r["c_worst_lo"])], [max(0.0, r["c_worst_hi"] - y)]]
+        ax.errorbar(x, y, xerr=xerr, yerr=yerr, fmt=marker, color=colour, ecolor=colour, elinewidth=0.8, capsize=2, ms=6, label=None if role in seen else label, zorder=3)
+        seen.add(role)
+        if r["layout_id"] == picks.get("joint_pick"):
+            ax.scatter([x], [y], s=180, facecolors="none", edgecolors="#f58518", linewidths=1.8, zorder=4, label="joint pick")
+    if picks.get("task_time_cap_s"):
+        ax.axvline(picks["task_time_cap_s"] / 60.0, color="#e45756", lw=0.8, ls=":", zorder=1)
+        ax.text(picks["task_time_cap_s"] / 60.0, 0.97, " 1.05 T(robot-only)", color="#e45756", fontsize=8, va="top", transform=ax.get_xaxis_transform())
+    ax.set_xlabel("robot task time T (min, mean over selection seeds)")
+    ax.set_ylabel("C_worst (extra travel time / reference)")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, loc="upper left", frameon=False)
+    fig.tight_layout()
+    out = pathlib.Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+#: The premise layout whose measured fleet capacity sets the task rate: `flowedit infra premise`'s layout with every
+#: element at the widest section (its roles are `narrow` and `wide`)
+RATE_ROLE = "wide"
+
+
+def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4, rate_role: str = RATE_ROLE) -> dict[str, typing.Any]:
+    """§10's premise check: the two layouts' mean `C_worst` against the seed spread (the larger of their per-seed
+    standard deviations), and the task rate at `utilisation` of the fleet's measured capacity in the layout with role
+    `rate_role`, the wide one: robots x 3600 over (busy seconds per completed job + seconds out of service per completed
+    job: charging, `charge_s`, and top-up trips, `top_up_s`; a table without `top_up_s` counts none).
+
+    Both layouts stay in the `C_worst` comparison, and each reports its own measured capacity; only the wide one sets the
+    rate. The narrow one's crowd cost and failed jobs are layout cost (at the study density it may complete no job at
+    all, which would give a rate of about 0). ValueError unless exactly one layout has role `rate_role`."""
+    out: dict[str, typing.Any] = {"layouts": {}}
+    for layout_id, sub in table.group_by("layout_id", maintain_order=True):
+        c = sub["c_worst"].cast(pl.Float64).drop_nulls().to_numpy() if "c_worst" in sub.columns else np.array([])
+        completed = float(sub["jobs_completed"].sum()) if "jobs_completed" in sub.columns else 0.0
+        busy = sub["busy_s_per_job"].cast(pl.Float64).drop_nulls().to_numpy() if "busy_s_per_job" in sub.columns else np.array([])
+        charge = float(sub["charge_s"].sum()) if "charge_s" in sub.columns else 0.0
+        top_up = float(sub["top_up_s"].sum() or 0.0) if "top_up_s" in sub.columns else 0.0
+        per_job = (float(np.mean(busy)) + ((charge + top_up) / completed if completed else 0.0)) if len(busy) else None
+        roles = sorted({role for value in sub["roles"].drop_nulls().to_list() for role in str(value).split(",") if role}) if "roles" in sub.columns else []
+        out["layouts"][layout_id[0] if isinstance(layout_id, tuple) else layout_id] = {
+            "roles": roles,
+            "c_worst": float(c.mean()) if len(c) else None,
+            "c_worst_sd": float(c.std(ddof=1)) if len(c) > 1 else None,
+            "seeds": len(c),
+            "jobs_completed": int(completed),
+            "charge_s": charge,
+            "top_up_s": top_up,
+            "busy_s_per_job": per_job,
+            "rate_per_h": round(utilisation * robots * 3600.0 / per_job, 2) if per_job else None,
+        }
+    layouts = list(out["layouts"].values())
+    measured = [r for r in layouts if r["c_worst"] is not None]
+    if len(measured) >= 2:
+        spread = max((r["c_worst_sd"] or 0.0) for r in measured)
+        gap = max(r["c_worst"] for r in measured) - min(r["c_worst"] for r in measured)
+        out |= {"c_worst_gap": gap, "seed_spread": spread, "raise_density": bool(gap < spread)}
+    sets_rate = [layout_id for layout_id, r in out["layouts"].items() if rate_role in r["roles"]]
+    if len(sets_rate) != 1:
+        found = ", ".join(f"{layout_id} ({','.join(r['roles']) or 'no role'})" for layout_id, r in out["layouts"].items())
+        raise ValueError(f"the task rate comes from the premise layout with role {rate_role!r}, and {len(sets_rate)} layouts have it: {found or 'no layouts'}; read the premise suite's manifest from `flowedit infra premise`")
+    out["rate_layout"] = sets_rate[0]
+    out["rate_per_h"] = out["layouts"][sets_rate[0]]["rate_per_h"]
+    return out
+
+
+def _plain(value: typing.Any) -> typing.Any:
+    """`value` with non-finite floats as None and numpy scalars as Python ones, for JSON."""
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def write_json(data: typing.Any, path: pathlib.Path) -> pathlib.Path:
+    path = pathlib.Path(path)
+    path.write_text(json.dumps(_plain(data), indent=1, default=str) + "\n")
+    return path
+
+
+# --- the command -----------------------------------------------------------------------------------------------------
+
+
+def _manifest(path: pathlib.Path) -> dict[str, typing.Any]:
+    path = pathlib.Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"no manifest {path}: `flowedit infra` writes <suite>.layouts.json beside the suite")
+    return json.loads(path.read_text())
+
+
+def _seed_list(text: str) -> list[int]:
+    """Seeds from `51-55`, `51,53,60` or both mixed, each once; `none` for no seed. ValueError for anything else, and
+    for more than `MAX_SEEDS` seeds."""
+    if text.strip().lower() == "none":
+        return []
+    seeds: dict[int, None] = {}
+    for part in text.split(","):
+        match = re.fullmatch(r" *([0-9]{1,9})(?:-([0-9]{1,9}))? *", part)
+        if match is None or int(match[2] or match[1]) < int(match[1]):
+            raise ValueError(f"seeds are whole numbers and ranges like 51-55,60 or `none`, not {text!r}")
+        if int(match[2] or match[1]) - int(match[1]) + 1 + len(seeds) > MAX_SEEDS:
+            raise ValueError(f"{text!r} names more than {MAX_SEEDS} seeds")
+        seeds.update(dict.fromkeys(range(int(match[1]), int(match[2] or match[1]) + 1)))
+    return list(seeds)
+
+
+def _fmt(value: typing.Any, spec: str = ".3f") -> str:
+    return "-" if value is None or (isinstance(value, float) and not math.isfinite(value)) else format(value, spec)
+
+
+def _print_layouts(means: pl.DataFrame) -> None:
+    groups = [g for g in GROUPS if f"C_{g}" in means.columns]
+    print(f"{'layout':10s} {'roles':16s} {'seeds':>5s} {'T s':>7s} {'done':>5s} {'success':>7s} {'queue s':>7s} {'tasks/h':>7s} {'jams':>5s} " + " ".join(f"{'C_' + g:>12s}" for g in groups) + f" {'C_worst':>8s} worst")
+    for r in means.to_dicts():
+        print(
+            f"{r['layout_id']:10s} {str(r['roles'])[:16]:16s} {r['seeds']:5d} {_fmt(r.get('task_time_s'), '.1f'):>7s} {_fmt(r.get('completed_share'), '.2f'):>5s} {_fmt(r.get('success_rate'), '.2f'):>7s} {_fmt(r.get('charger_queue_s'), '.1f'):>7s} {_fmt(r.get('tasks_per_h'), '.1f'):>7s} {_fmt(r.get('jam_share'), '.2f'):>5s} "
+            + " ".join(f"{_fmt(r.get(f'C_{g}')):>12s}" for g in groups)
+            + f" {_fmt(r.get('c_worst_of_means')):>8s} {r.get('worst_group_of_means') or '-'}"
+        )
+        parts = ", ".join(f"{g} element {_fmt(r.get(f'C_{g}_element'))} traffic {_fmt(r.get(f'C_{g}_traffic'))} delay {_fmt(r.get(f'delay_{g}_s'), '.1f')} s" for g in groups)
+        if parts:
+            print(f"{'':10s} {parts}" + (f"; element and traffic over the seeds with a walker in all three runs: " + ", ".join(f"{g} {r.get(f'split_seeds_{g}') or 0}" for g in groups) + f" of {r['split_seeds']} with a run without robots" if r.get("split_seeds") is not None else ""))
+
+
+def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float, *, recompute: bool = False) -> int:
+    """Keep the walker travel times (`walker_times`) of every usable run of `benchmark_dirs`, and of every run but those
+    without robots the conflict exposure (`run_exposure`), `recompute` computing kept ones again from the tracks; the
+    runs kept. Keeps going past a run it cannot keep (no tracks and none kept, or
+    tracks without a walker) and raises at the end naming each with its reason: FileNotFoundError when all lack tracks,
+    else ValueError."""
+    kept = 0
+    failed: list[tuple[str, Exception]] = []
+    for run in runs_of(benchmark_dirs):
+        try:
+            walker_times(run.episode_dir, run.env, warmup_s, recompute=recompute)
+        except (FileNotFoundError, ValueError) as e:
+            failed.append((f"{run.episode_dir} ({run.env})", e))
+            continue
+        if run.planner not in (NO_ROBOTS, SITE_PLANNER):
+            run_exposure(run.episode_dir, run.env, warmup_s, recompute=recompute)
+        kept += 1
+    if failed:
+        listed = "; ".join(f"{where}: {str(e).split(': ', 1)[-1]}" for where, e in failed[:5]) + ("; ..." if len(failed) > 5 else "")
+        message = f"kept the walker times of {kept} runs, but could not keep {len(failed)}: {listed}"
+        if all(isinstance(e, FileNotFoundError) for _, e in failed):
+            raise FileNotFoundError(message)
+        raise ValueError(message)
+    return kept
+
+
+def infra_command(args: typing.Any) -> int:
+    """`evaluation infra {table,premise,pick,compare,times,occupancy}`; see `add_infra_parser`."""
+    if args.infra == "occupancy":
+        cells = occupancy(args.benchmark, args.cell)
+        out = pathlib.Path(args.out or _dirs(args.benchmark)[0] / OCCUPANCY_FILE)
+        cells.write_parquet(out)
+        summary = cells.group_by("group").agg(pl.col("ped_seconds").sum()).sort("group")
+        print(f"wrote {out}: {len(cells)} group cells of {cells.select('planner', 'stage').unique().height} runs ({', '.join(f'{r[0]} {r[1]:.0f} walker-s' for r in summary.iter_rows())}); next: flowedit infra layouts --group-occupancy {out}")
+        return 0
+    if args.infra == "times":
+        warmup = float(args.warmup if args.warmup is not None else (_manifest(args.manifest).get("warmup_s", WARMUP_S) if args.manifest else WARMUP_S))
+        kept = keep_times(args.benchmark, warmup, recompute=getattr(args, "recompute", False))
+        print(f"kept the walker travel times of {kept} runs (warm-up {warmup:g} s) in {', '.join(map(str, _dirs(args.benchmark)))}; a copy of each run dir now needs only {RUN_MANIFEST} and per episode episode_NNN.yaml, {FACTS_FILE}, {TOPICS_DIR}/{FLEET_LOG_FILE} and {TOPICS_DIR}/{DERIVED_DIR}/{times_dir()}/")
+        return 0
+    manifest = _manifest(args.manifest)
+    layout_dirs = _dirs(args.layouts)
+    table = layout_table(args.site, layout_dirs, manifest, warmup_s=args.warmup, tau_s=args.tau, allow_mixed_commits=getattr(args, "allow_mixed_commits", False), split_seeds=getattr(args, "without_robots_seeds", None))
+    out_dir = pathlib.Path(args.output_dir or layout_dirs[0])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    table.write_parquet(out_dir / TABLE_FILE)
+    means = layout_means(table)
+    print(f"{len(table)} (layout, seed) rows from {', '.join(map(str, layout_dirs))} against the site as is in {', '.join(map(str, _dirs(args.site)))}; warm-up {args.warmup if args.warmup is not None else manifest.get('warmup_s', WARMUP_S):g} s; per seed in {out_dir / TABLE_FILE}")
+    incomplete = table.filter(~pl.col("complete")) if "complete" in table.columns else table.head(0)
+    reasons: dict[str, list[str]] = {}
+    for r in incomplete.to_dicts():
+        reasons.setdefault(str(r.get("incomplete") or "missing runs"), []).append(f"{r['layout_id']}@s{r['seed']}")
+    for reason, where in reasons.items():
+        print(f"{len(where)} (layout, seed) rows not complete ({reason}): " + ", ".join(where))
+    _print_layouts(means)
+    if args.infra == "premise":
+        result = premise(table)
+        print(json.dumps(_plain(result), indent=1))
+        if result.get("raise_density"):
+            print("C_worst of the two layouts differs by less than the seed spread: raise the density and rerun the premise check (§10)")
+        if result.get("rate_per_h"):
+            print(f"task rate at 75 % of the measured capacity of the wide layout {result['rate_layout']}: {result['rate_per_h']:g} jobs/h (pass it as `flowedit infra layouts --rate`)")
+        else:
+            print(f"the wide layout {result['rate_layout']} completed no job: no measured task rate")
+        write_json(result, out_dir / "infra_premise.json")
+    elif args.infra == "pick":
+        chosen = pick(means)
+        chosen["score_check"] = score_check(means)
+        chosen["forecaster_check"] = forecaster_check(means)
+        out = pathlib.Path(args.out or out_dir / "infra_pick.json")
+        write_json(chosen, out)
+        png = figure(means, chosen, out_dir / "plots" / FIGURE_FILE)
+        print(f"robot-only {chosen['robot_only']}: T {_fmt(chosen['robot_only_task_time_s'], '.1f')} s (cap {_fmt(chosen['task_time_cap_s'], '.1f')} s), C_worst {_fmt(chosen['robot_only_c_worst'])}")
+        for c in chosen["joint"]:
+            print(f"  joint {c['layout_id']}: T {_fmt(c['task_time_s'], '.1f')} s, C_worst {_fmt(c['c_worst'])} ({c['worst_group'] or '-'}){' - T over the cap beyond its interval' if c['t_over'] else ''}{'' if c['excluded'] is None else ' - excluded: ' + c['excluded']}")
+        sc = chosen["score_check"]
+        print(f"joint pick: {chosen['joint_pick'] or 'none (every joint layout dropped)'}; score check: Spearman {_fmt(sc['spearman'])} over {sc['layouts']} layouts, one-sided p {_fmt(sc['p'])} -> {'holds' if sc['holds'] else 'not shown'}; forecaster check: Spearman {_fmt(chosen['forecaster_check']['spearman'])} over {chosen['forecaster_check']['layouts']} layouts")
+        for group, g in sc["groups"].items():
+            print(f"  {group}: {g['predicted']} vs C_{group}_traffic, Spearman {_fmt(g['spearman'])}, p {_fmt(g['p'])} over {g['layouts']} layouts")
+        print(f"wrote {out} and {png}; next: flowedit infra evaluation --pick {out}")
+        return 0 if chosen["joint_pick"] else 1
+    elif args.infra == "compare":
+        picks = manifest.get("picks") or {}
+        if not picks.get("joint") or not picks.get("robot_only"):
+            raise ValueError(f"{args.manifest}: no picks; compare reads the evaluation manifest `flowedit infra evaluation` writes")
+        result = compare(table, {role: picks[role] for role in ("joint", "robot_only", "guideline") if picks.get(role)}, n_boot=args.boot)
+        out = write_json(result, pathlib.Path(args.out or out_dir / "infra_compare.json"))
+        d, d90, t = result["delta_c_worst"], result["delta_c_worst_90"], result["delta_t_rel"]
+        print(f"joint {picks['joint']} - robot-only {picks['robot_only']} over {d['seeds']} seeds: dC_worst {_fmt(d['estimate'])} 95 % [{_fmt(d['ci_low'])}, {_fmt(d['ci_high'])}], 90 % [{_fmt(d90['ci_low'])}, {_fmt(d90['ci_high'])}], dT/T {_fmt(t['estimate'])} [{_fmt(t['ci_low'])}, {_fmt(t['ci_high'])}] -> {result['verdict']} (H1 {'holds' if result['h1_holds'] else 'does not hold'}; equivalence margin +-{result['delta']:g})")
+        for name, c in (result.get("guideline") or {}).items():
+            cd, c90 = c["delta_c_worst"], c["delta_c_worst_90"]
+            print(f"  {name}: dC_worst {_fmt(cd['estimate'])} 95 % [{_fmt(cd['ci_low'])}, {_fmt(cd['ci_high'])}], 90 % [{_fmt(c90['ci_low'])}, {_fmt(c90['ci_high'])}], Holm p {_fmt(c['p_holm'])} -> {c['verdict']}")
+        for group, r in result["delta_aid_minus_adult"].items():
+            print(f"  d(C_{group} - C_adult) {_fmt(r['estimate'])} [{_fmt(r['ci_low'])}, {_fmt(r['ci_high'])}], Holm p {_fmt(r['p_holm'])} -> {'most for ' + group if r['holds'] else 'not shown'}")
+        print(f"wrote {out}")
+    return 0
+
+
+def add_infra_parser(subparsers: typing.Any) -> None:
+    """The `infra` command: INFRA's robot service, pedestrian cost, premise check, pick and comparison."""
+    import argparse
+
+    p = subparsers.add_parser("infra", help="INFRA (study design §6, §10, §12): robot service and pedestrian cost per layout, the premise check, the selection pick, the evaluation comparison")
+    sub = p.add_subparsers(dest="infra", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    several = "; repeatable: a suite's parts from several run dirs (e.g. recorded on two machines) are read as one, they must name the same Arena and humansim commits and share no stage"
+    common.add_argument("--site", type=pathlib.Path, action="append", required=True, help=f"processed benchmark dir of the site as is (flowedit infra reference) on the same seeds{several}")
+    common.add_argument("--layouts", type=pathlib.Path, action="append", required=True, help=f"processed benchmark dir of a layout suite (premise, selection or evaluation){several}")
+    common.add_argument("--manifest", type=pathlib.Path, required=True, help="the suite's <suite>.layouts.json from flowedit infra")
+    common.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g})")
+    common.add_argument("--tau", type=float, default=None, help="horizon of the restricted mean task time T, s (default the episode minus the warm-up; one value for a whole study)")
+    common.add_argument("--output-dir", type=pathlib.Path, default=None, help="where the table, JSON and plots go (default the first --layouts)")
+    common.add_argument("--allow-mixed-commits", action="store_true", help="read run dirs (site and layouts alike) whose manifests or kept walker times name different Arena, humansim or arena_evaluation commits, with a warning, instead of refusing them")
+
+    def seeds(text: str) -> list[int]:
+        try:
+            return _seed_list(text)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+
+    common.add_argument("--without-robots-seeds", type=seeds, default=None, metavar="SEEDS", help=f"the seeds that have a run without robots, e.g. 51-55 or `none`, for a manifest without {WITHOUT_ROBOTS_SEEDS} (refused when the manifest names other seeds; with neither, every seed needs one and the three runs pair as before): the cost against the site as is then pairs the site as is and the fleet run on every seed, and the element and traffic parts come from these seeds")
+    common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
+    sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
+    sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the task rate at 75 %% of the wide layout's measured capacity")
+    sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10, the score check, the forecaster check, the T vs C_worst figure")
+    q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick (and each against the guideline layout) on the evaluation seeds: lower, equivalent or inconclusive")
+    q.add_argument("--boot", type=int, default=10_000, help="bootstrap draws (default 10000)")
+    q = sub.add_parser("times", help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST} and per episode episode_NNN.yaml, {FACTS_FILE}, {TOPICS_DIR}/{FLEET_LOG_FILE} and {TOPICS_DIR}/{DERIVED_DIR}/infra_times.*/ reads like the original (run it where the tracks are, before copying, with the analysis' warm-up)")
+    q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir; repeatable")
+    q.add_argument("--manifest", type=pathlib.Path, default=None, help="the suite's <suite>.layouts.json, for its warm-up")
+    q.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g}); the analysis reads the times kept for its own warm-up")
+    q.add_argument("--recompute", action="store_true", help="compute kept times again from the tracks and replace them, e.g. to keep a run dir's times with one release")
+    q = sub.add_parser("occupancy", help=f"per walker group, the walker-seconds per cell of a run dir's runs (the site as is): {OCCUPANCY_FILE}, the occupancy `flowedit infra layouts --group-occupancy` ranks by")
+    q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir of the site as is, with its tracks; repeatable, read as one")
+    q.add_argument("--cell", type=float, default=OCCUPANCY_CELL_M, help=f"cell size, m (default {OCCUPANCY_CELL_M:g})")
+    q.add_argument("--out", type=pathlib.Path, default=None, help=f"the parquet file (default <first benchmark dir>/{OCCUPANCY_FILE})")
