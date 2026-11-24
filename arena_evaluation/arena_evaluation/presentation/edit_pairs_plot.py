@@ -7,7 +7,15 @@ import pathlib
 
 import polars as pl
 
-from arena_evaluation.processing.edit_pairs import CONTRAST, CONTROL, EDIT, short_world
+#: The `role` values of `edit_pairs`' rows: a function-carrying edit and a geometry-only control against their base
+#: world, and an edit minus one of its controls (the presentation layer binds the table and imports no processing)
+EDIT, CONTROL, CONTRAST = "edit", "control", "contrast"
+
+
+def short_world(world: str) -> str:
+    """`hospital_1__move_fountain__6e1d6873` as `move_fountain`: the edit's name without its base and id."""
+    parts = world.split("__")
+    return parts[1] if len(parts) >= 2 else world
 
 # Categorical slots 1 and 2 of the reference chart palette (blue, orange), a validated adjacent pair on the light surface;
 # role is also told by marker shape and by the x labels, never by color alone.

@@ -59,7 +59,8 @@ FACT_FILES = ("fact_episodes.parquet", "fact_robots.parquet")
 _FACT_KEY = ["run_id", "episode_id", "robot_id"]
 
 EDIT, CONTROL, UNLABELLED = "edit", "control", "edited"
-#: The role of an edit-minus-control row: `world` the edit, `against` the control
+#: The role of an edit-minus-control row: `world` the edit, `against` the control (`presentation.edit_pairs_plot` draws
+#: the same role names)
 CONTRAST = "contrast"
 
 #: Seeds up to which tied differences get the signed-rank p by enumerating every sign flip (2^n of them)

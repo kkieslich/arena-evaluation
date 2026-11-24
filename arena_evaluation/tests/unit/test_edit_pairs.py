@@ -252,3 +252,10 @@ def test_the_h2_contrasts_are_holm_adjusted_apart_from_the_rows_against_the_base
     text = format_tests(tests)
     assert text.startswith("personal_space_time: function-carrying edit minus geometry-only control, paired by seed (H2)")
     assert "move_fountain_leave_demand" in text and "edited world minus base world" in text
+
+
+def test_the_figure_draws_the_roles_the_pairs_carry():
+    from arena_evaluation.presentation import edit_pairs_plot
+
+    assert (edit_pairs_plot.EDIT, edit_pairs_plot.CONTROL, edit_pairs_plot.CONTRAST) == (EDIT, CONTROL, CONTRAST)
+    assert edit_pairs_plot.short_world(MOVE) == short_world(MOVE)
