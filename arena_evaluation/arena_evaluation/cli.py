@@ -116,6 +116,12 @@ Examples:
   # Check a suite or contest definition without running it:
   evaluation validate --suite configs/suites/basic
 
+  # Print each pedestrian measure per group (mean over seeds) and write ped_groups.parquet:
+  evaluation groups --benchmark-dir /opt/arena_ws/data/my_benchmark
+
+  # Each robot measure of an edited world minus its base world per planner and seed, paired tests, one figure:
+  evaluation edits --benchmark-dir /opt/arena_ws/data/my_benchmark --split h2_planners.yaml --plot
+
   # INFRA: service and cost per layout, the premise check, the pick, the comparison (see processing/infra.py):
   evaluation infra pick --site <site run> --layouts <selection run> --manifest <suites>/infra_h1.layouts.json
 """,
@@ -267,6 +273,20 @@ Examples:
         help="Contest bundle directory or contest.yaml to validate.",
     )
 
+    groups_parser = subparsers.add_parser(
+        "groups",
+        help="Each pedestrian measure per group of agent types: print the mean over seeds, write ped_groups.parquet in the benchmark dir.",
+    )
+    groups_parser.add_argument("--benchmark-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Processed benchmark directories")
+    edits_parser = subparsers.add_parser(
+        "edits",
+        help="Each robot measure of an edited world minus its base world at the same seed, and of an edit minus each of its controls (with --split, the H2 test), per planner, with a paired test across seeds; writes edit_pairs.parquet and edit_tests.csv.",
+    )
+    edits_parser.add_argument("--benchmark-dir", type=pathlib.Path, nargs="+", metavar="DIR", help="Processed benchmark directories")
+    edits_parser.add_argument("--split", type=pathlib.Path, default=None, help="FLOWEDIT split whose control_worlds label the edited worlds edit or control and give the edit-minus-control contrasts")
+    edits_parser.add_argument("--measure", action="append", default=None, help="a measure to pair (repeatable, default: personal_space_time, its integral, intimate time, encounters, pedestrian contacts, path length)")
+    edits_parser.add_argument("--plot", action="store_true", help="also save plots/edit_pairs_<first measure>.png and, with contrasts, plots/edit_contrasts_<first measure>.png")
+
     from arena_evaluation.cli_acoustic import add_acoustic_commands
     from arena_evaluation.processing.infra import add_infra_parser
 
@@ -358,6 +378,16 @@ Examples:
         if not d.exists() or not d.is_dir():
             print(f"Error: directory does not exist: {d}")
             sys.exit(1)
+
+    if args.command == "groups":
+        from arena_evaluation.processing.ped_groups import groups_command
+
+        return groups_command(target_dirs)
+
+    if args.command == "edits":
+        from arena_evaluation.processing.edit_pairs import edits_command
+
+        return edits_command(target_dirs, args.split, args.measure, args.plot)
 
     profiler = None
     if args.profile:

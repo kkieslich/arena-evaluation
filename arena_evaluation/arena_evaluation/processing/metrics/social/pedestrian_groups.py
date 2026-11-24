@@ -15,19 +15,19 @@ TYPE_GROUPS = {
     "blind_rolling_cane": "long_cane",
 }
 
-# Measures with a `<measure>_per_ped` output and the direction that is better, the other end names the worst-served group.
+# The per-pedestrian measures (columns of fact_pedestrians) scored per group, with the direction that is better: the
+# other end names the worst-served group
 PED_MEASURES = {
     "ped_path_deflection_m": "lower",
     "ped_velocity_delay_ratio": "lower",
-    "ped_round_trips_completed": "higher",
-    "ped_mechanism_delay_seconds": "lower",
+    "round_trips_completed": "higher",
     "ped_max_exposure_dba": "lower",
     "ped_leq_exposure_dba": "lower",
     "ped_max_startle_factor": "lower",
     "ped_robot_contacts": "lower",
 }
 
-# The fleet measures `add_fleet_contacts` breaks down by group, with the direction that is better.
+# The fleet measures, every robot of an env together, scored per group, with the direction that is better
 FLEET_MEASURES = {
     "ped_fleet_contacts": "lower",
     "ped_contact_free_rate": "higher",
