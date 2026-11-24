@@ -167,7 +167,10 @@ def _merge_fact_tables(groups: list[ScopedFactTables]) -> ScopedFactTables | Non
         return None
     from arena_evaluation.processing.scoped_evaluator import ScopedFactTables
 
-    return ScopedFactTables(**_merge_frames([group.by_name() for group in groups], "vertical"))
+    merged = ScopedFactTables(**_merge_frames([group.by_name() for group in groups], "vertical"))
+    # Each robot of an env evaluates every pedestrian of it: rows that agree in every column are one pedestrian's row
+    # (so without a pedestrian-scope calculator, `--measures flow`); rows that differ stay for the contract to refuse
+    return dataclasses.replace(merged, pedestrians=merged.pedestrians.unique(maintain_order=True)) if len(groups) > 1 else merged
 
 
 def _worker_init():
