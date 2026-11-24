@@ -65,6 +65,7 @@ from .runner_plan import (
     build_launch_args,
     cell_verdict,
     closed_fraction,
+    drives_robot,
     compromised_table,
     episode_line,
     group_pending,
@@ -944,7 +945,7 @@ class _RunnerExecMixin(_RunnerExecHost):
                 goal.world = step.stage.map
                 goal.seed = step.stage.seed + ep_idx if step.stage.seed is not None else ep_idx
                 window.append((step.key, ep_idx))
-                self._lockstep.open(window[-1], time.time(), env=env_fqn)
+                self._lockstep.open(window[-1], time.time(), env=env_fqn, beats=drives_robot(step))
                 ep_started_sim = self.sim_time.to_seconds()
                 ep_started_wall = time.time()
                 try:

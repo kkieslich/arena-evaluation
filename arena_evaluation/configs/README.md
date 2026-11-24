@@ -265,6 +265,10 @@ report table, and `--lockstep-verdict` turns a `fail` row into exit code 3. A
 row fails when a stall reaches 5 s, no tick was gated, or no `nav/`/`planner/`
 beat registered for the contestant or delivered a heartbeat, i.e. the run froze
 or the planner never engaged the gate.
+A step whose robot drives under no planner (the no-op mobile adapter
+`mobile: none`, a stage whose robots are all `stationary`, or an `unhindered_peds`
+reference) expects no planner beat: its row passes on gated ticks without a long
+stall, and the report shows its beats as `(none due)`.
 
 Suite and contest are both built inline by the `arena` CLI
 (`arena_cli/features/planners.py`), so nothing here defines them: bridge planners become

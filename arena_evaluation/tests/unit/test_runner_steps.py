@@ -312,3 +312,16 @@ def test_suite_references_take_a_bool_or_the_reference_types(value: object, refe
 def test_suite_references_refuse_unknown_reference_types(value: object):
     with pytest.raises(ValueError, match="suite references"):
         Suite.parse("suite", {"references": value, "stages": [_stage_doc("s1")]})
+
+
+def test_planner_beats_are_due_only_when_the_robot_drives_under_a_planner():
+    from arena_evaluation.benchmark.runner_plan import drives_robot
+
+    parked = Suite.Stage(name="s1", episodes=1, robot="jackal", map="map1", modes={"robots": "stationary", "obstacles": "scenario"}, config={}, seed=7, timeout=60.0, optim=None)
+    assert drives_robot(_step())
+    assert drives_robot(_step(args={"mobile": {"driver": "nav2", "local_planner": "dwb"}}))
+    # the no-op mobile adapter, a parked robot, and the runner's own unhindered-peds reference drive under no planner
+    assert not drives_robot(_step(args={"mobile": "none"}))
+    assert not drives_robot(_step(stage=parked))
+    assert not drives_robot(_step(is_reference=True, reference_type="unhindered_peds"))
+    assert drives_robot(_step(is_reference=True, reference_type="unobstructed_robot"))

@@ -556,6 +556,17 @@ def _accepts_empty_selection(layer: TaskLayer, axis: str) -> bool:
     return True
 
 
+def drives_robot(step: Step) -> bool:
+    """Whether the step's robot drives under a planner, so lockstep planner beats are due: not with the no-op mobile
+    adapter (`mobile: none`), not on a stage whose robots only park (`stationary`), not in an unhindered-peds reference."""
+    if (step.contestant.args or {}).get("mobile") == "none":
+        return False
+    if step.is_reference and step.reference_type == "unhindered_peds":
+        return False
+    robots = stage_modes(step.stage, {_ROBOTS: []})[_ROBOTS]
+    return not robots or any(mode != "stationary" for mode in robots)
+
+
 def stage_request(step: Step) -> QueueEpisode.Request:
     """The QueueEpisode request that sets a step's stage: its set modes and its config blocks under the namespaces of the selected modes."""
     layer = task_layer(step.task_layer)
