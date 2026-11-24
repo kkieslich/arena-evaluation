@@ -682,6 +682,19 @@ def _stage_budget(episode_dir: pathlib.Path, data_root: pathlib.Path, metadata: 
         return None
 
 
+def _keep_tracks(ep: EpisodeDescriptor, episode_dir: pathlib.Path) -> None:
+    """Keep the pedestrian tracks of every env of the extracted episode beside its topics (`ped_track_store`), which
+    the cross-run measures and the flow forecaster read; a failure leaves them to be built on first use."""
+    from arena_evaluation.processing.ped_track_store import TOPICS_DIR, write_tracks
+
+    if not (episode_dir / TOPICS_DIR).is_dir():
+        return
+    try:
+        write_tracks(episode_dir)
+    except Exception as e:  # noqa: BLE001 - the tracks are a cache, the episode's evaluation goes on without them
+        _log.warning(f"episode_{ep.episode_id:03d}: pedestrian tracks not kept, they are built again on use: {e!r}")
+
+
 def _failed_evaluation(ep: EpisodeDescriptor, error: Exception) -> EpisodeEvaluation:
     """The evaluation row of an episode whose metrics could not be computed."""
     return _status_evaluation(ep, pathlib.Path(ep.episode_dir), None, "", "error", repr(error))
@@ -1055,6 +1068,7 @@ class ProcessingPipeline:
             _log.warning(f"episode_{ep.episode_id:03d}: could not read metadata: {e}")
             metadata = None
         bundles = self.extract_episode(ep, force_extract=force_extract)
+        _keep_tracks(ep, episode_dir)
         if not bundles:
             return _status_evaluation(
                 ep,
