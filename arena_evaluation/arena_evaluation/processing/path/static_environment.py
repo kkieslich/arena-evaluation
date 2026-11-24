@@ -29,11 +29,27 @@ DEFAULT_PADDING_CELLS: Final = 5
 ROUNDING_DECIMALS: Final = 6
 
 
+# What compacting a world or footprinting its obstacles raises for a world that does not resolve.
+_UNRESOLVED_WORLD_ERRORS: Final = (FileNotFoundError, ValueError)
+# The error of each (world, run dir) that did not resolve: compacting a large world takes seconds and every encounter
+# window asks for its grid, so a world that failed is not compacted again.
+_UNRESOLVED_WORLDS: dict[tuple[str, pathlib.Path | None], Exception] = {}
+
+
 def grid_for_map(map_name: str | None, run_dir: pathlib.Path | None, robot_radius_m: float) -> StaticGrid | None:
-    """Lethal grid of a named map's world for a robot radius; None for an unnamed map. A world that does not resolve raises."""
+    """Lethal grid of a named map's world for a robot radius; None for an unnamed map. A world that does not resolve
+    raises, and raises the same error at once on every later call for it."""
     if not map_name or map_name == "unknown":
         return None
-    return _world_grid(map_name, run_dir, robot_radius_m)
+    key = (map_name, run_dir)
+    failure = _UNRESOLVED_WORLDS.get(key)
+    if failure is not None:
+        raise failure.with_traceback(None)
+    try:
+        return _world_grid(map_name, run_dir, robot_radius_m)
+    except _UNRESOLVED_WORLD_ERRORS as error:
+        _UNRESOLVED_WORLDS[key] = error
+        raise
 
 
 @functools.cache
