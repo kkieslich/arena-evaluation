@@ -80,6 +80,8 @@ from .step import Step, StepErrorKind, StepResult
 
 _T = typing.TypeVar("_T")
 _log = logging.getLogger("arena_evaluation.benchmark.runner")
+#: Wall seconds a run waits for the run_episode result after the env published the episode's outcome [s]
+_RESULT_GRACE_S = 60.0
 
 if typing.TYPE_CHECKING:
     from arena_rclpy_mixins import ArenaMixinNode
@@ -508,6 +510,9 @@ class _RunnerEnvMixin(_RunnerHost):
         )
         last_sim = self.sim_time.to_seconds()
         last_move = time.monotonic()
+        records = self._episode_records.get(env_id, {})
+        ended_before = {episode_id for episode_id, record in records.items() if record.outcome_state != EpisodeRecord.RUNNING}
+        ended_seen: float | None = None
         try:
             while True:
                 done, _ = await asyncio.wait({result_task}, timeout=1.0)
@@ -515,6 +520,19 @@ class _RunnerEnvMixin(_RunnerHost):
                     response = result_task.result()
                     assert isinstance(response, RunEpisode.Impl.GetResultService.Response)
                     return response
+                ended = [record for episode_id, record in records.items() if episode_id not in ended_before and record.outcome_state != EpisodeRecord.RUNNING]
+                if ended:
+                    # the env published the episode's outcome; an env whose executor fell behind (overloaded, lockstep off)
+                    # may never answer the action's result request: take the outcome from the record after a grace period
+                    ended_seen = time.monotonic() if ended_seen is None else ended_seen
+                    if time.monotonic() - ended_seen >= _RESULT_GRACE_S:
+                        record = max(ended, key=lambda r: r.episode_id)
+                        _log.warning(f"[env {env_id}] episode {record.episode_id} ended ({record.outcome_info!r}) but no run_episode result after {_RESULT_GRACE_S:.0f}s; using its EpisodeRecord")
+                        response = RunEpisode.Impl.GetResultService.Response()
+                        response.result.state = record.outcome_state
+                        response.result.info = record.outcome_info
+                        response.result.episode_id = record.episode_id
+                        return response
                 now_sim = self.sim_time.to_seconds()
                 if now_sim > last_sim or self._env_holds:
                     last_sim, last_move = now_sim, time.monotonic()
