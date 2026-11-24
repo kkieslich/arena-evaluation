@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
@@ -185,7 +185,7 @@ def record_meta_rows(sink: TableSink, envelope: Envelope[RosAgentMeta]) -> None:
         )
 
 
-def _aligned[T](values: Sequence[T], n: int, default: T) -> list[T]:
+def _aligned[T](values: Collection[T], n: int, default: T) -> list[T]:
     """`values` when it holds one entry per agent, else `default` for each of the `n` agents."""
     return list(values) if len(values) == n else [default] * n
 

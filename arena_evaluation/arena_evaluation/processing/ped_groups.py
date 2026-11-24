@@ -85,7 +85,7 @@ def _group_means(run: EpisodeRun, peds: pl.DataFrame, measure: str, values: pl.E
     """One `_LONG_SCHEMA` row per group: the mean of `values` over the group's pedestrians with a finite one."""
     scored = peds.select("group", values.cast(pl.Float64).alias("value")).filter(pl.col("value").is_not_null() & pl.col("value").is_finite())
     out = scored.group_by("group").agg(pl.col("value").mean(), pl.len().cast(pl.Int64).alias("peds"))
-    return out.with_columns(pl.lit(run.planner).alias("planner"), pl.lit(run.stage).alias("stage"), pl.lit(run.episode, pl.Int64).alias("episode"), pl.lit(run.env).alias("env"), pl.lit(measure).alias("measure")).select(list(_LONG_SCHEMA)).cast(_LONG_SCHEMA)
+    return out.with_columns(pl.lit(run.planner).alias("planner"), pl.lit(run.stage).alias("stage"), pl.lit(run.episode, pl.Int64).alias("episode"), pl.lit(run.env).alias("env"), pl.lit(measure).alias("measure")).select(list(_LONG_SCHEMA)).cast(pl.Schema(_LONG_SCHEMA))
 
 
 def _contact_ped(obstacle: str, peds: pl.DataFrame) -> str | None:
@@ -128,7 +128,7 @@ def _paired_rows(benchmark_dir: pathlib.Path) -> list[pl.DataFrame]:
     frames = []
     for column in [c for c in paired.columns if c.endswith(_BY_GROUP)]:
         measure = column.removesuffix(_BY_GROUP)
-        frames.append(paired.select("planner", "stage", "episode", "env", pl.lit(measure).alias("measure"), pl.col(column).alias("record")).explode("record").drop_nulls("record").unnest("record").select(list(_LONG_SCHEMA)).cast(_LONG_SCHEMA))
+        frames.append(paired.select("planner", "stage", "episode", "env", pl.lit(measure).alias("measure"), pl.col(column).alias("record")).explode("record").drop_nulls("record").unnest("record").select(list(_LONG_SCHEMA)).cast(pl.Schema(_LONG_SCHEMA)))
     return frames
 
 

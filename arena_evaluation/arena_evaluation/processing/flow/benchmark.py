@@ -179,7 +179,9 @@ def flow_measures(
         if key in maps:
             base = _base_of(world)
             labels = {"planner": planner, "stage": _stage_name(world, seed), "flow_world": world, "flow_base": base, "flow_seed": seed}
-            cells.append(grids[base].cells(maps[key]).with_columns(pl.lit(v, FLOW_CELL_SCHEMA[k]).alias(k) for k, v in labels.items()).select(list(FLOW_CELL_SCHEMA)))
+            g = grids[base]
+            assert g is not None, f"{base}: a flow map without its grid"  # maps holds only runs counted on a grid
+            cells.append(g.cells(maps[key]).with_columns(pl.lit(v, FLOW_CELL_SCHEMA[k]).alias(k) for k, v in labels.items()).select(list(FLOW_CELL_SCHEMA)))
 
     for entry, row in zip(entries, rows, strict=True):
         if entry.world == entry.base or (entry.run.planner, entry.base, entry.seed) not in stages:

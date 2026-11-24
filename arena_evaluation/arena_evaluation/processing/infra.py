@@ -243,7 +243,9 @@ def check_commits(run_dirs: typing.Sequence[pathlib.Path], *, allow_mixed: bool 
             _warn(f"{run_dir}: " + (f"no {RUN_MANIFEST}" if doc is None else f"its {RUN_MANIFEST} records no commits") + ", so its Arena and humansim commits are not compared")
             continue
         for name in SAME_COMMITS:
-            entry = commits.get(name) if isinstance(commits.get(name), dict) else {}
+            entry = commits.get(name)
+            if not isinstance(entry, dict):
+                entry = {}
             if not entry.get("commit"):
                 _warn(f"{run_dir}: no {name} commit recorded ({entry.get('reason') or 'not in the manifest'}), so it is not compared")
                 continue
@@ -1046,6 +1048,7 @@ def layout_table(
             row.update({f"pred_{group}": value for group, value in predicted.get(layout_id, {}).items()})
             row.update({f"pred_traffic_{group}": value for group, value in predicted_traffic.get(layout_id, {}).items()})
             if on is not None:
+                assert snapshot is not None  # a fleet run is kept only with its task log, read above
                 row.update(service(log_from_snapshot(snapshot, on.env), warmup_s=warmup, episode_s=episode_s, tau_s=tau_s))
                 measured_exposure = run_exposure(on.episode_dir, on.env, warmup)
                 if measured_exposure is not None:
@@ -1053,14 +1056,16 @@ def layout_table(
                     row.update({f"exposure_{r['group']}_{PREDICTION_BAND_TAG}_s": r.get(f"exposure_{PREDICTION_BAND_TAG}_s") for r in measured_exposure.iter_rows(named=True)})
             times: dict[str, pl.DataFrame | None] = {}
             if split is None and off is not None and ref is not None:
-                times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": walker_times(off.episode_dir, off.env, warmup), "with the fleet": None if on is None else walker_times(on.episode_dir, on.env, warmup)}
-                measured = cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)
+                site = walker_times(ref.episode_dir, ref.env, warmup)
+                times = {"the site as is": site, "without robots": walker_times(off.episode_dir, off.env, warmup), "with the fleet": None if on is None else walker_times(on.episode_dir, on.env, warmup)}
+                measured = cost_from_times(site, times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)
                 row.update(_flatten(measured))
             elif split is not None and on is not None and ref is not None:
-                times = {"the site as is": walker_times(ref.episode_dir, ref.env, warmup), "without robots": None if off is None else walker_times(off.episode_dir, off.env, warmup), "with the fleet": walker_times(on.episode_dir, on.env, warmup)}
-                row.update(_flatten(cost_from_times(times["the site as is"], None, times["with the fleet"], visitor_sources=visitor_sources)))
+                site = walker_times(ref.episode_dir, ref.env, warmup)
+                times = {"the site as is": site, "without robots": None if off is None else walker_times(off.episode_dir, off.env, warmup), "with the fleet": walker_times(on.episode_dir, on.env, warmup)}
+                row.update(_flatten(cost_from_times(site, None, times["with the fleet"], visitor_sources=visitor_sources)))
                 if off is not None:
-                    row.update(_flatten_split(cost_from_times(times["the site as is"], times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)))
+                    row.update(_flatten_split(cost_from_times(site, times["without robots"], times["with the fleet"], visitor_sources=visitor_sources)))
             # a run without a walker that spawned after the warm-up and finished has no cost to give: not complete
             empty = [what for what, t in times.items() if t is not None and len(t) == 0]
             if empty:
@@ -1171,8 +1176,9 @@ def pick(means: pl.DataFrame, *, slack: float = SERVICE_SLACK, jam_drop: float =
     }
 
 
-def spearman(x: typing.Sequence[float], y: typing.Sequence[float]) -> float:
-    """Spearman's rank correlation with average ranks for ties, nan for fewer than 3 pairs or a constant side."""
+def spearman(x: typing.Sequence[float | None], y: typing.Sequence[float | None]) -> float:
+    """Spearman's rank correlation with average ranks for ties over the pairs with both values set and finite, nan for
+    fewer than 3 such pairs or a constant side."""
     pairs = [(a, b) for a, b in zip(x, y, strict=True) if a is not None and b is not None and math.isfinite(a) and math.isfinite(b)]
     if len(pairs) < 3:
         return math.nan

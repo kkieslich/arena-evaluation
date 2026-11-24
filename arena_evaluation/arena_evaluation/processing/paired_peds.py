@@ -121,7 +121,7 @@ def paired_ped_measures(ref_tracks: pl.DataFrame, run_tracks: pl.DataFrame) -> d
         "ped_paired_deflection_m_per_ped": deflection,
         "ped_paired_deflection_m_by_group": deflection_groups,
         "ped_paired_deflection_m_worst_group": worst_group(deflection_groups, PAIRED_MEASURES["ped_paired_deflection_m"]),
-        "ped_paired_delay_s": float(done["delay_s"].mean()) if len(done) else None,
+        "ped_paired_delay_s": float(typing.cast(float, done["delay_s"].mean())) if len(done) else None,
         "ped_paired_delay_s_per_ped": delay,
         "ped_paired_delay_s_by_group": delay_groups,
         "ped_paired_delay_s_worst_group": worst_group(delay_groups, PAIRED_MEASURES["ped_paired_delay_s"]),

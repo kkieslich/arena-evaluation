@@ -200,7 +200,7 @@ def pair_table(episodes: pl.DataFrame, roles: Mapping[str, str] | None = None) -
     )
     order = {EDIT: 0, CONTROL: 1, UNLABELLED: 2}
     pairs = pairs.sort([pl.col("planner"), pl.col("base"), pl.col("role").replace_strict(order, return_dtype=pl.Int64), pl.col("world"), pl.col("measure"), pl.col("seed")], nulls_last=True)
-    return pairs.select(list(PAIRS_SCHEMA)).cast(PAIRS_SCHEMA)
+    return pairs.select(list(PAIRS_SCHEMA)).cast(pl.Schema(PAIRS_SCHEMA))
 
 
 def contrast_table(episodes: pl.DataFrame, controls: Mapping[str, Sequence[str]]) -> pl.DataFrame:
@@ -224,7 +224,7 @@ def contrast_table(episodes: pl.DataFrame, controls: Mapping[str, Sequence[str]]
         (pl.col("value") - pl.col("base_value")).alias("diff"),
     )
     rows = rows.sort("planner", "world", "against", "measure", "seed")
-    return rows.select(list(PAIRS_SCHEMA)).cast(PAIRS_SCHEMA)
+    return rows.select(list(PAIRS_SCHEMA)).cast(pl.Schema(PAIRS_SCHEMA))
 
 
 def paired_test(diffs: Sequence[float]) -> dict[str, float | int | None]:
@@ -254,7 +254,8 @@ def paired_test(diffs: Sequence[float]) -> dict[str, float | int | None]:
         out["p_t"] = 1.0 if mean == 0 else 0.0
     if any(x != 0 for x in d):
         try:
-            out["p_wilcoxon"] = float(stats.wilcoxon(d, method=_signed_rank_method(d)).pvalue)
+            # scipy builds its result bunch at runtime, so the checker does not see its `pvalue` field
+            out["p_wilcoxon"] = float(stats.wilcoxon(d, method=_signed_rank_method(d)).pvalue)  # pyright: ignore[reportAttributeAccessIssue]
         except ValueError:
             out["p_wilcoxon"] = None
     return out
