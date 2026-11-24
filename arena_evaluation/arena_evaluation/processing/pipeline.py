@@ -433,6 +433,17 @@ _PEDESTRIAN_CONSTANT_COLUMNS: typing.Final[tuple[str, ...]] = (
 )
 
 
+def _engine_as_arena_peds(topics: dict[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
+    """The engine's agent states as the pedestrian frames the calculators read when the recording has no arena_peds
+    (a suite's record block may leave arena_peds out: it repeats the engine's states): both tables hold the same
+    pedestrians in the environment frame, the engine's with its recorded radius and desired speed."""
+    arena = topics.get(PEDESTRIAN_ARENA_PEDS_TOPIC)
+    engine = topics.get(PEDESTRIAN_AGENT_STATES_TOPIC)
+    if (arena is not None and arena.height > 0) or engine is None or engine.height == 0:
+        return topics
+    return {**topics, PEDESTRIAN_ARENA_PEDS_TOPIC: engine}
+
+
 def _with_pedestrian_constants(
     topics: dict[str, pl.DataFrame],
 ) -> dict[str, pl.DataFrame]:
@@ -963,6 +974,9 @@ class ProcessingPipeline:
         t0 = int(aligned_df["t_ns"][0])
         t1 = int(aligned_df["t_ns"][-1])
         native = {name: frame for name in sorted(bundle.available() - _SHARED_FRAMES) if (frame := _frame(vars(bundle)[name])) is not None and (len(frame) > 0 or name in KEPT_EMPTY_TABLES)}
+        native = _engine_as_arena_peds(native)
+        if PEDESTRIAN_ARENA_PEDS_TOPIC in native:
+            available_topics = available_topics | {PEDESTRIAN_ARENA_PEDS_TOPIC}
         topics = {name: df if name in _UNCLIPPED_TABLES else _clipped(df, t0, t1, TRACK_ALIGN_TOLERANCE_NS) for name, df in _with_pedestrian_constants(native).items()}
 
         peds_df = _frame(bundle.pedestrian_arena_peds)
