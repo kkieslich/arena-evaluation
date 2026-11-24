@@ -12,10 +12,13 @@ import typing
 import numpy as np
 import polars as pl
 
-from arena_evaluation.processing.mcap_reader import bundle_env
 from arena_evaluation.processing.metrics.social.pedestrian_disturbance import PedestrianDisturbanceCalculator
 from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group, by_group, worst_group
-from arena_evaluation.processing.ped_track_store import Pairing, empty_tracks, pair, tracks_for_episode
+
+if typing.TYPE_CHECKING:
+    from arena_evaluation.processing.ped_track_store import Pairing
+
+# The track store is imported where it is used: metric discovery imports this module while the store's own imports load.
 
 _PER_PED = pl.List(pl.Struct({"ped": pl.String, "value": pl.Float64}))
 _BY_GROUP = pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64}))
@@ -97,6 +100,8 @@ def paired_ped_measures(ref_tracks: pl.DataFrame, run_tracks: pl.DataFrame) -> d
     The relative delay of a group is its mean extra travel time over its mean reference travel time (a ratio of
     means). Dropped are paired pedestrians that do not complete both runs, per group of the paired ones.
     """
+    from arena_evaluation.processing.ped_track_store import pair
+
     if len(ref_tracks) == 0 or len(run_tracks) == 0:
         return dict.fromkeys(PAIRED_DTYPES)
     pairing = pair(ref_tracks, run_tracks)
@@ -130,36 +135,51 @@ def paired_ped_measures(ref_tracks: pl.DataFrame, run_tracks: pl.DataFrame) -> d
     }
 
 
-def _run(row: dict[str, typing.Any]) -> tuple[int, str] | None:
-    """The (episode id, env) whose tracks a row scores, None for a row without an episode."""
-    episode = row.get("episode")
-    return None if episode is None else (int(episode), bundle_env(str(row.get("robot") or "")))
+#: The benchmark-level table of the paired measures, one row per run (planner, stage, episode, env), beside the dims
+PAIRED_FILE = "ped_paired.parquet"
+NO_ROBOTS = "unhindered_peds"
+_RUN_SCHEMA = {"planner": pl.String, "stage": pl.String, "episode": pl.Int64, "env": pl.String, "reference_episode": pl.Int64, "reference_env": pl.String}
 
 
-def add_paired_ped_measures(
-    rows: list[dict[str, typing.Any]],
-    ref_rows_by_stage: typing.Mapping[str | None, list[dict[str, typing.Any]]],
-    episode_dir: typing.Callable[[int], pathlib.Path],
+def paired_table(
+    benchmark_dir: pathlib.Path,
     *,
-    evaluated: str,
-    tracks: typing.Callable[[pathlib.Path, str], pl.DataFrame] = tracks_for_episode,
-) -> None:
-    """Give every run row its paired measures against the first `evaluated` reference row of its stage.
+    tracks: typing.Callable[[pathlib.Path, str], pl.DataFrame] | None = None,
+) -> pl.DataFrame:
+    """The paired measures (`paired_ped_measures`) of every usable run of a processed benchmark dir against the first
+    `unhindered_peds` reference run of its stage (`benchmark_runs.episode_runs`), one row per (planner, stage, episode,
+    env); a stage without such a reference gives no rows. Each run is scored on the tracks of its own env, the reference
+    on those of its env; each stage's reference is read once."""
+    from arena_evaluation.processing.benchmark_runs import episode_runs
+    from arena_evaluation.processing.ped_track_store import tracks_for_episode
 
-    Each row is scored on the tracks of its own env, the reference on those of the reference row's env; each stage's
-    reference and each (episode, env) are read once.
-    """
-    by_stage: dict[str | None, dict[tuple[int, str] | None, list[dict[str, typing.Any]]]] = {}
-    for row in rows:
-        if not row.get("is_reference"):
-            by_stage.setdefault(row.get("stage"), {}).setdefault(_run(row), []).append(row)
-    for stage, runs in by_stage.items():
-        ref_row = next((r for r in ref_rows_by_stage.get(stage, []) if r.get("status") == evaluated), None)
-        ref = None if ref_row is None else _run(ref_row)
-        if ref is None:
+    tracks = tracks or tracks_for_episode
+    runs = episode_runs(benchmark_dir)
+    references: dict[str, typing.Any] = {}
+    for run in runs:
+        if run.is_reference and (run.reference_type or run.planner) == NO_ROBOTS:
+            references.setdefault(run.stage, run)
+    rows = []
+    ref_tracks: dict[str, pl.DataFrame] = {}
+    for run in runs:
+        ref = references.get(run.stage)
+        if run.is_reference or ref is None:
             continue
-        ref_tracks = tracks(episode_dir(ref[0]), ref[1])
-        for run, run_rows in runs.items():
-            measures = paired_ped_measures(ref_tracks, empty_tracks() if run is None else tracks(episode_dir(run[0]), run[1]))
-            for row in run_rows:
-                row.update(measures)
+        if run.stage not in ref_tracks:
+            ref_tracks[run.stage] = tracks(ref.episode_dir, ref.env)
+        measures = paired_ped_measures(ref_tracks[run.stage], tracks(run.episode_dir, run.env))
+        rows.append({"planner": run.planner, "stage": run.stage, "episode": run.episode, "env": run.env, "reference_episode": ref.episode, "reference_env": ref.env, **measures})
+    return pl.DataFrame(rows, schema={**_RUN_SCHEMA, **PAIRED_DTYPES})
+
+
+def write_paired_table(benchmark_dir: pathlib.Path) -> pl.DataFrame:
+    """Write `paired_table` to `<benchmark dir>/ped_paired.parquet`, removing a stale one when no run has a reference."""
+    table = paired_table(benchmark_dir)
+    path = pathlib.Path(benchmark_dir) / PAIRED_FILE
+    if len(table) == 0:
+        path.unlink(missing_ok=True)
+        return table
+    temp = path.with_name(f".{path.name}.tmp")
+    table.write_parquet(temp)
+    temp.replace(path)
+    return table

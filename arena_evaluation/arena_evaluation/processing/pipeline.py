@@ -706,6 +706,15 @@ def _keep_tracks(ep: EpisodeDescriptor, episode_dir: pathlib.Path) -> None:
         _log.warning(f"episode_{ep.episode_id:03d}: pedestrian tracks not kept, they are built again on use: {e!r}")
 
 
+def _write_paired_pedestrians(benchmark_dir: pathlib.Path) -> None:
+    """The paired pedestrian measures of every run against its stage's run without robots (`paired_peds.PAIRED_FILE`)."""
+    from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_FILE, write_paired_table
+
+    table = write_paired_table(benchmark_dir)
+    if len(table):
+        print(f"Paired pedestrian measures of {len(table)} runs against their stage's run without robots -> {benchmark_dir / PAIRED_FILE}", flush=True)
+
+
 def _failed_evaluation(ep: EpisodeDescriptor, error: Exception) -> EpisodeEvaluation:
     """The evaluation row of an episode whose metrics could not be computed."""
     return _status_evaluation(ep, pathlib.Path(ep.episode_dir), None, "", "error", repr(error))
@@ -1272,5 +1281,6 @@ class ProcessingPipeline:
             flowed = write_flow_tables(benchmark_dir)
         if len(flowed.runs):
             print(f"Phase 3: flow change of {len(flowed.runs)} flowedit suite runs against their base worlds", flush=True)
+        _write_paired_pedestrians(benchmark_dir)
         print(f"Done. {len(episodes)} episodes -> {benchmark_dir}")
         return benchmark_dir
