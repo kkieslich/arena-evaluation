@@ -17,7 +17,7 @@ from mcap.reader import NonSeekingReader
 from mcap_ros2.decoder import DecoderFactory
 
 from arena_evaluation.processing import legacy_schemas
-from arena_evaluation.processing.telemetry import context, events, sensors, tracks
+from arena_evaluation.processing.telemetry import cdr, context, events, sensors, tracks
 from arena_evaluation.processing.telemetry.messages import (
     Envelope,
     RobotRef,
@@ -174,6 +174,8 @@ class MCAPReader:
                     continue
                 if message.channel_id not in decoders:
                     decoders[message.channel_id] = factory.decoder_for(channel.message_encoding, schema)
+                    if decoders[message.channel_id] is not None and schema.name == cdr.PATH_SCHEMA and channel.message_encoding == "cdr":
+                        decoders[message.channel_id] = cdr.path_decoder(decoders[message.channel_id])
                     if decoders[message.channel_id] is None and ingest.accepts(channel.topic, schema):
                         _log.warning(f"{channel.topic}: schema {schema.name!r} ({schema.encoding}) cannot be decoded; its messages are skipped")
                 decoder = decoders[message.channel_id]

@@ -74,6 +74,40 @@ class TableSink:
         if self._pending_rows >= self._flush_rows:
             self.flush()
 
+    def extend(self, table: str, columns: Mapping[str, Any]) -> None:
+        """Append many rows given as columns of equal length, as `append` would one by one (a column the table does not
+        name is refused, one it names and `columns` leaves out is None; a row whose key repeats replaces the earlier)."""
+        names = TABLE_SCHEMAS[table].names
+        unknown = set(columns) - set(names)
+        if unknown:
+            raise KeyError(f"{table}: no columns {sorted(unknown)}")
+        n = len(columns["t_ns"])
+        if n == 0:
+            return
+        values = {name: list(columns[name]) if name in columns else [None] * n for name in names}
+        key = _ROW_KEYS.get(table, ())
+        if key:
+            known = self._key_rows.setdefault(table, {})
+            keys = list(zip(*(values[name] for name in key), strict=True))
+            if any(k in known for k in keys) or len(set(keys)) != n:
+                for i in range(n):
+                    self.append(table, {name: values[name][i] for name in names})
+                return
+        stamps = values["t_ns"]
+        previous = self._last_stamp.get(table)
+        if (previous is not None and stamps[0] < previous) or any(b < a for a, b in zip(stamps, stamps[1:])):
+            self._unsorted.add(table)
+        self._last_stamp[table] = stamps[-1]
+        target = self._columns.setdefault(table, {name: [] for name in names})
+        start = len(target["t_ns"])
+        for name in names:
+            target[name].extend(values[name])
+        if key:
+            known.update(zip(keys, range(start, start + n)))
+        self._pending_rows += n
+        if self._pending_rows >= self._flush_rows:
+            self.flush()
+
     def flush(self) -> None:
         for table, columns in self._columns.items():
             if columns["t_ns"]:

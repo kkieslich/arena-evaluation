@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -16,6 +17,7 @@ from arena_evaluation.processing.telemetry.messages import (
     stamp_ns,
     yaw_from_orientation,
 )
+from arena_evaluation.processing.telemetry.cdr import PathPoses
 from arena_evaluation.processing.telemetry.writer import TableSink
 
 if TYPE_CHECKING:
@@ -210,6 +212,26 @@ class PlanRecorder:
             raise ValueError("PlanRecorder requires an envelope with a RobotRef")
         plan_id = self._plan_counts[envelope.ref]
         self._plan_counts[envelope.ref] += 1
+        if isinstance(envelope.body, PathPoses):
+            # the poses as the direct reader gives them (`telemetry.cdr.path_poses`): x, y, z, qx, qy, qz, qw, written
+            # as one batch of the rows the generic path writes one by one
+            poses = envelope.body.values
+            n = len(poses)
+            _x, _y, _z, qx, qy, qz, qw = (poses[:, k].tolist() for k in range(7))
+            self._sink.extend(
+                "robot_plans",
+                {
+                    "t_ns": [envelope.t_ns] * n,
+                    "env_id": [envelope.ref.env_id] * n,
+                    "robot_id": [envelope.ref.robot_id] * n,
+                    "plan_id": [plan_id] * n,
+                    "waypoint_idx": list(range(n)),
+                    "x": _x,
+                    "y": _y,
+                    "yaw": [math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)) for x, y, z, w in zip(qx, qy, qz, qw, strict=True)],
+                },
+            )
+            return
         for waypoint_idx, stamped in enumerate(envelope.body.poses):
             pose = stamped.pose
             self._sink.append(
