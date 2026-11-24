@@ -201,6 +201,7 @@ class TopicBundle:
     robot_params: pl.DataFrame | pl.LazyFrame | None = None
     pedestrian_arena_peds: pl.DataFrame | pl.LazyFrame | None = None
     pedestrian_agent_states: pl.DataFrame | pl.LazyFrame | None = None
+    pedestrian_agent_meta: pl.DataFrame | pl.LazyFrame | None = None
     pedestrian_gestures: pl.DataFrame | pl.LazyFrame | None = None
     pedestrian_animations: pl.DataFrame | pl.LazyFrame | None = None
     pedestrian_interactions: pl.DataFrame | pl.LazyFrame | None = None
@@ -208,6 +209,7 @@ class TopicBundle:
     pedestrian_interaction_events: pl.DataFrame | pl.LazyFrame | None = None
     episode_lifecycle: pl.DataFrame | pl.LazyFrame | None = None
     episode_integrity: pl.DataFrame | pl.LazyFrame | None = None
+    episode_fleet_log: pl.DataFrame | pl.LazyFrame | None = None
     environment_map: pl.DataFrame | pl.LazyFrame | None = None
     environment_map_cells: pl.DataFrame | pl.LazyFrame | None = None
 

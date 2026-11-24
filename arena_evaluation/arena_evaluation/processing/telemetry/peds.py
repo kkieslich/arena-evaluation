@@ -15,6 +15,7 @@ from arena_evaluation.processing.telemetry.messages import (
     Envelope,
     env_row,
     pedestrian_id,
+    stamp_ns,
     yaw_from_orientation,
 )
 from arena_evaluation.processing.telemetry.writer import TableSink
@@ -31,6 +32,7 @@ NO_INTERACTION_TYPE = 0
 ARENA_TABLE = "pedestrian_arena_peds"
 ENGINE_TABLE = "pedestrian_agent_states"
 GESTURE_TABLE = "pedestrian_gestures"
+META_TABLE = "pedestrian_agent_meta"
 PEDESTRIANS_SCHEMA = "arena_people_msgs/msg/Pedestrians"
 AGENT_FRAME_SCHEMA = "arena_humansim_msgs/msg/AgentFrame"
 AGENT_STATES_SCHEMA = "arena_humansim_msgs/msg/AgentStates"
@@ -142,8 +144,9 @@ class PedestrianRecorder:
             raise ValueError("PedestrianRecorder.record_frame requires an envelope with a RobotRef")
         env_id = envelope.ref.env_id
         self._frames[(env_id, table)].add(envelope.body.header.frame_id.strip("/"))
+        stamp = stamp_ns(envelope.body.header)
         for agent in _agents(envelope, self._meta.get(env_id, AgentMeta())):
-            columns = agent.table_columns()
+            columns = agent.table_columns() | {"stamp_ns": stamp}
             if table == ENGINE_TABLE:
                 columns |= agent.crowd_columns()
             self._sink.append(table, env_row(envelope, **columns))
@@ -152,6 +155,39 @@ class PedestrianRecorder:
 
     def frames(self) -> dict[tuple[str, str], frozenset[str]]:
         return {key: frozenset(frames) for key, frames in self._frames.items()}
+
+
+def record_meta_rows(sink: TableSink, envelope: Envelope[RosAgentMeta]) -> None:
+    """One `pedestrian_agent_meta` row per agent of an AgentMeta message: its id, name, agent type and releasing source,
+    each empty (0 for `source_seq`) where the recorded schema does not carry the field or its list does not hold one
+    entry per agent."""
+    meta = envelope.body
+    fields = legacy_schemas.agent_meta_fields(envelope.schema.data.decode("utf-8", "replace"))
+    agent_ids = [int(agent_id) for agent_id in meta.agent_id]
+    n = len(agent_ids)
+    names = _aligned(meta.name, n, "") if fields.name else [""] * n
+    types = _aligned(meta.agent_type, n, "") if fields.agent_type else [""] * n
+    source_names = _aligned(meta.source_name, n, "") if fields.sources else [""] * n
+    source_seqs = _aligned(meta.source_seq, n, 0) if fields.sources else [0] * n
+    stamp = stamp_ns(meta.header)
+    for agent_id, name, agent_type, source_name, source_seq in zip(agent_ids, names, types, source_names, source_seqs, strict=True):
+        sink.append(
+            META_TABLE,
+            env_row(
+                envelope,
+                stamp_ns=stamp,
+                agent_id=agent_id,
+                name=str(name),
+                agent_type=str(agent_type),
+                source_name=str(source_name),
+                source_seq=int(source_seq),
+            ),
+        )
+
+
+def _aligned[T](values: Sequence[T], n: int, default: T) -> list[T]:
+    """`values` when it holds one entry per agent, else `default` for each of the `n` agents."""
+    return list(values) if len(values) == n else [default] * n
 
 
 class _CrowdAgentMetaProto(Protocol):
@@ -245,7 +281,7 @@ def _pedestrians_columns(envelope: Envelope[Pedestrians]) -> dict[str, list[Any]
         "vx": [float(ped.twist.linear.x) for ped in peds],
         "vy": [float(ped.twist.linear.y) for ped in peds],
         "vz": [float(ped.twist.linear.z) for ped in peds],
-        "radius_m": nulls,
+        "radius_m": ([_nonzero(float(ped.radius)) for ped in peds] if fields.carries("radius") else nulls),
         "desired_speed": nulls,
         "policy": nulls,
         "agent_type": ([_text_or_none(ped.agent_type) for ped in peds] if fields.carries("agent_type") else nulls),

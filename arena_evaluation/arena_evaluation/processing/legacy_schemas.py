@@ -332,6 +332,24 @@ def agent_meta_has_agent_type(schema_text: str) -> bool:
     return "agent_type" in schema_text
 
 
+class AgentMetaFields(typing.NamedTuple):
+    """Which per-agent lists a recorded AgentMeta schema declares beside `agent_id`."""
+
+    name: bool
+    agent_type: bool
+    sources: bool
+
+
+def agent_meta_fields(schema_text: str) -> AgentMetaFields:
+    """The per-agent lists the recorded AgentMeta schema declares: names, agent types, and releasing sources
+    (`source_name` with `source_seq`)."""
+    return AgentMetaFields(
+        name=re.search(r"^\s*string\[\]\s+name\b", schema_text, re.M) is not None,
+        agent_type=re.search(r"^\s*string\[\]\s+agent_type\b", schema_text, re.M) is not None,
+        sources=re.search(r"^\s*string\[\]\s+source_name\b", schema_text, re.M) is not None and re.search(r"^\s*int32\[\]\s+source_seq\b", schema_text, re.M) is not None,
+    )
+
+
 def _validated_fields(
     name: str,
     fields: Mapping[str, str],

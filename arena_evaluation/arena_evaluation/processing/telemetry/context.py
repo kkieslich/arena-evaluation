@@ -166,6 +166,38 @@ def record_semantics(sink: TableSink, envelope: Envelope[SemanticSnapshot]) -> N
         )
 
 
+FLEET_KIND = "fleet"
+
+
+class FleetLogRecorder:
+    """The fleet mode's task log (`episode_fleet_log`): the discrete fields of every `fleet` entity, by message index."""
+
+    def __init__(self, sink: TableSink) -> None:
+        self._sink = sink
+        self._messages = 0
+
+    def record(self, envelope: Envelope[SemanticSnapshot]) -> None:
+        snapshot = envelope.body
+        index = self._messages
+        self._messages += 1
+        env_id = f"env_{int(snapshot.env_id)}"
+        for entity in snapshot.entities:
+            if str(entity.kind) != FLEET_KIND:
+                continue
+            for name, value in zip(entity.discrete_names, entity.discrete_values, strict=True):
+                self._sink.append(
+                    "episode_fleet_log",
+                    {
+                        "t_ns": envelope.t_ns,
+                        "env_id": env_id,
+                        "msg_index": index,
+                        "entity_name": str(entity.entity),
+                        "field_name": str(name),
+                        "value_str": str(value),
+                    },
+                )
+
+
 class PlanRecorder:
     """Writes each global plan as numbered waypoint rows, one plan per message and robot."""
 

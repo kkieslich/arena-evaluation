@@ -34,6 +34,7 @@ from arena_evaluation.processing.telemetry.peds import (
     agent_meta,
     agent_meta_gains_only,
     agent_meta_without_robot_fields,
+    record_meta_rows,
 )
 from arena_evaluation.processing.telemetry.tracks import (
     _BASE_FRAME_MARKERS,
@@ -87,6 +88,11 @@ _POSITION_COLUMNS: dict[str, tuple[str, str]] = {
     "pedestrian_gestures": ("at_x", "at_y"),
     "environment_map": ("origin_x", "origin_y"),
 }
+
+
+def bundle_env(key: str) -> str:
+    """The environment of a bundle key (`env_<n>_<robot>`), env_0 for a key that names none."""
+    return env_id_in(key) or "env_0"
 
 
 def anchor_at(anchors: list[Anchor], t_ns: int) -> tuple[float, float]:
@@ -234,6 +240,7 @@ def _agent_meta(ingest: _Ingest, _topic: str, envelope: Envelope) -> None:
             has_agent_type=legacy_schemas.agent_meta_has_agent_type(schema_text),
         )
     ingest._pedestrians.record_meta(envelope, meta)
+    record_meta_rows(ingest._sink, envelope)
 
 
 def _episode(ingest: _Ingest, _topic: str, envelope: Envelope) -> None:
@@ -242,6 +249,11 @@ def _episode(ingest: _Ingest, _topic: str, envelope: Envelope) -> None:
         envelope,
         legacy_schemas.episode_fields(envelope.body, envelope.schema),
     )
+
+
+def _semantics(ingest: _Ingest, _topic: str, envelope: Envelope) -> None:
+    context.record_semantics(ingest._sink, envelope)
+    ingest._fleet_log.record(envelope)
 
 
 def _fleet_snapshot(ingest: _Ingest, topic: str, envelope: Envelope[RobotFleet]) -> None:
@@ -316,7 +328,7 @@ _ROUTES: tuple[tuple[Predicate, Handler], ...] = (
     (_topic("/characterization_schedule"), _recorder("_schedules")),
     (_topic("/hearing/search_state"), _sink(context.record_hearing_search_state)),
     (_topic("/state/episode"), _episode),
-    (_topic("/state/semantics"), _sink(context.record_semantics)),
+    (_topic("/state/semantics"), _semantics),
     (_topic("/state/robots"), _fleet_snapshot),
     (_topic("/collision_events"), _sink(events.record_collision_events)),
     (_topic("/collision_monitor_state"), _sink(events.record_collision_monitor)),
@@ -344,6 +356,7 @@ class _Ingest:
         self._scans = sensors.ScanRecorder(sink)
         self._plans = context.PlanRecorder(sink)
         self._fleet = context.FleetRecorder(sink)
+        self._fleet_log = context.FleetLogRecorder(sink)
         self._schedules = context.ScheduleRecorder()
 
     def accepts(self, topic: str, schema: Schema) -> bool:

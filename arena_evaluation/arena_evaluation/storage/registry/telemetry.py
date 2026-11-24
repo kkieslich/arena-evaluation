@@ -80,6 +80,9 @@ class _PedestrianStateColumns(Table, abstract=True):
 
     ped_id = _TEXT
     ped_name = _TEXT
+    # the frame's header stamp: the crowd engine's tick time, which the recorder's log time (t_ns) follows with a
+    # varying delay, up to ~0.4 s at an episode's start
+    stamp_ns = _INT
     x = _FLOAT
     y = _FLOAT
     z = _FLOAT
@@ -466,6 +469,26 @@ class PedestrianAgentStates(
     robot_blind = _FLAG
 
 
+class PedestrianAgentMeta(
+    _EnvironmentTelemetry,
+    name="pedestrian_agent_meta",
+    kind=TableKind.TELEMETRY,
+    scope=MetricScope.PEDESTRIAN,
+):
+    """The name, agent type and releasing source of each crowd-engine agent, one row per agent per agent_meta message.
+
+    `source_name` and `source_seq` (the source that released the agent and its release index) pair a released
+    pedestrian across runs of one seed; both are empty and 0 where the recorded schema carries no sources."""
+
+    row_key: ClassVar[tuple[str, ...]] = ("env_id", "t_ns", "agent_id")
+    stamp_ns = _INT
+    agent_id = _INT
+    name = _TEXT
+    agent_type = _TEXT
+    source_name = _TEXT
+    source_seq = _INT
+
+
 class PedestrianGestures(
     _EnvironmentTelemetry,
     name="pedestrian_gestures",
@@ -642,6 +665,25 @@ class WorldSemantics(_GlobalTelemetry, name="world_semantics", kind=TableKind.TE
     value_str = _TEXT
     value_num = _FLOAT
     value_bool = _FLAG
+
+
+class EpisodeFleetLog(
+    _EnvironmentTelemetry,
+    name="episode_fleet_log",
+    kind=TableKind.TELEMETRY,
+    scope=MetricScope.EPISODE,
+):
+    """The discrete fields of the fleet mode's task log (the `fleet` semantic entities), one row per field per message.
+
+    `msg_index` counts the semantic snapshot messages in recording order and is part of the row key: a recording starts
+    with the state its lane's previous episode left latched, and that copy can carry the stamp of the reset message that
+    follows it, so the two messages must stay apart (world_semantics keeps one row per stamp and field)."""
+
+    row_key: ClassVar[tuple[str, ...]] = ("env_id", "msg_index", "entity_name", "field_name")
+    msg_index = _INT
+    entity_name = _TEXT
+    field_name = _TEXT
+    value_str = _TEXT
 
 
 class EnvironmentMap(
