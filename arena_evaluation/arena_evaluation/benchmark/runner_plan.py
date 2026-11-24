@@ -266,6 +266,32 @@ def build_launch_args(step: Step, simulator: str | None, passthrough: dict[str, 
     return args
 
 
+RECORDER_CONFIG_FILE = "recorder_config.yaml"
+
+
+def write_recorder_config(suite: Suite, run_path: pathlib.Path, base: pathlib.Path | None = None) -> pathlib.Path | None:
+    """The recorder config of a suite with a `record` block: the packaged data_recorder_config.yaml (or `base`) with the
+    block over it, written to `<run dir>/recorder_config.yaml` (the same for every lane), None for a suite without one."""
+    if not suite.record:
+        return None
+    from ..ingestion.topics import merged_config
+
+    if base is None:
+        base = pathlib.Path(get_package_share_directory("arena_evaluation")) / "config" / "data_recorder_config.yaml"
+    try:
+        packaged = yaml.safe_load(pathlib.Path(base).read_text()) or {}
+    except OSError:
+        packaged = {"tf_frames": []}
+    out = pathlib.Path(run_path) / RECORDER_CONFIG_FILE
+    text = "# the packaged recorder config with the suite's record block over it\n" + yaml.safe_dump(dict(merged_config(packaged, suite.record)), sort_keys=False)
+    if not out.is_file() or out.read_text() != text:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        partial = out.with_name(f".{out.name}.{os.getpid()}.partial")
+        partial.write_text(text)
+        partial.replace(out)
+    return out
+
+
 def _all_steps_grid(
     suite: Suite,
     contest: Contest,

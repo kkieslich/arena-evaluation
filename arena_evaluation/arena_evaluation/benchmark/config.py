@@ -45,7 +45,58 @@ _LEGACY_MODE_PREFIX = "tm_"
 # Keys a stage carries that are not fields of Suite.Stage: they are parsed separately.
 _STAGE_EXTRA_KEYS = ("timeout", "timeout_peds", "optim")
 
-_SUITE_KEYS = frozenset({"name", "stages", "launch", "references", "metrics", "task_layer"})
+_SUITE_KEYS = frozenset({"name", "stages", "launch", "references", "metrics", "task_layer", "record"})
+
+#: The keys of a suite's `record` block, what the recorder keeps of a run (see `parse_record`)
+RECORD_KEYS = frozenset({"exclude", "tf_frames", "rates_hz"})
+
+
+def parse_record(obj: object) -> dict[str, typing.Any]:
+    """A suite's `record` block, overrides of the recorder's config (`config/data_recorder_config.yaml`) for its runs:
+
+    - `exclude`: recorder topic keys (`ingestion.topics.get_topics`) not recorded at all, e.g. `peds` (`arena_peds`,
+      which processing rebuilds from the engine's `agent_states`) or `animation_states`;
+    - `tf_frames`: `[regex, ms]` pairs matched against a transform's child frame before the config's own, a negative
+      interval drops the frame, e.g. `["_agent_\\d+$", -1]` for the pedestrians' skeleton and body frames;
+    - `rates_hz`: throttle rates in Hz by exact topic name, over the config's `record_rates_hz` (0 = unthrottled).
+    """
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        raise ValueError(f"suite record: a mapping of {sorted(RECORD_KEYS)}, got {obj!r}")
+    if "frequencies" in obj:
+        raise ValueError("suite record: frequencies (ms by topic substring) is no longer read, the recorder throttles by rate: use rates_hz (exact topic name -> Hz, 0 = unthrottled)")
+    unknown = sorted(set(obj) - RECORD_KEYS)
+    if unknown:
+        raise ValueError(f"suite record: unknown keys {unknown}, known: {sorted(RECORD_KEYS)}")
+    out: dict[str, typing.Any] = {}
+    if "exclude" in obj:
+        exclude = obj["exclude"]
+        if not isinstance(exclude, list) or not all(isinstance(k, str) for k in exclude):
+            raise ValueError(f"suite record: exclude must be a list of topic keys, got {exclude!r}")
+        out["exclude"] = list(dict.fromkeys(exclude))
+    if "tf_frames" in obj:
+        frames = []
+        for entry in obj["tf_frames"] or []:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2 or not isinstance(entry[0], str):
+                raise ValueError(f"suite record: tf_frames entries are [regex, ms], got {entry!r}")
+            try:
+                re.compile(entry[0])
+            except re.error as exc:
+                raise ValueError(f"suite record: tf_frames regex {entry[0]!r}: {exc}") from None
+            frames.append([entry[0], float(entry[1])])
+        out["tf_frames"] = frames
+    if "rates_hz" in obj:
+        rates = obj["rates_hz"]
+        if not isinstance(rates, dict):
+            raise ValueError(f"suite record: rates_hz must map topic names to Hz, got {rates!r}")
+        out["rates_hz"] = {}
+        for topic, rate in rates.items():
+            value = float(rate)
+            if value < 0:
+                raise ValueError(f"suite record: rates_hz[{topic!r}] is {value}: a throttle rate is >= 0 Hz, 0 meaning unthrottled")
+            out["rates_hz"][str(topic)] = value
+    return out
 
 _log = logging.getLogger(__name__)
 
@@ -117,6 +168,7 @@ class Suite(typing.NamedTuple):
             launch_args=cls._parse_launch(obj.get("launch") or {}),
             references=bool(obj.get("references", False)),
             metrics=cls._parse_metrics(obj.get("metrics") or {}),
+            record=parse_record(obj.get("record")),
             task_layer=task_layer_key,
         )
 
@@ -188,6 +240,8 @@ class Suite(typing.NamedTuple):
     references: bool = False
     metrics: dict[str, typing.Any] = {}
     task_layer: str = ""
+    #: overrides of the recorder's config for this suite's runs (`parse_record`), {} for none
+    record: dict[str, typing.Any] = {}
 
     def config(self, index: Suite.Index) -> Suite.Stage:
         return self.stages[index]

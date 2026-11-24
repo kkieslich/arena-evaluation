@@ -1118,3 +1118,65 @@ def test_constructor_auto_mode_generates_run_id_from_map_robot_planner(fake_shar
         sys.argv = old_argv
         if node is not None:
             node.destroy_node()
+
+
+# A suite's record block: excluded topics and dropped tf frames
+
+
+def test_a_negative_tf_interval_drops_the_frame(tmp_path):
+    node = _bare_node(current_time=1_000_000_000)
+    node.tf_frames = [(re.compile(r"_agent_\d+$"), -1.0), *node.tf_frames]
+    read = _tf_bag(node, tmp_path)
+    for step in range(0, 100_000_001, 20_000_000):
+        node._tf_callback(_tf_message(("map", "body_env_0_agent_2", 0.0, step), ("body_env_0_agent_2", "l_p_collar_env_0_agent_2", 0.0, step), ("env_0/jackal_0/odom", "env_0/jackal_0/base_link", 1.0, step)))
+    writes = _tf_writes(read())
+    assert writes and all(set(frames) == {"env_0/jackal_0/base_link"} for _, frames in writes)
+
+
+def test_excluded_topics_are_never_subscribed_by_key_name_or_discovery():
+    from arena_evaluation.ingestion.topics import TopicDefinition, excluded_topics
+
+    node = _bare_node()
+    node.config = {"exclude": ["peds", "animation_states"]}
+    node.excluded = frozenset(excluded_topics(node.config))
+    assert {"peds", "arena_peds", "animation_states"} <= node.excluded
+    assert not node._records("peds", TopicDefinition("/arena/env_0/arena_peds", object))
+    assert not node._records("whatever", TopicDefinition("/arena/env_0/animation_states", object))
+    assert node._records("agent_states", TopicDefinition("/arena/env_0/arena_env_node/agent_states", object))
+    node._subscribe_discovered("/arena/env_0/arena_peds", object, rate_hz=20.0)
+    node._discover_state_topic("/arena/env_0/animation_states", ["x"])
+    assert node.subs == [] and node._topic_registry == {}
+
+
+def test_excluding_the_humans_tf_keeps_the_tf_topic():
+    from arena_evaluation.ingestion.topics import TopicDefinition, excluded_topics
+
+    # `<env>/humans/tf` ends in `tf` like `/tf`: excluding the skeleton frames must keep the robot's transforms
+    node = _bare_node()
+    node.config = {"exclude": ["tf_humans"]}
+    node.excluded = frozenset(excluded_topics(node.config))
+    assert node.excluded == {"tf_humans"}
+    assert not node._records("tf_humans", TopicDefinition("/arena/env_0/humans/tf", object))
+    assert node._records("tf", TopicDefinition("/tf", object)) and not node._excluded_name("/tf")
+    # a name part no other topic has is still excluded with its key
+    assert "arena_peds" in excluded_topics({"exclude": ["peds", "tf_humans"]}) and "tf" not in excluded_topics({"exclude": ["peds", "tf_humans"]})
+
+
+def test_read_config_takes_the_record_config_parameter(tmp_path):
+    path = tmp_path / "recorder_config.yaml"
+    path.write_text("record_rates_hz:\n  /tf: 50.0\ntf_frames:\n  - ['_agent_\\d+$', -1.0]\nexclude: [peds]\n")
+    node = _bare_node(base_dir=str(tmp_path / "missing"), record_config=str(path))
+    assert node.read_config() == {"record_rates_hz": {"/tf": 50.0}, "tf_frames": [["_agent_\\d+$", -1.0]], "exclude": ["peds"]}
+    # without the parameter the packaged config is read, a missing one keeping the defaults
+    assert _bare_node(base_dir=str(tmp_path / "missing"), record_config="").read_config() == {"record_rates_hz": {}, "tf_frames": []}
+
+
+def test_merged_config_puts_the_suite_block_over_the_packaged_config():
+    from arena_evaluation.ingestion.topics import merged_config
+
+    base = {"record_rates_hz": {"/tf": 20.0, "/env_0/arena_peds": 20.0}, "tf_frames": [["^body_env_\\d+_agent_\\d+$", 0.0]], "exclude": ["lidar"]}
+    out = merged_config(base, {"exclude": ["peds", "lidar"], "tf_frames": [["_agent_\\d+$", -1.0]], "rates_hz": {"/env_0/agent_states": 100.0}})
+    assert out["exclude"] == ["lidar", "peds"]
+    assert out["tf_frames"] == [["_agent_\\d+$", -1.0], ["^body_env_\\d+_agent_\\d+$", 0.0]]
+    assert out["record_rates_hz"] == {"/tf": 20.0, "/env_0/arena_peds": 20.0, "/env_0/agent_states": 100.0}
+    assert merged_config(base, {}) == base

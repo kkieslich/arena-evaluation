@@ -177,6 +177,22 @@ Suite-level `references: true` enables automatically generated reference steps
 suites whose report manifest consumes reference-episode data (e.g. pedestrian disturbance).
 Characterization suites leave it off because the sweep itself is the reference.
 
+A suite-level `record` block changes what the recorder keeps of its runs, over
+`config/data_recorder_config.yaml`; the runner writes the merged config to `<run dir>/recorder_config.yaml` and
+starts every recorder with it (`record_config:=`):
+
+```yaml
+record:
+  exclude: [peds, animation_states]      # topic keys not recorded (arena_peds is rebuilt from the engine's agent_states)
+  tf_frames: [["_agent_\\d+$", -1]]      # [regex on the child frame, min interval ms] before the config's; < 0 drops it
+  rates_hz: {/env_0/agent_states: 50.0}  # throttle rates in Hz by exact topic name, over record_rates_hz (0 = unthrottled)
+```
+
+Leave it out to record everything as before. A crowd of hundreds puts every pedestrian's skeleton on `/tf` and in
+`arena_peds`, which a study that scores only tracks, robots and semantics never reads. Excluding `tf_humans`
+(`<env>/humans/tf`) keeps `/tf`. The former `frequencies` key (ms by topic substring) is refused, like the recorder
+refuses `record_frequencies`.
+
 ### Characterization suite
 
 ```yaml

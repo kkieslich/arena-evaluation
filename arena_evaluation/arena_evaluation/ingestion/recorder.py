@@ -34,7 +34,7 @@ from arena_evaluation.storage.manifest import MetadataWriter
 
 from .episode_writer import EpisodeWriter
 from .metadata import IngestionMetadata
-from .topics import DEFAULT_THROTTLE_RATE_HZ
+from .topics import DEFAULT_THROTTLE_RATE_HZ, excluded_topics
 
 if TYPE_CHECKING:
     from arena_evaluation_msgs.srv import RecordEpisode
@@ -213,6 +213,7 @@ class _RecorderConfig(TypedDict, total=False):
     record_rates_hz: dict[str, float]
     tf_frames: list[tuple[str, float]]
     optional_topics: list[str]
+    exclude: list[str]
 
 
 _RECORDER_PARAMS = (
@@ -264,10 +265,18 @@ _RECORDER_PARAMS = (
         "",
         description="Run id chosen for an automatic run directory (empty = generated at start).",
     ),
+    Param[str](
+        "record_config",
+        "",
+        description="The run's recorder config file, written by the benchmark runner from the suite's `record` block (empty = the packaged data_recorder_config.yaml).",
+    ),
 )
 
 
 class DataRecorderNode(ROSParamServer, EpisodeWriter):
+    #: topic keys and topic names the run's record config leaves out (`topics.excluded_topics`)
+    excluded: frozenset[str] = frozenset()
+
     def __init__(self, **node_kwargs: Unpack[_NodeKwargs]):
         super().__init__(
             "arena_evaluation_data_recorder",
@@ -309,6 +318,7 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
         self.workspace_dir = str(handles["workspace_dir"].value or "")
         self.world_lighting = str(handles["world.lighting"].value)
         self.kg_derive = str(handles["kg.derive"].value)
+        self.record_config = str(handles["record_config"].value or "")
         self._snapshot_worlds: set[str] = set()
 
         env_namespace = self.get_namespace().strip("/")
@@ -330,6 +340,9 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
         self.config = self.read_config()
         self.record_rates_hz = self.config.get("record_rates_hz", {})
         self.tf_frames = [(re.compile(pattern), float(ms)) for pattern, ms in self.config.get("tf_frames", [])]
+        self.excluded = frozenset(excluded_topics(self.config))
+        if self.excluded:
+            self._log_info(f"Not recording topics {sorted(self.excluded)} (the run's record config)")
 
         self._log_info(f"Recorder ready. Episodes root: {self.episodes_root}")
         self._log_info(f"planner={self.planner!r} stage={self.stage!r} map={self.map_name!r} benchmark_id={self.benchmark_id!r}")
@@ -655,6 +668,8 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
                             break
 
     def _discover_state_topic(self, topic_name: str, types: list[str]) -> None:
+        if self._excluded_name(topic_name):
+            return
         for type_name in types:
             entry = self._state_types.get(type_name)
             if entry is None:
@@ -684,6 +699,8 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
 
     def _subscribe_discovered(self, topic_name: str, msg_type: type, *, rate_hz: float) -> None:
         """Subscribe a discovered topic, throttled at rate_hz."""
+        if self._excluded_name(topic_name):
+            return
         self._register_topic(topic_name, msg_type)
         sub = self.create_subscription(
             msg_type,
@@ -825,8 +842,16 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
         self._write_to_bag_at(topic, msg, self.current_time)
 
     def _records(self, key: str, t_def: TopicDefinition) -> bool:
-        """Default topics always, the others only when listed under optional_topics in data_recorder_config.yaml."""
+        """Default topics always, the others only when listed under optional_topics in data_recorder_config.yaml, none
+        that the config excludes."""
+        if key in self.excluded or self._excluded_name(t_def.name_template):
+            return False
         return t_def.recorded or key in self.config.get("optional_topics", [])
+
+    def _excluded_name(self, topic_name: str) -> bool:
+        """Whether a topic's last name part is an excluded topic key or an excluded topic's name (`arena_peds` for
+        `peds`), so a topic found by discovery or a backend's recorded-topics row is left out the same way."""
+        return bool(self.excluded) and topic_name.rstrip("/").rsplit("/", 1)[-1] in self.excluded
 
     def robots_fleet_callback(self, msg: RobotFleet):
         env_namespace = self.get_namespace().strip("/")
@@ -962,19 +987,23 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
             self._write_to_bag_at("/tf", TFMessage(transforms=by_stamp[stamp_ns]), stamp_ns)
 
     def _accept_transform(self, transform: TransformStamped, stamp_ns: int) -> bool:
-        """Whether the transform passes its family interval, its stamp recorded when it does. Call under _tf_lock."""
+        """Whether the transform passes its family interval, its stamp recorded when it does; a family with a negative
+        interval is never recorded. Call under _tf_lock."""
         key = (transform.header.frame_id, transform.child_frame_id)
+        interval_ns = self._tf_interval_ns(transform.child_frame_id)
+        if interval_ns < 0:
+            return False
         last_ns = self._tf_last_written.get(key)
-        if last_ns is not None and stamp_ns - last_ns < self._tf_interval_ns(transform.child_frame_id):
+        if last_ns is not None and stamp_ns - last_ns < interval_ns:
             return False
         self._tf_last_written[key] = stamp_ns
         return True
 
     def _tf_interval_ns(self, child_frame_id: str) -> int:
-        """The tf_frames cap of a child frame, the /tf rate when no family pattern matches."""
+        """The tf_frames cap of a child frame, the /tf rate when no family pattern matches; negative for a dropped family."""
         for pattern, ms in self.tf_frames:
             if pattern.search(child_frame_id):
-                return math.ceil(float(ms) * _NS_PER_MILLISECOND)
+                return -1 if float(ms) < 0 else math.ceil(float(ms) * _NS_PER_MILLISECOND)
         return min_interval_ns(resolve_rate_hz(self.record_rates_hz, "/tf", DEFAULT_THROTTLE_RATE_HZ))
 
     def _log_info(self, msg: str):
@@ -1137,8 +1166,10 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
         return mapping.get(val.type, lambda v: str(v))(val)
 
     def read_config(self) -> _RecorderConfig:
-        """The recorder config; a missing file keeps the defaults, a file still carrying record_frequencies is refused."""
-        config_path = os.path.join(self.base_dir, "config", "data_recorder_config.yaml")
+        """The recorder config: the `record_config` parameter's file (the benchmark runner writes one per run from a suite's
+        `record` block), else the packaged data_recorder_config.yaml; a missing file keeps the defaults, a file still
+        carrying record_frequencies is refused."""
+        config_path = getattr(self, "record_config", "") or os.path.join(self.base_dir, "config", "data_recorder_config.yaml")
         try:
             with open(config_path) as f:
                 config = yaml.safe_load(f) or {}
@@ -1149,6 +1180,7 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
         return {
             "record_rates_hz": _checked_rates(config.get("record_rates_hz") or {}),
             "tf_frames": list(config.get("tf_frames") or []),
+            "exclude": list(config.get("exclude") or []),
         }
 
     def finalize(self):

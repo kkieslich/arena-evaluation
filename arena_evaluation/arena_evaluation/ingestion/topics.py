@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import typing
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -153,3 +154,31 @@ def recorded_topic_definition(row: RecordedTopic, tg_namespace: str, robot_names
         reliable=row.reliable,
         depth=row.depth,
     )
+
+
+def merged_config(base: typing.Mapping[str, typing.Any], overrides: typing.Mapping[str, typing.Any]) -> dict[str, typing.Any]:
+    """The recorder config `base` with a suite's `record` block over it (`benchmark.config.parse_record`): `exclude`
+    joins the excluded topic keys, `tf_frames` come before the config's own (first match wins), `rates_hz` overlay
+    `record_rates_hz`."""
+    out: dict[str, typing.Any] = dict(base)
+    if overrides.get("exclude"):
+        out["exclude"] = list(dict.fromkeys([*(base.get("exclude") or []), *overrides["exclude"]]))
+    if overrides.get("tf_frames"):
+        out["tf_frames"] = [*[list(f) for f in overrides["tf_frames"]], *(base.get("tf_frames") or [])]
+    if overrides.get("rates_hz"):
+        out["record_rates_hz"] = {**(base.get("record_rates_hz") or {}), **overrides["rates_hz"]}
+    return out
+
+
+def excluded_topics(config: typing.Mapping[str, typing.Any]) -> set[str]:
+    """The topic keys a config excludes, with the last name part of each one's topic (`arena_peds` for `peds`) when no
+    other topic's name ends in it: `tf_humans` (`<env>/humans/tf`) excludes itself, not `/tf` with it."""
+    keys = set(config.get("exclude") or [])
+    if not keys:
+        return set()
+    try:
+        names = {key: t.name_template.rstrip("/").rsplit("/", 1)[-1] for key, t in get_topics("", "").items()}
+    except ImportError:
+        names = {}
+    kept = {name for key, name in names.items() if key not in keys}
+    return keys | {names[key] for key in keys if key in names and names[key] not in kept}

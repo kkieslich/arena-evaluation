@@ -73,6 +73,7 @@ from .runner_plan import (
     robot_has_depth_camera,
     stage_request,
     step_status,
+    write_recorder_config,
 )
 from .step import Step, StepErrorKind, StepResult
 
@@ -1162,6 +1163,9 @@ class _RunnerExecMixin(_RunnerExecHost):
         ]
         if step.reference_type:
             arguments += ["-p", f"reference_type:={_yaml_str(step.reference_type)}"]
+        record_config = write_recorder_config(self._suite, self._run_dir.path)
+        if record_config is not None:
+            arguments += ["-p", f"record_config:={record_config}"]
         arguments += [
             "-p",
             f"episode_id_offset:={offset}",

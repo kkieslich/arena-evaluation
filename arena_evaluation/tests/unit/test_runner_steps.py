@@ -235,3 +235,44 @@ def _manifest(config_hash: str) -> Manifest:
         contest=[],
         steps=[],
     )
+
+
+def _stage_doc(name: str) -> dict:
+    return {"name": name, "episodes": 1, "robot": "jackal", "map": "map1", "modes": {"robots": RANDOM_ROBOTS, "obstacles": RANDOM_OBSTACLES}, "seed": 7, "timeout": 60.0}
+
+
+def test_a_suites_record_block_parses_and_refuses_what_the_recorder_cannot_take():
+    from arena_evaluation.benchmark.config import parse_record
+
+    suite = Suite.parse("suite", {"record": {"exclude": ["peds", "peds", "animation_states"], "tf_frames": [["_agent_\\d+$", -1]], "rates_hz": {"/env_0/agent_states": 100}}, "stages": [_stage_doc("s1")]})
+    assert suite.record == {"exclude": ["peds", "animation_states"], "tf_frames": [["_agent_\\d+$", -1.0]], "rates_hz": {"/env_0/agent_states": 100.0}}
+    assert Suite.parse("suite", {"stages": [_stage_doc("s1")]}).record == {}
+    for bad, match in (
+        ({"drop": []}, "unknown keys"),
+        ({"exclude": "peds"}, "list of topic keys"),
+        ({"tf_frames": [["(", 1]]}, "regex"),
+        ({"tf_frames": [["a"]]}, r"\[regex, ms\]"),
+        ({"rates_hz": [1]}, "map topic names"),
+        ({"rates_hz": {"/tf": -1}}, ">= 0 Hz"),
+        ({"frequencies": {"agent_states": 100}}, "use rates_hz"),
+        ([1], "a mapping"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            parse_record(bad)
+
+
+def test_the_runner_writes_the_recorder_config_of_a_suite_with_a_record_block(tmp_path: pathlib.Path):
+    import yaml
+
+    from arena_evaluation.benchmark.runner_plan import RECORDER_CONFIG_FILE, write_recorder_config
+
+    base = tmp_path / "packaged.yaml"
+    base.write_text("record_rates_hz:\n  /tf: 20.0\ntf_frames:\n  - ['^body_env_\\d+_agent_\\d+$', 0.0]\n")
+    assert write_recorder_config(_suite(_stage("s1")), tmp_path, base) is None
+    suite = _suite(_stage("s1"))._replace(record={"exclude": ["peds"], "tf_frames": [["_agent_\\d+$", -1.0]]})
+    out = write_recorder_config(suite, tmp_path / "run", base)
+    assert out == tmp_path / "run" / RECORDER_CONFIG_FILE
+    doc = yaml.safe_load(out.read_text())
+    assert doc["exclude"] == ["peds"] and doc["tf_frames"][0] == ["_agent_\\d+$", -1.0] and doc["record_rates_hz"] == {"/tf": 20.0}
+    stamp = out.stat().st_mtime_ns
+    assert write_recorder_config(suite, tmp_path / "run", base) == out and out.stat().st_mtime_ns == stamp
