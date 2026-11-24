@@ -176,6 +176,9 @@ Suite-level `references: true` enables automatically generated reference steps
 (`unobstructed_robot` / `unhindered_peds`) per stage. The default is `false`. Enable it for
 suites whose report manifest consumes reference-episode data (e.g. pedestrian disturbance).
 Characterization suites leave it off because the sweep itself is the reference.
+A list adds only the reference steps it names: `references: [unhindered_peds]` adds each stage's
+run with the robots parked and no `<contestant>_unobstructed_robot` runs, for a study that pairs
+pedestrians with the robot-free run but has no use for the robot alone.
 
 A suite-level `record` block changes what the recorder keeps of its runs, over
 `config/data_recorder_config.yaml`; the runner writes the merged config to `<run dir>/recorder_config.yaml` and

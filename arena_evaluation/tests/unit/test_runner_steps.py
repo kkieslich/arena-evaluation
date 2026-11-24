@@ -276,3 +276,39 @@ def test_the_runner_writes_the_recorder_config_of_a_suite_with_a_record_block(tm
     assert doc["exclude"] == ["peds"] and doc["tf_frames"][0] == ["_agent_\\d+$", -1.0] and doc["record_rates_hz"] == {"/tf": 20.0}
     stamp = out.stat().st_mtime_ns
     assert write_recorder_config(suite, tmp_path / "run", base) == out and out.stat().st_mtime_ns == stamp
+
+
+def test_reference_grid_adds_only_the_listed_reference_runs(tmp_path: pathlib.Path):
+    from arena_evaluation.benchmark.runner_plan import _all_steps_grid
+
+    both = _all_steps_grid(_suite(_stage("s1"), references=True), _contest("a"), 1.0, tmp_path)
+    peds = _all_steps_grid(Suite.parse("suite", {"references": ["unhindered_peds"], "stages": [_stage_doc("s1"), _stage_doc("s2")]}), _contest("a", "b"), 1.0, tmp_path)
+    robot = _all_steps_grid(Suite.parse("suite", {"references": ["unobstructed_robot"], "stages": [_stage_doc("s1")]}), _contest("a"), 1.0, tmp_path)
+
+    assert [s.key for s in both] == ["a/s1", "a_unobstructed_robot/s1", "unhindered_peds/s1"]
+    assert [s.key for s in peds] == ["a/s1", "a/s2", "b/s1", "b/s2", "unhindered_peds/s1", "unhindered_peds/s2"]
+    assert [(s.is_reference, s.reference_type) for s in peds[-2:]] == [(True, "unhindered_peds")] * 2
+    assert [s.key for s in robot] == ["a/s1", "a_unobstructed_robot/s1"]
+
+
+@pytest.mark.parametrize(
+    ("value", "references", "types"),
+    [
+        (None, False, ()),
+        (False, False, ()),
+        (True, True, ("unobstructed_robot", "unhindered_peds")),
+        ([], False, ()),
+        ("unhindered_peds", True, ("unhindered_peds",)),
+        (["unhindered_peds", "unobstructed_robot"], True, ("unobstructed_robot", "unhindered_peds")),
+    ],
+)
+def test_suite_references_take_a_bool_or_the_reference_types(value: object, references: bool, types: tuple[str, ...]):
+    suite = Suite.parse("suite", {"references": value, "stages": [_stage_doc("s1")]})
+
+    assert (suite.references, suite.reference_types if suite.references else ()) == (references, types)
+
+
+@pytest.mark.parametrize("value", [["unhindered"], [1], {"unhindered_peds": True}])
+def test_suite_references_refuse_unknown_reference_types(value: object):
+    with pytest.raises(ValueError, match="suite references"):
+        Suite.parse("suite", {"references": value, "stages": [_stage_doc("s1")]})

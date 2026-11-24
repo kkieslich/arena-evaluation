@@ -312,9 +312,9 @@ def _all_steps_grid(
             task_layer=suite.task_layer,
         )
 
-    reference_types = (None, "unobstructed_robot") if suite.references else (None,)
+    reference_types = (None, "unobstructed_robot") if suite.adds_reference("unobstructed_robot") else (None,)
     steps = [_step(contestant, stage, reference_type) for contestant in contest.contestants for stage in suite.stages for reference_type in reference_types]
-    if suite.references:
+    if suite.adds_reference("unhindered_peds"):
         steps += [_step(Contestant(name="unhindered_peds", args={}), stage, "unhindered_peds") for stage in suite.stages]
     keys = [step.key for step in steps]
     if duplicate := next((key for key in keys if keys.count(key) > 1), None):
