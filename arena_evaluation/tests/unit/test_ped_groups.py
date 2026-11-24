@@ -221,7 +221,9 @@ def _episode(root: pathlib.Path, episode: int, stage: str, robots: tuple[str, ..
     (episode_dir / f"episode_{episode:03d}.yaml").write_text(json.dumps(metadata.model_dump(mode="json")))
     pl.DataFrame({"run_id": root.name, "episode_id": [episode] * len(robots), "robot_id": list(robots)}).write_parquet(episode_dir / "metrics" / "fact_episodes.parquet")
     peds = peds or {}
-    pl.DataFrame({"run_id": root.name, "episode_id": episode, "env_id": "env_0", "ped_id": list(peds), "ped_name": [p.removeprefix("Pedestrian_") for p in peds], "ped_path_deflection_m": list(peds.values())}, schema_overrides={"ped_path_deflection_m": pl.Float64}).write_parquet(episode_dir / "metrics" / "fact_pedestrians.parquet")
+    pl.DataFrame({"run_id": root.name, "episode_id": episode, "env_id": "env_0", "ped_id": list(peds), "ped_name": [p.removeprefix("Pedestrian_") for p in peds], "ped_path_deflection_m": list(peds.values())}, schema_overrides={"ped_path_deflection_m": pl.Float64}).write_parquet(
+        episode_dir / "metrics" / "fact_pedestrians.parquet"
+    )
     if contacts is not None:
         pl.DataFrame({"robot_id": [c[0] for c in contacts], "collider_kind": [c[1] for c in contacts], "obstacle_id": [c[2] for c in contacts]}, schema={"robot_id": pl.String, "collider_kind": pl.String, "obstacle_id": pl.String}).write_parquet(episode_dir / "metrics" / "fact_contacts.parquet")
     return episode_dir
@@ -241,7 +243,10 @@ def _processed(tmp_path: pathlib.Path) -> pathlib.Path:
     _episode(root, 2, "w__s1", ("env_0_jackal",), reference="unhindered_peds", peds=dict.fromkeys(peds, 100.0), contacts=[("env_0_jackal", "pedestrian", "Pedestrian_3")])
     types = ["adult", "wheelchair_manual", "/humansim/agents/blind_white_cane.yaml"]
     pl.DataFrame({"run_id": "bench", "episode_id": [e for e in (0, 1, 2) for _ in peds], "env_id": "env_0", "ped_id": list(peds) * 3, "agent_type": types * 3}).write_parquet(root / "dim_pedestrians.parquet")
-    paired = pl.DataFrame({"planner": ["dwa"], "stage": ["w__s1"], "episode": [0], "env": ["env_0"], "ped_paired_delay_s_by_group": [[{"group": "adult", "value": 4.0, "peds": 1}]]}, schema={"planner": pl.String, "stage": pl.String, "episode": pl.Int64, "env": pl.String, "ped_paired_delay_s_by_group": PAIRED_DTYPES["ped_paired_delay_s_by_group"]})
+    paired = pl.DataFrame(
+        {"planner": ["dwa"], "stage": ["w__s1"], "episode": [0], "env": ["env_0"], "ped_paired_delay_s_by_group": [[{"group": "adult", "value": 4.0, "peds": 1}]]},
+        schema={"planner": pl.String, "stage": pl.String, "episode": pl.Int64, "env": pl.String, "ped_paired_delay_s_by_group": PAIRED_DTYPES["ped_paired_delay_s_by_group"]},
+    )
     paired.write_parquet(root / PAIRED_FILE)
     return root
 

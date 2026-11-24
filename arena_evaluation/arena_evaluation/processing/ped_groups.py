@@ -20,8 +20,8 @@ import polars as pl
 from arena_evaluation.processing.benchmark_runs import EpisodeRun, episode_runs
 from arena_evaluation.processing.edit_pairs import parse_stage
 from arena_evaluation.processing.paired_peds import PAIRED_FILE, PAIRED_MEASURES
-from arena_evaluation.processing.pedestrian_groups import FLEET_MEASURES, PED_MEASURES, agent_group, worst_group
 from arena_evaluation.processing.ped_track_store import DEFAULT_AGENT_TYPE, strip_env
+from arena_evaluation.processing.pedestrian_groups import FLEET_MEASURES, PED_MEASURES, agent_group, worst_group
 
 PED_GROUPS_FILE = "ped_groups.parquet"
 DIM_PEDESTRIANS_FILE = "dim_pedestrians.parquet"
@@ -128,14 +128,7 @@ def _paired_rows(benchmark_dir: pathlib.Path) -> list[pl.DataFrame]:
     frames = []
     for column in [c for c in paired.columns if c.endswith(_BY_GROUP)]:
         measure = column.removesuffix(_BY_GROUP)
-        frames.append(
-            paired.select("planner", "stage", "episode", "env", pl.lit(measure).alias("measure"), pl.col(column).alias("record"))
-            .explode("record")
-            .drop_nulls("record")
-            .unnest("record")
-            .select(list(_LONG_SCHEMA))
-            .cast(_LONG_SCHEMA)
-        )
+        frames.append(paired.select("planner", "stage", "episode", "env", pl.lit(measure).alias("measure"), pl.col(column).alias("record")).explode("record").drop_nulls("record").unnest("record").select(list(_LONG_SCHEMA)).cast(_LONG_SCHEMA))
     return frames
 
 

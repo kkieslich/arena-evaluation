@@ -338,7 +338,24 @@ def _write_flow_tables(bench: pathlib.Path) -> None:
         labels = {"planner": "dwb", "stage": f"{world}__s{seed}", "flow_world": world, "flow_base": base, "flow_seed": seed}
         cells.append(grid.cells(counts).with_columns(pl.lit(v).cast(FLOW_CELL_SCHEMA[k]).alias(k) for k, v in labels.items()).select(list(FLOW_CELL_SCHEMA)))
         scored = world != base
-        runs.append({**dict.fromkeys(FLOW_RUN_SCHEMA), **labels, "episode": episode, "env": "env_0", "flow_peds": 3, "flow_room_ped_seconds": float(counts.sum()), "flow_reference_stage": f"{base}__s{seed}" if scored else None, "flow_jsd": 0.3 * seed if scored else None, "flow_jsd_occupancy": 0.2 if scored else None, "flow_paired_peds": 3 if scored else None, "flow_unpaired_peds": 0 if scored else None, "flow_jsd_pooled": 0.33 if scored else None, "flow_jsd_pooled_occupancy": 0.25 if scored else None, "flow_pooled_seeds": 2 if scored else None})
+        runs.append(
+            {
+                **dict.fromkeys(FLOW_RUN_SCHEMA),
+                **labels,
+                "episode": episode,
+                "env": "env_0",
+                "flow_peds": 3,
+                "flow_room_ped_seconds": float(counts.sum()),
+                "flow_reference_stage": f"{base}__s{seed}" if scored else None,
+                "flow_jsd": 0.3 * seed if scored else None,
+                "flow_jsd_occupancy": 0.2 if scored else None,
+                "flow_paired_peds": 3 if scored else None,
+                "flow_unpaired_peds": 0 if scored else None,
+                "flow_jsd_pooled": 0.33 if scored else None,
+                "flow_jsd_pooled_occupancy": 0.25 if scored else None,
+                "flow_pooled_seeds": 2 if scored else None,
+            }
+        )
     flow_cells = pl.concat(cells)
     flow_cells.write_parquet(run_table_path(bench, "flow_cells"))
     map_pairs(flow_cells).write_parquet(run_table_path(bench, "flow_map_pairs"))

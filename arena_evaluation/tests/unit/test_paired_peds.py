@@ -13,11 +13,7 @@ S = 1_000_000_000
 
 def _tracks(*peds: tuple[str, str, list[tuple[float, float, float]]]) -> pl.DataFrame:
     """Track rows of (key, agent_type, [(t, x, y), ...]) pedestrians."""
-    rows = [
-        {"time_ns": int(t * S), "t": t, "agent_id": i, "key": key, "name": "", "source_name": "", "source_seq": 0, "agent_type": agent_type, "x": x, "y": y, "vx": 0.0, "vy": 0.0}
-        for i, (key, agent_type, points) in enumerate(peds)
-        for t, x, y in points
-    ]
+    rows = [{"time_ns": int(t * S), "t": t, "agent_id": i, "key": key, "name": "", "source_name": "", "source_seq": 0, "agent_type": agent_type, "x": x, "y": y, "vx": 0.0, "vy": 0.0} for i, (key, agent_type, points) in enumerate(peds) for t, x, y in points]
     return pl.DataFrame(rows, schema=TRACK_SCHEMA)
 
 
