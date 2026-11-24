@@ -39,12 +39,11 @@ from arena_simulation_setup.tree import ResolverVerdict
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 
-from ..ingestion.metadata import IngestionMetadata
 from ..storage.config_layout import CONFIG_KINDS, bundle_config_file
 from ..storage.planner_names import split_planner_name
 from .config import Contest, Contestant, Suite, stage_modes
 from .lockstep import format_table
-from .state import Manifest, capture_git_sha, compute_config_hash
+from .state import Manifest, capture_commits, compute_config_hash
 from .step import Step, StepErrorKind, StepResult
 from .tree import ContestIdentifier, SuiteIdentifier
 
@@ -99,9 +98,10 @@ _SPAWN_CHATTER_PATTERNS = (
 _log = logging.getLogger("arena_evaluation.benchmark.runner")
 
 
-def _arena_git_provenance(share: pathlib.Path) -> tuple[str | None, bool]:
-    """Git sha and dirty flag of the Arena checkout that owns the installed share."""
-    return capture_git_sha(pathlib.Path(IngestionMetadata.resolve_git_workspace(str(share))))
+def _run_commits(share: pathlib.Path) -> dict[str, dict]:
+    """The commits a run started from the installed share depends on (`state.capture_commits`): Arena's checkout, the
+    one that owns the share unless arena_evaluation runs from a submodule of another, and its packages'."""
+    return capture_commits(share)
 
 
 def _proc_fields(pid: int) -> list[str] | None:

@@ -372,7 +372,8 @@ def cli_main(argv: list[str] | None = None) -> int:
         if fresh is not None:
             suite_dict, contest_dict, suite_provenance, contest_provenance, cfg_hash = fresh
             run_id = args.run_id or _default_run_id(args.suite, args.contest, os.environ.get("ARENA_LANE"))
-            sha, dirty = runner_plan._arena_git_provenance(share)
+            commits = runner_plan._run_commits(share)
+            sha, dirty = commits["arena"]["commit"], bool(commits["arena"]["dirty"])
             manifest = runner_cli.fresh_manifest(
                 run_id=run_id,
                 suite=suite,
@@ -391,6 +392,7 @@ def cli_main(argv: list[str] | None = None) -> int:
                 simulator=simulator,
                 scale_episodes=scale_episodes,
                 cli_args=sys.argv[1:] if argv is None else list(argv),
+                commits=commits,
             )
             run_dir = RunDir.create(root, run_id, manifest, lane=lane)
     except FileNotFoundError as exc:

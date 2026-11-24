@@ -191,6 +191,7 @@ def fresh_manifest(
     simulator: str,
     scale_episodes: float,
     cli_args: list[str],
+    commits: dict | None = None,
 ) -> Manifest:
     return Manifest(
         run_id=run_id,
@@ -221,4 +222,5 @@ def fresh_manifest(
         launch_args=dict(launch_args),
         suite_provenance=suite_provenance,
         contest_provenance=contest_provenance,
+        commits=commits,
     )
