@@ -20,6 +20,7 @@ class NullReason(StrEnum):
     NOT_APPLICABLE = "not_applicable"
     INVALID_EPISODE = "invalid_episode"
     EXCEPTION = "exception"
+    GRID_TOO_LARGE = "grid_too_large"
 
 
 #: Codes written as ``code:parameter``.
@@ -43,6 +44,7 @@ NULL_REASON_MEANINGS: Final[Mapping[str, str]] = {
     NullReason.NOT_APPLICABLE.value: "the quantity has no meaning for this row's kind",
     f"{NullReason.INVALID_EPISODE.value}:<why>": "the episode is not rankable; <why> names the defect",
     f"{NullReason.EXCEPTION.value}:<Class>": "the calculator raised <Class>",
+    NullReason.GRID_TOO_LARGE.value: "the world's solver grid has more cells than the solver's limit, so the value was not solved",
 }
 
 #: ``<why>`` values of ``invalid_episode:<why>``, the defects that make an episode unrankable.

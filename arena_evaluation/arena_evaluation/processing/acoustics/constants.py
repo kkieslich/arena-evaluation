@@ -18,6 +18,12 @@ DOOR_OPEN_PROGRESS_THRESHOLD: Final[float] = 0.15
 # The barrier-aware exposure is re-solved only after the robot or a pedestrian moved.
 POSITION_EVALUATION_THRESHOLD_M: Final[float] = 0.5
 
+# The exposure solves one wavefront over the barrier grid per re-solved sample, so its cost grows with the grid's
+# cells times the samples: a grid above MAX_EXPOSURE_GRID_CELLS is not solved (its values are NULL, `grid_too_large`).
+# ARENA_ACOUSTIC_MAX_GRID_CELLS overrides the limit, 0 lifts it.
+MAX_EXPOSURE_GRID_CELLS: Final[int] = 4_000_000
+MAX_EXPOSURE_GRID_CELLS_ENV: Final[str] = "ARENA_ACOUSTIC_MAX_GRID_CELLS"
+
 NANOSECONDS_PER_SECOND: Final[float] = 1e9
 
 # The recorded topic every acoustic metric and the field renderer read.

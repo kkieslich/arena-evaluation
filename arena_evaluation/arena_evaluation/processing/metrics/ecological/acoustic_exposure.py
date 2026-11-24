@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import typing
 from typing import Final
 
@@ -12,6 +13,8 @@ import polars as pl
 
 from arena_evaluation.processing.acoustics.constants import (
     ACOUSTIC_REFERENCE_PRESSURE_SQ_PA2,
+    MAX_EXPOSURE_GRID_CELLS,
+    MAX_EXPOSURE_GRID_CELLS_ENV,
     MIC_DISTANCE_M,
     NANOSECONDS_PER_SECOND,
     POSITION_EVALUATION_THRESHOLD_M,
@@ -33,6 +36,7 @@ from arena_evaluation.processing.acoustics.statistics import (
     rise_rates_dba_per_s,
 )
 from arena_evaluation.processing.metrics.base import (
+    NULL_REASON_SUFFIX,
     BaseMetricCalculator,
     Direction,
     ScopeSlice,
@@ -44,6 +48,7 @@ from arena_evaluation.processing.metrics.common.alignment import (
 )
 from arena_evaluation.storage.exceptions import MetricInputError
 from arena_evaluation.storage.registry import Metric, MetricScope, define_metric
+from arena_evaluation.storage.registry.null_reasons import NullReason
 from arena_evaluation.storage.registry.series import SeriesAcousticExposure
 from arena_evaluation.storage.schemas import AlignedEpisodeBundle, RobotParams
 
@@ -116,6 +121,21 @@ _PEDESTRIAN_KEYS: Final[tuple[str, ...]] = (
 
 SERIES_SCHEMA: Final[pl.Schema] = SeriesAcousticExposure.polars_schema()
 
+_WARNED_GRIDS: set[str] = set()
+
+
+def max_exposure_grid_cells() -> int | None:
+    """The largest barrier grid the exposure solves (MAX_EXPOSURE_GRID_CELLS, or $ARENA_ACOUSTIC_MAX_GRID_CELLS), None
+    without a limit."""
+    raw = os.environ.get(MAX_EXPOSURE_GRID_CELLS_ENV)
+    if raw is None or not raw.strip():
+        return MAX_EXPOSURE_GRID_CELLS
+    try:
+        limit = int(raw)
+    except ValueError as error:
+        raise MetricInputError(f"${MAX_EXPOSURE_GRID_CELLS_ENV}={raw!r} is not a cell count") from error
+    return limit if limit > 0 else None
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class AcousticExposureResult:
@@ -133,6 +153,8 @@ class AcousticExposureResult:
     frame_attenuation_db: list[list[float]]
     frame_open_doors: list[str]
     worst_frame_index: int
+    # Why the episode has no exposure values when it was not solved (a NullReason code), None otherwise
+    null_reason: str | None = None
 
 
 class AcousticExposureCalculator(BaseMetricCalculator):
@@ -220,8 +242,8 @@ class AcousticExposureCalculator(BaseMetricCalculator):
         return t_ns, rx_m, ry_m, ~np.isnan(rx_m) & ~np.isnan(ry_m)
 
     @staticmethod
-    def _null_result() -> AcousticExposureResult:
-        """The empty result: no frame carried an exposure value."""
+    def _null_result(null_reason: str | None = None) -> AcousticExposureResult:
+        """The empty result: no frame carried an exposure value, for `null_reason` when the episode was not solved."""
         empty = np.array([], dtype=np.float64)
         return AcousticExposureResult(
             pedestrian_scalars={},
@@ -236,6 +258,7 @@ class AcousticExposureCalculator(BaseMetricCalculator):
             frame_attenuation_db=[],
             frame_open_doors=[],
             worst_frame_index=0,
+            null_reason=null_reason,
         )
 
     def _summarize(
@@ -320,6 +343,23 @@ class AcousticExposureCalculator(BaseMetricCalculator):
         barrier = load_barrier_map(map_name, run_dir=run_dir)
         grid, resolution = barrier.occupancy, barrier.resolution
         origin_x, origin_y = barrier.origin
+        limit = max_exposure_grid_cells()
+        if limit is not None and grid.size > limit:
+            if map_name not in _WARNED_GRIDS:
+                _WARNED_GRIDS.add(map_name)
+                height, width = grid.shape
+                logger.warning(
+                    "AcousticExposureCalculator: world %r has a %d x %d barrier grid at %g m (%.1f M cells, limit %.1f M): one wavefront over it per sample would take hours per episode, so its exposure is not solved (NULL, %s); set $%s to a larger limit, or 0, to solve it",
+                    map_name,
+                    width,
+                    height,
+                    resolution,
+                    grid.size / 1e6,
+                    limit / 1e6,
+                    NullReason.GRID_TOO_LARGE.value,
+                    MAX_EXPOSURE_GRID_CELLS_ENV,
+                )
+            return self._null_result(NullReason.GRID_TOO_LARGE.value)
 
         doors = barrier_door_tl(barrier)
         tl_cache: dict[tuple[str, ...], np.ndarray] = {}
@@ -492,6 +532,8 @@ class AcousticExposureCalculator(BaseMetricCalculator):
             return self.calculate(episode, prior_results)
         if scope_slice.scope == MetricScope.PEDESTRIAN:
             result = self._episode_result(scope_slice.full_episode, prior_results)
+            if result.null_reason is not None:
+                return {**dict.fromkeys(_PEDESTRIAN_KEYS), **{f"{key}{NULL_REASON_SUFFIX}": result.null_reason for key in _PEDESTRIAN_KEYS}}
             ped_id = str(scope_slice.identity.get("ped_id") or scope_slice.slice_id)
             scalars = result.pedestrian_scalars.get(ped_id)
             if scalars is None:
@@ -505,6 +547,11 @@ class AcousticExposureCalculator(BaseMetricCalculator):
                     "sound_exposure_dose_pa2s_null_reason": "not_applicable",
                 }
             full_result = self._episode_result(scope_slice.full_episode, prior_results)
+            if full_result.null_reason is not None:
+                return {
+                    "sound_exposure_dose_pa2s": None,
+                    "sound_exposure_dose_pa2s_null_reason": full_result.null_reason,
+                }
             ped_id = str(scope_slice.identity.get("actor_2") or scope_slice.slice_id)
             dose = self._encounter_dose_pa2s(full_result, ped_id, scope_slice.t_start_ns, scope_slice.t_end_ns)
             return {"sound_exposure_dose_pa2s": dose}
