@@ -4,6 +4,7 @@ difference on one raster, each the mean of the seeds both ran, with the shared c
 from __future__ import annotations
 
 import dataclasses
+import typing
 from collections.abc import Callable
 
 import numpy as np
@@ -31,8 +32,9 @@ class Raster:
     def over(cls, cells: pl.DataFrame) -> Raster:
         """The raster spanning every cell of `cells` (FLOW_CELL_SCHEMA rows of one base world)."""
         cell = float(cells["cell_m"][0])
-        x0, y0 = float(cells["x"].min()), float(cells["y"].min())
-        return cls(x0, y0, round((float(cells["x"].max()) - x0) / cell) + 1, round((float(cells["y"].max()) - y0) / cell) + 1, cell)
+        x0, y0 = float(typing.cast(float, cells["x"].min())), float(typing.cast(float, cells["y"].min()))
+        x1, y1 = float(typing.cast(float, cells["x"].max())), float(typing.cast(float, cells["y"].max()))
+        return cls(x0, y0, round((x1 - x0) / cell) + 1, round((y1 - y0) / cell) + 1, cell)
 
     def index(self, cells: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         """(row, column) of each cell of `cells`."""
@@ -51,8 +53,9 @@ class Raster:
         moving = cells.filter(pl.col("heading_rad").is_not_null())
         i, j = self.index(moving)
         theta, w = moving["heading_rad"].to_numpy(), moving["ped_seconds"].to_numpy()
-        np.add.at(out, (i, j, 0), w * np.cos(theta))
-        np.add.at(out, (i, j, 1), w * np.sin(theta))
+        # numpy's stubs type `indices` as one integer array, but ufunc.at takes a tuple index as `out[indices]` does
+        np.add.at(out, (i, j, 0), w * np.cos(theta))  # pyright: ignore[reportArgumentType]
+        np.add.at(out, (i, j, 1), w * np.sin(theta))  # pyright: ignore[reportArgumentType]
         return out
 
 

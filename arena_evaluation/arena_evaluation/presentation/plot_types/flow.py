@@ -85,7 +85,8 @@ def _pairs(df: pl.DataFrame) -> list[_Pair]:
         ny, nx = int(first["ny"]), int(first["nx"])
         i, j = frame["i"].to_numpy(), frame["j"].to_numpy()
 
-        def grid(*columns: str, frame: pl.DataFrame = frame, ny: int = ny, nx: int = nx, i: np.ndarray = i, j: np.ndarray = j) -> np.ndarray:
+        def grid(column: str, *more: str, frame: pl.DataFrame = frame, ny: int = ny, nx: int = nx, i: np.ndarray = i, j: np.ndarray = j) -> np.ndarray:
+            columns = (column, *more)
             shape = (ny, nx, len(columns)) if len(columns) > 1 else (ny, nx)
             out = np.zeros(shape, dtype=bool if frame.schema[columns[0]] == pl.Boolean else float)
             if len(columns) > 1:

@@ -84,8 +84,10 @@ class TableSink:
         n = len(columns["t_ns"])
         if n == 0:
             return
-        values = {name: list(columns[name]) if name in columns else [None] * n for name in names}
+        values: dict[str, list[Any]] = {name: list(columns[name]) if name in columns else [None] * n for name in names}
         key = _ROW_KEYS.get(table, ())
+        known: dict[tuple[Any, ...], int] = {}
+        keys: list[tuple[Any, ...]] = []
         if key:
             known = self._key_rows.setdefault(table, {})
             keys = list(zip(*(values[name] for name in key), strict=True))
