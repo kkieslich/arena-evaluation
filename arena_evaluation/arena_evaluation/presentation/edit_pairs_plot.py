@@ -17,6 +17,7 @@ def short_world(world: str) -> str:
     parts = world.split("__")
     return parts[1] if len(parts) >= 2 else world
 
+
 # Categorical slots 1 and 2 of the reference chart palette (blue, orange), a validated adjacent pair on the light surface;
 # role is also told by marker shape and by the x labels, never by color alone.
 _ROLE_STYLE = {EDIT: ("#2a78d6", "o", "function-carrying edit"), CONTROL: ("#eb6834", "s", "geometry-only control")}

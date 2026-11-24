@@ -260,7 +260,7 @@ def paired_test(diffs: Sequence[float]) -> dict[str, float | int | None]:
     return out
 
 
-def _signed_rank_method(d: Sequence[float]) -> typing.Any:
+def _signed_rank_method(d: Sequence[float]) -> typing.Any:  # noqa: ANN401
     """scipy's `method` that makes the signed-rank p exact for `d`: its exact null distribution without ties, else every
     sign flip of the differences enumerated (exact given the tied ranks; scipy's `exact` is not, gh-19872).
 

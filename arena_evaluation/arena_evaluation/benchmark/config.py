@@ -98,6 +98,7 @@ def parse_record(obj: object) -> dict[str, typing.Any]:
             out["rates_hz"][str(topic)] = value
     return out
 
+
 _log = logging.getLogger(__name__)
 
 

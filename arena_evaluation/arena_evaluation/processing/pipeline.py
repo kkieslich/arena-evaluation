@@ -22,6 +22,8 @@ if typing.TYPE_CHECKING:
     from arena_evaluation.processing.scoped_evaluator import ScopedFactTables
 
 from arena_evaluation.processing.dimension_rows import episode_dimensions
+from arena_evaluation.processing.episode_topics import episode_rows as _episode_rows
+from arena_evaluation.processing.episode_topics import episode_window as _episode_window
 from arena_evaluation.processing.mcap_reader import MCAPReader, load_bundles
 from arena_evaluation.processing.metrics.common.alignment import (
     TRACK_ALIGN_TOLERANCE_NS,
@@ -34,8 +36,6 @@ from arena_evaluation.processing.metrics.social.interaction_common import (
     PEDESTRIAN_ARENA_PEDS_TOPIC,
 )
 from arena_evaluation.processing.outcome import outcome_verdict
-from arena_evaluation.processing.episode_topics import episode_rows as _episode_rows
-from arena_evaluation.processing.episode_topics import episode_window as _episode_window
 from arena_evaluation.processing.parquet_store import TopicParquetStore
 from arena_evaluation.processing.pose_anchor import pose_frame, resolve_pose_source
 from arena_evaluation.processing.scoped_evaluator import (

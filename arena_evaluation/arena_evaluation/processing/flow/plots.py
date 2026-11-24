@@ -17,7 +17,6 @@ GAMMA = 0.45
 ARROW_PERCENTILE = 60
 
 
-
 @dataclasses.dataclass(frozen=True)
 class Raster:
     """Cell centres of one base world's grid, covering every map drawn on it."""

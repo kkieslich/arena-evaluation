@@ -78,13 +78,13 @@ import typing
 import numpy as np
 import polars as pl
 
-from arena_evaluation.processing.paired_peds import _travel_times
-from arena_evaluation.processing.pedestrian_groups import agent_group
 from arena_evaluation.processing import ped_track_store
 from arena_evaluation.processing.alignment import interpolate_values
 from arena_evaluation.processing.benchmark_runs import FACTS_FILE, episode_runs
+from arena_evaluation.processing.paired_peds import _travel_times
 from arena_evaluation.processing.parquet_store import TopicParquetStore
 from arena_evaluation.processing.ped_track_store import DERIVED_DIR, TOPICS_DIR, topics_envs, tracks_for_episode
+from arena_evaluation.processing.pedestrian_groups import agent_group
 
 #: The warm-up the analysis leaves out and the episode length (Kolja, 9 Nov: 25 min with 7 min warm-up)
 WARMUP_S = 420.0
@@ -918,7 +918,7 @@ def _visitors(off: pl.DataFrame, on: pl.DataFrame | None, sources: set[str]) -> 
 # --- tables ----------------------------------------------------------------------------------------------------------
 
 
-def _whole_seeds(named: typing.Any, what: str) -> frozenset[int]:
+def _whole_seeds(named: typing.Any, what: str) -> frozenset[int]:  # noqa: ANN401
     """`named` as a set of seeds; ValueError unless it is a list of whole numbers (no string, no float, no bool)."""
     import numbers
 
@@ -952,7 +952,17 @@ def without_robots_seeds(manifest: typing.Mapping[str, typing.Any], seeds: typin
     return chosen
 
 
-def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts_dir: pathlib.Path | typing.Sequence[pathlib.Path], manifest: typing.Mapping[str, typing.Any], *, warmup_s: float | None = None, fleet: str | None = None, tau_s: float | None = None, allow_mixed_commits: bool = False, split_seeds: typing.Collection[int] | None = None) -> pl.DataFrame:
+def layout_table(
+    site_dir: pathlib.Path | typing.Sequence[pathlib.Path],
+    layouts_dir: pathlib.Path | typing.Sequence[pathlib.Path],
+    manifest: typing.Mapping[str, typing.Any],
+    *,
+    warmup_s: float | None = None,
+    fleet: str | None = None,
+    tau_s: float | None = None,
+    allow_mixed_commits: bool = False,
+    split_seeds: typing.Collection[int] | None = None,
+) -> pl.DataFrame:
     """One row per layout of `manifest` and seed: its roles, the service of its fleet run, its pedestrian cost against
     the site as is at that seed (`cost`), flattened (`C_<group>`, `C_<group>_element`, `C_<group>_traffic`,
     `delay_<group>_s`, `peds_<group>`, `dropped_<group>`, `c_worst`, `worst_group`, `visitor_*`). `site_dir` and
@@ -1021,7 +1031,16 @@ def layout_table(site_dir: pathlib.Path | typing.Sequence[pathlib.Path], layouts
             if off is not None and not needs_off:
                 raise ValueError(f"{layouts_what}: stage {off.stage} has a run without robots (episode_{off.episode:03d}), but seed {seed} is not among the seeds named to have one ({sorted(split or ())}); name the seed in the manifest's {WITHOUT_ROBOTS_SEEDS} or with --without-robots-seeds, or leave the run's dir out")
             complete = on is not None and ref is not None and (off is not None or not needs_off)
-            row: dict[str, typing.Any] = {"layout_id": layout_id, "world": world, "seed": int(seed), "roles": ",".join(roles.get(layout_id, [])), "ranking_score": ranking.get(layout_id), "travel_m": travel.get(layout_id), "complete": complete, "incomplete": None if complete else "; ".join(["missing runs: " + ", ".join(what for what, r, needed in (("the site as is", ref, True), ("without robots", off, needs_off), ("with the fleet", on, True)) if needed and r is None), *notes])}
+            row: dict[str, typing.Any] = {
+                "layout_id": layout_id,
+                "world": world,
+                "seed": int(seed),
+                "roles": ",".join(roles.get(layout_id, [])),
+                "ranking_score": ranking.get(layout_id),
+                "travel_m": travel.get(layout_id),
+                "complete": complete,
+                "incomplete": None if complete else "; ".join(["missing runs: " + ", ".join(what for what, r, needed in (("the site as is", ref, True), ("without robots", off, needs_off), ("with the fleet", on, True)) if needed and r is None), *notes]),
+            }
             if split is not None:
                 row["split"] = off is not None and on is not None and ref is not None
             row.update({f"pred_{group}": value for group, value in predicted.get(layout_id, {}).items()})
@@ -1397,7 +1416,7 @@ def premise(table: pl.DataFrame, *, utilisation: float = 0.75, robots: int = 4, 
     return out
 
 
-def _plain(value: typing.Any) -> typing.Any:
+def _plain(value: typing.Any) -> typing.Any:  # noqa: ANN401
     """`value` with non-finite floats as None and numpy scalars as Python ones, for JSON."""
     if isinstance(value, dict):
         return {str(k): _plain(v) for k, v in value.items()}
@@ -1410,7 +1429,7 @@ def _plain(value: typing.Any) -> typing.Any:
     return value
 
 
-def write_json(data: typing.Any, path: pathlib.Path) -> pathlib.Path:
+def write_json(data: typing.Any, path: pathlib.Path) -> pathlib.Path:  # noqa: ANN401
     path = pathlib.Path(path)
     path.write_text(json.dumps(_plain(data), indent=1, default=str) + "\n")
     return path
@@ -1442,7 +1461,7 @@ def _seed_list(text: str) -> list[int]:
     return list(seeds)
 
 
-def _fmt(value: typing.Any, spec: str = ".3f") -> str:
+def _fmt(value: typing.Any, spec: str = ".3f") -> str:  # noqa: ANN401
     return "-" if value is None or (isinstance(value, float) and not math.isfinite(value)) else format(value, spec)
 
 
@@ -1457,7 +1476,7 @@ def _print_layouts(means: pl.DataFrame) -> None:
         )
         parts = ", ".join(f"{g} element {_fmt(r.get(f'C_{g}_element'))} traffic {_fmt(r.get(f'C_{g}_traffic'))} delay {_fmt(r.get(f'delay_{g}_s'), '.1f')} s" for g in groups)
         if parts:
-            print(f"{'':10s} {parts}" + (f"; element and traffic over the seeds with a walker in all three runs: " + ", ".join(f"{g} {r.get(f'split_seeds_{g}') or 0}" for g in groups) + f" of {r['split_seeds']} with a run without robots" if r.get("split_seeds") is not None else ""))
+            print(f"{'':10s} {parts}" + ("; element and traffic over the seeds with a walker in all three runs: " + ", ".join(f"{g} {r.get(f'split_seeds_{g}') or 0}" for g in groups) + f" of {r['split_seeds']} with a run without robots" if r.get("split_seeds") is not None else ""))
 
 
 def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], warmup_s: float, *, recompute: bool = False) -> int:
@@ -1486,7 +1505,7 @@ def keep_times(benchmark_dirs: pathlib.Path | typing.Sequence[pathlib.Path], war
     return kept
 
 
-def infra_command(args: typing.Any) -> int:
+def infra_command(args: typing.Any) -> int:  # noqa: ANN401
     """`evaluation infra {table,premise,pick,compare,times,occupancy}`; see `add_infra_parser`."""
     if args.infra == "occupancy":
         cells = occupancy(args.benchmark, args.cell)
@@ -1536,7 +1555,9 @@ def infra_command(args: typing.Any) -> int:
         for c in chosen["joint"]:
             print(f"  joint {c['layout_id']}: T {_fmt(c['task_time_s'], '.1f')} s, C_worst {_fmt(c['c_worst'])} ({c['worst_group'] or '-'}){' - T over the cap beyond its interval' if c['t_over'] else ''}{'' if c['excluded'] is None else ' - excluded: ' + c['excluded']}")
         sc = chosen["score_check"]
-        print(f"joint pick: {chosen['joint_pick'] or 'none (every joint layout dropped)'}; score check: Spearman {_fmt(sc['spearman'])} over {sc['layouts']} layouts, one-sided p {_fmt(sc['p'])} -> {'holds' if sc['holds'] else 'not shown'}; forecaster check: Spearman {_fmt(chosen['forecaster_check']['spearman'])} over {chosen['forecaster_check']['layouts']} layouts")
+        print(
+            f"joint pick: {chosen['joint_pick'] or 'none (every joint layout dropped)'}; score check: Spearman {_fmt(sc['spearman'])} over {sc['layouts']} layouts, one-sided p {_fmt(sc['p'])} -> {'holds' if sc['holds'] else 'not shown'}; forecaster check: Spearman {_fmt(chosen['forecaster_check']['spearman'])} over {chosen['forecaster_check']['layouts']} layouts"
+        )
         for group, g in sc["groups"].items():
             print(f"  {group}: {g['predicted']} vs C_{group}_traffic, Spearman {_fmt(g['spearman'])}, p {_fmt(g['p'])} over {g['layouts']} layouts")
         print(f"wrote {out} and {png}; next: flowedit infra evaluation --pick {out}")
@@ -1548,7 +1569,9 @@ def infra_command(args: typing.Any) -> int:
         result = compare(table, {role: picks[role] for role in ("joint", "robot_only", "guideline") if picks.get(role)}, n_boot=args.boot)
         out = write_json(result, pathlib.Path(args.out or out_dir / "infra_compare.json"))
         d, d90, t = result["delta_c_worst"], result["delta_c_worst_90"], result["delta_t_rel"]
-        print(f"joint {picks['joint']} - robot-only {picks['robot_only']} over {d['seeds']} seeds: dC_worst {_fmt(d['estimate'])} 95 % [{_fmt(d['ci_low'])}, {_fmt(d['ci_high'])}], 90 % [{_fmt(d90['ci_low'])}, {_fmt(d90['ci_high'])}], dT/T {_fmt(t['estimate'])} [{_fmt(t['ci_low'])}, {_fmt(t['ci_high'])}] -> {result['verdict']} (H1 {'holds' if result['h1_holds'] else 'does not hold'}; equivalence margin +-{result['delta']:g})")
+        print(
+            f"joint {picks['joint']} - robot-only {picks['robot_only']} over {d['seeds']} seeds: dC_worst {_fmt(d['estimate'])} 95 % [{_fmt(d['ci_low'])}, {_fmt(d['ci_high'])}], 90 % [{_fmt(d90['ci_low'])}, {_fmt(d90['ci_high'])}], dT/T {_fmt(t['estimate'])} [{_fmt(t['ci_low'])}, {_fmt(t['ci_high'])}] -> {result['verdict']} (H1 {'holds' if result['h1_holds'] else 'does not hold'}; equivalence margin +-{result['delta']:g})"
+        )
         for name, c in (result.get("guideline") or {}).items():
             cd, c90 = c["delta_c_worst"], c["delta_c_worst_90"]
             print(f"  {name}: dC_worst {_fmt(cd['estimate'])} 95 % [{_fmt(cd['ci_low'])}, {_fmt(cd['ci_high'])}], 90 % [{_fmt(c90['ci_low'])}, {_fmt(c90['ci_high'])}], Holm p {_fmt(c['p_holm'])} -> {c['verdict']}")
@@ -1558,7 +1581,7 @@ def infra_command(args: typing.Any) -> int:
     return 0
 
 
-def add_infra_parser(subparsers: typing.Any) -> None:
+def add_infra_parser(subparsers: typing.Any) -> None:  # noqa: ANN401
     """The `infra` command: INFRA's robot service, pedestrian cost, premise check, pick and comparison."""
     import argparse
 
@@ -1580,14 +1603,23 @@ def add_infra_parser(subparsers: typing.Any) -> None:
         except ValueError as e:
             raise argparse.ArgumentTypeError(str(e)) from None
 
-    common.add_argument("--without-robots-seeds", type=seeds, default=None, metavar="SEEDS", help=f"the seeds that have a run without robots, e.g. 51-55 or `none`, for a manifest without {WITHOUT_ROBOTS_SEEDS} (refused when the manifest names other seeds; with neither, every seed needs one and the three runs pair as before): the cost against the site as is then pairs the site as is and the fleet run on every seed, and the element and traffic parts come from these seeds")
+    common.add_argument(
+        "--without-robots-seeds",
+        type=seeds,
+        default=None,
+        metavar="SEEDS",
+        help=f"the seeds that have a run without robots, e.g. 51-55 or `none`, for a manifest without {WITHOUT_ROBOTS_SEEDS} (refused when the manifest names other seeds; with neither, every seed needs one and the three runs pair as before): the cost against the site as is then pairs the site as is and the fleet run on every seed, and the element and traffic parts come from these seeds",
+    )
     common.add_argument("--out", type=pathlib.Path, default=None, help="the pick or comparison JSON (default <output dir>/infra_pick.json, infra_compare.json)")
     sub.add_parser("table", parents=[common], help="print service and cost per layout, write infra_layouts.parquet (per seed)")
     sub.add_parser("premise", parents=[common], help="§10: C_worst of the two layouts against the seed spread, the task rate at 75 %% of the wide layout's measured capacity")
     sub.add_parser("pick", parents=[common], help="§6: the joint pick among the joint top 10, the score check, the forecaster check, the T vs C_worst figure")
     q = sub.add_parser("compare", parents=[common], help="§12: joint pick - robot-only pick (and each against the guideline layout) on the evaluation seeds: lower, equivalent or inconclusive")
     q.add_argument("--boot", type=int, default=10_000, help="bootstrap draws (default 10000)")
-    q = sub.add_parser("times", help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST} and per episode episode_NNN.yaml, {FACTS_FILE}, {TOPICS_DIR}/{FLEET_LOG_FILE} and {TOPICS_DIR}/{DERIVED_DIR}/infra_times.*/ reads like the original (run it where the tracks are, before copying, with the analysis' warm-up)")
+    q = sub.add_parser(
+        "times",
+        help=f"keep each run's walker travel times beside its tracks, so a copy of the run dir holding only {RUN_MANIFEST} and per episode episode_NNN.yaml, {FACTS_FILE}, {TOPICS_DIR}/{FLEET_LOG_FILE} and {TOPICS_DIR}/{DERIVED_DIR}/infra_times.*/ reads like the original (run it where the tracks are, before copying, with the analysis' warm-up)",
+    )
     q.add_argument("--benchmark", type=pathlib.Path, action="append", required=True, help="processed benchmark dir; repeatable")
     q.add_argument("--manifest", type=pathlib.Path, default=None, help="the suite's <suite>.layouts.json, for its warm-up")
     q.add_argument("--warmup", type=float, default=None, help=f"seconds left out at the start (default the manifest's, else {WARMUP_S:g}); the analysis reads the times kept for its own warm-up")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import math
 import pathlib
-from collections.abc import Callable
 
 import numpy as np
 import polars as pl
@@ -86,7 +85,7 @@ def _pairs(df: pl.DataFrame) -> list[_Pair]:
         ny, nx = int(first["ny"]), int(first["nx"])
         i, j = frame["i"].to_numpy(), frame["j"].to_numpy()
 
-        def grid(*columns: str) -> np.ndarray:
+        def grid(*columns: str, frame: pl.DataFrame = frame, ny: int = ny, nx: int = nx, i: np.ndarray = i, j: np.ndarray = j) -> np.ndarray:
             shape = (ny, nx, len(columns)) if len(columns) > 1 else (ny, nx)
             out = np.zeros(shape, dtype=bool if frame.schema[columns[0]] == pl.Boolean else float)
             if len(columns) > 1:
@@ -98,8 +97,21 @@ def _pairs(df: pl.DataFrame) -> list[_Pair]:
 
         out.append(
             _Pair(
-                str(first["planner"]), str(first["flow_world"]), str(first["flow_base"]), str(first["seeds"]), float(first["x0"]), float(first["y0"]), float(first["cell_m"]),
-                grid("ref"), grid("edit"), grid("ref_hx", "ref_hy"), grid("edit_hx", "edit_hy"), grid("ref_arrow"), grid("edit_arrow"), float(first["occ_top"]), float(first["diff_lim"]),
+                str(first["planner"]),
+                str(first["flow_world"]),
+                str(first["flow_base"]),
+                str(first["seeds"]),
+                float(first["x0"]),
+                float(first["y0"]),
+                float(first["cell_m"]),
+                grid("ref"),
+                grid("edit"),
+                grid("ref_hx", "ref_hy"),
+                grid("edit_hx", "edit_hy"),
+                grid("ref_arrow"),
+                grid("edit_arrow"),
+                float(first["occ_top"]),
+                float(first["diff_lim"]),
             )
         )
     return out

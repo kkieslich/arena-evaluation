@@ -40,15 +40,48 @@ def _log(fields: dict[str, str]) -> pl.DataFrame:
 LOG = {
     "t0": "100.000",
     # before the warm-up: not scored
-    "job.0.kind": "delivery", "job.0.released": "100.000", "job.0.assigned": "100.000", "job.0.ended": "300.000", "job.0.outcome": "completed",
-    "job.1.kind": "delivery", "job.1.released": "500.000", "job.1.assigned": "510.000", "job.1.loaded": "540.000", "job.1.ended": "700.000", "job.1.outcome": "completed", "job.1.wait_s": "40.000", "job.1.timeout_0": "330.000",
-    "job.2.kind": "pickup", "job.2.released": "600.000", "job.2.assigned": "600.000", "job.2.ended": "1000.000", "job.2.outcome": "completed",
-    "job.3.kind": "delivery", "job.3.released": "800.000", "job.3.assigned": "820.000", "job.3.ended": "900.000", "job.3.outcome": "failed", "job.3.reason": "jam",
-    "job.4.kind": "delivery", "job.4.released": "900.000", "job.4.assigned": "900.000", "job.4.ended": "1400.000", "job.4.outcome": "abandoned", "job.4.reason": "timeout",
-    "job.5.kind": "delivery", "job.5.released": "1450.000",
-    "charge.0.robot": "r0", "charge.0.queued": "600.000", "charge.0.dispatched": "630.000", "charge.0.ended": "1100.000", "charge.0.outcome": "charged",
-    "charge.1.robot": "r1", "charge.1.queued": "200.000", "charge.1.dispatched": "200.000",
-    "empty.0.robot": "r1", "empty.0.at": "1200.000",
+    "job.0.kind": "delivery",
+    "job.0.released": "100.000",
+    "job.0.assigned": "100.000",
+    "job.0.ended": "300.000",
+    "job.0.outcome": "completed",
+    "job.1.kind": "delivery",
+    "job.1.released": "500.000",
+    "job.1.assigned": "510.000",
+    "job.1.loaded": "540.000",
+    "job.1.ended": "700.000",
+    "job.1.outcome": "completed",
+    "job.1.wait_s": "40.000",
+    "job.1.timeout_0": "330.000",
+    "job.2.kind": "pickup",
+    "job.2.released": "600.000",
+    "job.2.assigned": "600.000",
+    "job.2.ended": "1000.000",
+    "job.2.outcome": "completed",
+    "job.3.kind": "delivery",
+    "job.3.released": "800.000",
+    "job.3.assigned": "820.000",
+    "job.3.ended": "900.000",
+    "job.3.outcome": "failed",
+    "job.3.reason": "jam",
+    "job.4.kind": "delivery",
+    "job.4.released": "900.000",
+    "job.4.assigned": "900.000",
+    "job.4.ended": "1400.000",
+    "job.4.outcome": "abandoned",
+    "job.4.reason": "timeout",
+    "job.5.kind": "delivery",
+    "job.5.released": "1450.000",
+    "charge.0.robot": "r0",
+    "charge.0.queued": "600.000",
+    "charge.0.dispatched": "630.000",
+    "charge.0.ended": "1100.000",
+    "charge.0.outcome": "charged",
+    "charge.1.robot": "r1",
+    "charge.1.queued": "200.000",
+    "charge.1.dispatched": "200.000",
+    "empty.0.robot": "r1",
+    "empty.0.at": "1200.000",
 }
 
 
@@ -84,8 +117,16 @@ def _message(fields: dict[str, str], time_ns: int) -> pl.DataFrame:
 def test_the_fleet_log_leaves_out_a_latched_log_that_shares_the_reset_messages_stamp() -> None:
     # the latched copy of the previous episode's log and this episode's reset message can carry one stamp; the latched
     # copy comes first in the recording, so its jobs, jam and top-ups must not survive (infra_eval_x_i2 episode_002)
-    previous = {"t0": "1595.303", **{f"job.{j}.{k}": v for j in range(1, 5) for k, v in (("kind", "delivery"), ("released", f"{100 * j}.000"), ("outcome", "failed"), ("reason", "jam"))},
-                "jam.0.job": "3", "jam.0.target": "locker_0", "top_up.0.dispatched": "900.000", "top_up.0.started": "950.000", "top_up.1.dispatched": "1200.000", "top_up.1.ended": "1300.000"}
+    previous = {
+        "t0": "1595.303",
+        **{f"job.{j}.{k}": v for j in range(1, 5) for k, v in (("kind", "delivery"), ("released", f"{100 * j}.000"), ("outcome", "failed"), ("reason", "jam"))},
+        "jam.0.job": "3",
+        "jam.0.target": "locker_0",
+        "top_up.0.dispatched": "900.000",
+        "top_up.0.started": "950.000",
+        "top_up.1.dispatched": "1200.000",
+        "top_up.1.ended": "1300.000",
+    }
     own = {"t0": "3096.401", "job.0.kind": "delivery", "job.0.released": "174.891"}
     stamp, later = 3_096_400_500_000, 3_271_292_100_000
     snapshot = pl.concat([_message(previous, stamp), _message({"t0": "3096.401"}, stamp), _message(own, later)])
@@ -122,13 +163,34 @@ def test_service_scores_the_jobs_released_after_the_warm_up() -> None:
 
 TOP_UPS = {
     # before the warm-up: not scored
-    "top_up.0.robot": "r2", "top_up.0.charger": "charger_1", "top_up.0.dispatched": "300.000", "top_up.0.started": "500.000", "top_up.0.ended": "500.000", "top_up.0.outcome": "docked",
+    "top_up.0.robot": "r2",
+    "top_up.0.charger": "charger_1",
+    "top_up.0.dispatched": "300.000",
+    "top_up.0.started": "500.000",
+    "top_up.0.ended": "500.000",
+    "top_up.0.outcome": "docked",
     # docked after a 360 s trip: free for jobs from then on, its charging there is no time out of service
-    "top_up.1.robot": "r0", "top_up.1.soc_dispatched": "47.60", "top_up.1.charger": "charger_1", "top_up.1.dispatched": "700.000", "top_up.1.started": "1060.000", "top_up.1.soc_start": "29.00", "top_up.1.ended": "1060.000", "top_up.1.outcome": "docked", "top_up.1.soc_end": "29.00",
+    "top_up.1.robot": "r0",
+    "top_up.1.soc_dispatched": "47.60",
+    "top_up.1.charger": "charger_1",
+    "top_up.1.dispatched": "700.000",
+    "top_up.1.started": "1060.000",
+    "top_up.1.soc_start": "29.00",
+    "top_up.1.ended": "1060.000",
+    "top_up.1.outcome": "docked",
+    "top_up.1.soc_end": "29.00",
     # given up on its way after 100 s, to a robot queued to charge
-    "top_up.2.robot": "r1", "top_up.2.charger": "charger_2", "top_up.2.dispatched": "800.000", "top_up.2.ended": "900.000", "top_up.2.outcome": "abandoned", "top_up.2.reason": "yielded", "top_up.2.yielded_to": "r3",
+    "top_up.2.robot": "r1",
+    "top_up.2.charger": "charger_2",
+    "top_up.2.dispatched": "800.000",
+    "top_up.2.ended": "900.000",
+    "top_up.2.outcome": "abandoned",
+    "top_up.2.reason": "yielded",
+    "top_up.2.yielded_to": "r3",
     # still on its way at the episode end
-    "top_up.3.robot": "r2", "top_up.3.charger": "charger_1", "top_up.3.dispatched": "1450.000",
+    "top_up.3.robot": "r2",
+    "top_up.3.charger": "charger_1",
+    "top_up.3.dispatched": "1450.000",
 }
 
 
@@ -453,7 +515,19 @@ def test_the_infra_command_tables_and_picks_a_selection(tmp_path: pathlib.Path, 
     monkeypatch.setattr(infra, "tracks_for_episode", fake)
     monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)
     manifest = tmp_path / "infra_h1.layouts.json"
-    manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
+    manifest.write_text(
+        json.dumps(
+            {
+                "site": "site",
+                "seeds": [1, 2],
+                "episode_s": 1500.0,
+                "warmup_s": 420.0,
+                "visitor_sources": [],
+                "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}],
+                "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"},
+            }
+        )
+    )
     args = argparse.Namespace(infra="pick", site=site, layouts=layouts, manifest=manifest, warmup=None, tau=None, output_dir=None, out=None, boot=200)
     assert infra.infra_command(args) == 0
     table = pl.read_parquet(layouts / infra.TABLE_FILE)
@@ -533,7 +607,19 @@ def _selection(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: d
     monkeypatch.setattr(infra, "tracks_for_episode", fake)
     monkeypatch.setattr(infra, "has_tracks", lambda episode_dir, env: True)  # the fake store holds every episode
     manifest = tmp_path / "infra_h1.layouts.json"
-    manifest.write_text(json.dumps({"site": "site", "seeds": [1, 2], "episode_s": 1500.0, "warmup_s": 420.0, "visitor_sources": [], "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}], "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"}}))
+    manifest.write_text(
+        json.dumps(
+            {
+                "site": "site",
+                "seeds": [1, 2],
+                "episode_s": 1500.0,
+                "warmup_s": 420.0,
+                "visitor_sources": [],
+                "runs": [{"role": "robot_only", "layout_id": "aaaa", "travel_m": 10.0}, {"role": "joint", "layout_id": "aaaa", "ranking_score": 3.0}, {"role": "joint", "layout_id": "bbbb", "travel_m": 11.0, "ranking_score": 1.0}],
+                "worlds": {"aaaa": "/x/site__layout_aaaa", "bbbb": "/x/site__layout_bbbb"},
+            }
+        )
+    )
     return site, dirs, manifest
 
 
@@ -976,7 +1062,9 @@ def test_the_cost_without_the_run_without_robots_pairs_the_site_as_is_and_the_fl
 VISITOR = ("south_locker_wheelchair", "7", "./types/locker_visitor__south_wheelchair.yaml", 450.0, 850.0)
 
 
-def _layout_runs(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: dict[str, list[tuple]], lost: tuple[str, ...] = (), *, walkers: list[tuple[str, str, str, float, float]] = SITE, logs: dict[str, pl.DataFrame | None] | None = None, visitor: bool = False) -> tuple[pathlib.Path, dict[str, pathlib.Path], dict]:
+def _layout_runs(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, parts: dict[str, list[tuple]], lost: tuple[str, ...] = (), *, walkers: list[tuple[str, str, str, float, float]] = SITE, logs: dict[str, pl.DataFrame | None] | None = None, visitor: bool = False
+) -> tuple[pathlib.Path, dict[str, pathlib.Path], dict]:
     """The site as is on seeds 1 and 2 and layout runs in run dirs by `parts` (dir name -> (contestant, seed) of layout
     aaaa, or (contestant, seed, layout) with layout bbbb), with tracks from a monkeypatched store: in aaaa the `walkers`
     are 30 s slower without robots and 60 s with the fleet (`fleet_dwb`), in bbbb 10 and 20 s, and the walkers with a

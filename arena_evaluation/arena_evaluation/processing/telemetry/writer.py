@@ -95,7 +95,7 @@ class TableSink:
                 return
         stamps = values["t_ns"]
         previous = self._last_stamp.get(table)
-        if (previous is not None and stamps[0] < previous) or any(b < a for a, b in zip(stamps, stamps[1:])):
+        if (previous is not None and stamps[0] < previous) or any(b < a for a, b in zip(stamps, stamps[1:], strict=False)):
             self._unsorted.add(table)
         self._last_stamp[table] = stamps[-1]
         target = self._columns.setdefault(table, {name: [] for name in names})
@@ -103,7 +103,7 @@ class TableSink:
         for name in names:
             target[name].extend(values[name])
         if key:
-            known.update(zip(keys, range(start, start + n)))
+            known.update(zip(keys, range(start, start + n), strict=False))
         self._pending_rows += n
         if self._pending_rows >= self._flush_rows:
             self.flush()

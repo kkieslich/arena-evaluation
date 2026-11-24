@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from arena_evaluation.processing.telemetry.cdr import PathPoses
 from arena_evaluation.processing.telemetry.messages import (
     Envelope,
     RobotRef,
@@ -17,7 +18,6 @@ from arena_evaluation.processing.telemetry.messages import (
     stamp_ns,
     yaw_from_orientation,
 )
-from arena_evaluation.processing.telemetry.cdr import PathPoses
 from arena_evaluation.processing.telemetry.writer import TableSink
 
 if TYPE_CHECKING:
