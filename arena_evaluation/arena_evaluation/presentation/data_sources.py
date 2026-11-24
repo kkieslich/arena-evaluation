@@ -9,6 +9,7 @@ from arena_evaluation.analytics.catalog import CANONICAL_VIEW_NAMES, SERIES_TABL
 from arena_evaluation.storage.registry import FACT_TABLES, dimensions, registered_tables
 from arena_evaluation.storage.registry.series import SERIES_TABLES
 from arena_evaluation.storage.registry.table import TableKind
+from arena_evaluation.storage.run_tables import RUN_TABLES
 
 __all__ = [
     "EPISODE_SUMMARY_VIEW",
@@ -58,6 +59,7 @@ def declared_data_sources() -> frozenset[str]:
             *fact_names,
             *series_names,
             *telemetry_names,
+            *RUN_TABLES,
             *declared_view_names(),
         }
     )

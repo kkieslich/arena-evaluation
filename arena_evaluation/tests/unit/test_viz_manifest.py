@@ -67,3 +67,10 @@ def test_plot_spec_requires_type_or_uses() -> None:
         PlotSpec(id="missing_type")
     spec = PlotSpec(id="from_recipe", uses="scorecard_table")
     assert spec.uses == "scorecard_table"
+
+
+def test_the_run_tables_are_declared_data_sources() -> None:
+    from arena_evaluation.storage.run_tables import RUN_TABLES
+
+    assert {"flow_runs", "flow_cells", "flow_object_uses", "flow_map_pairs"} <= set(RUN_TABLES) <= declared_data_sources()
+    assert validate_data_source("flow_cells") == "flow_cells"

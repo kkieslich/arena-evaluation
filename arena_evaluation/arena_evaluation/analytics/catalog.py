@@ -24,6 +24,7 @@ from arena_evaluation.storage.registry import (
     table as registry_table,
 )
 from arena_evaluation.storage.registry.analysis import EvidenceIndex
+from arena_evaluation.storage.run_tables import RUN_TABLE_SCHEMAS, scan_run_tables
 from arena_evaluation.storage.star_schema import (
     scan_series_tables,
     scan_star_schema,
@@ -200,6 +201,7 @@ def _merged_tables(source_dir: pathlib.Path, manifest: object) -> dict[str, pl.L
             **scan_star_schema(src_path),
             **scan_series_tables(src_path),
             **scan_telemetry_tables(src_path),
+            **scan_run_tables(src_path, empty=True),
         }
         if "dim_episodes" in tables:
             tables["dim_episodes"] = tables["dim_episodes"].with_columns(
@@ -285,6 +287,8 @@ class BenchmarkCatalog:
             self._tables[name] = _to_lazy(raw) if raw is not None else pl.LazyFrame(schema=schema)
         if source is not None:
             self._tables.update({name: _to_lazy(frame) for name, frame in source.items() if name not in self._tables})
+        for name, schema in RUN_TABLE_SCHEMAS.items():
+            self._tables.setdefault(name, pl.LazyFrame(schema=schema))
         self._tables.setdefault("evidence_index", pl.LazyFrame(schema=EVIDENCE_INDEX_SCHEMA))
 
     def _load_directory(self, source_dir: pathlib.Path) -> None:
@@ -296,6 +300,7 @@ class BenchmarkCatalog:
         if merge_manifest is None:
             for scan in (scan_star_schema, scan_series_tables, scan_telemetry_tables):
                 self._tables.update(scan(source_dir))
+            self._tables.update(scan_run_tables(source_dir, empty=True))
             self._tables.update(scan_derived_tables(source_dir))
         else:
             self._tables.update(_merged_tables(source_dir, merge_manifest))

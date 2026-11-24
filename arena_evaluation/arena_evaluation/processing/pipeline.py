@@ -1252,5 +1252,11 @@ class ProcessingPipeline:
         benchmark_dir = self.folder_manager.benchmark_dir(benchmark_id)
         enforce_benchmark_contract(benchmark_dir)
         write_benchmark_stamp(benchmark_dir)
+        from arena_evaluation.processing.flow.benchmark import write_flow_tables
+
+        with _phase_context(self.profiler, "flow"):
+            flowed = write_flow_tables(benchmark_dir)
+        if len(flowed.runs):
+            print(f"Phase 3: flow change of {len(flowed.runs)} flowedit suite runs against their base worlds", flush=True)
         print(f"Done. {len(episodes)} episodes -> {benchmark_dir}")
         return benchmark_dir

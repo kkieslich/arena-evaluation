@@ -152,3 +152,40 @@ Scores an episode whose robot phases hold a judge-only goto on a named pedestria
 | `search_driving_s` | s | `search_time_to_find_s - search_stopped_s` |
 
 `PRIMARY_OUTPUTS` are `search_time_to_find_s`, `search_found` and `search_tsr`.
+
+## Flow measures (FLOWEDIT)
+
+How a layout edit changes where pedestrians walk, stand and head, from the runs of a `flowedit suite` (Arena `generative/flowedit`). Code: `processing/flow/`. Every stage of such a suite is named `<world>__s<seed>` with one episode, and an edited world is `<base>__<edit id>`; the stage names parse with flowedit's own `parse_stage_name` and `base_of`. An edit stage and its base stage at the same seed ran the same crowd, so each edit run is scored against the base run of its own contestant (`planner`) at its seed.
+
+`process_benchmark` computes them after the fact tables are published (`flow/benchmark.py`, `write_flow_tables`) for every usable run (`benchmark_runs.episode_runs`: an env of an episode with fact rows, or of a crowd-only one) of a suite stage that is no reference run, from its pedestrian tracks (`ped_track_store.tracks_for_episode`), and writes four tables at the benchmark root (`storage/run_tables.py`, report data sources of the same names). A benchmark without suite stages has none, and stale ones are removed.
+
+**Maps:** 0.5 m cells over the base world's rooms (its zones, moved by their level origins), so a base and each of its edits are counted on the same cells. Each cell holds pedestrian-seconds in 8 heading bins of 45 degrees, bin `k` for headings in [-180 + 45 k, -180 + 45 (k + 1)) degrees, plus a standing bin (speed under 0.2 m/s). A frame lasts until the pedestrian's next one, at most 4 of its median steps. Velocities missing from the recording come from the positions. Time outside the rooms does not count.
+
+**Divergence:** Jensen-Shannon in bits between two maps, each normalized: 0 for the same flow, 1 for disjoint cells or headings. `*_occupancy` sums the headings first.
+
+`flow_runs.parquet`, one row per scored run (`planner`, `stage`, `episode`, `env`):
+
+| Column | Definition |
+|---|---|
+| `flow_world`, `flow_seed`, `flow_base` | parsed from the stage name |
+| `flow_peds` | pedestrians of the run by pairing key, in its episode window |
+| `flow_room_ped_seconds` | pedestrian-seconds on the base world's grid, None without the base world |
+| `flow_reference_stage` | `<base>__s<seed>`, None for a base stage or without a base run of the same contestant at that seed |
+| `flow_jsd`, `flow_jsd_occupancy` | divergence from the base run at the same seed |
+| `flow_paired_peds`, `flow_unpaired_peds` | pedestrians both runs have by key, and those only one has |
+| `flow_jsd_pooled`, `flow_jsd_pooled_occupancy`, `flow_pooled_seeds` | divergence of the seed-averaged maps over the seeds both worlds ran for the contestant, the same on every row of the world and contestant |
+
+The pooled divergence is the primary score: it measures the systematic flow change. The paired one also counts a crowd that ran differently after one pedestrian was turned another way, so an inert footprint can score clearly above 0 per seed while its pooled map barely moves.
+
+`flow_cells.parquet`, the map of every scored run, one row per cell and bin that holds time (kkieslich/Arena's flowedit search and forecaster read it):
+
+| Column | Definition |
+|---|---|
+| `planner`, `stage`, `flow_world`, `flow_base`, `flow_seed` | the run |
+| `x`, `y`, `cell_m` | cell centre in the world frame, on the base world's grid, and the cell size |
+| `heading_rad` | centre of the walking-direction bin, None for standing |
+| `ped_seconds` | pedestrian-seconds in the cell and bin |
+
+`flow_object_uses.parquet`, per scored run and anchor object of HumanSim's interactions (`pedestrian_interactions` in the episode window): `uses`, the interactions that reached holding, and `max_queue`, the most members queued in one interaction's frame (`pedestrian_interaction_members`).
+
+`flow_map_pairs.parquet`, the maps the `flow_map` plot draws (`flow/plots.py`): per edit and contestant, its base world's occupancy and the edit's in pedestrian-seconds per m² per run, each the mean of the seeds both ran, the walking time summed as a vector along the headings, the arrow cells (the 60th percentile of the walked cells and up), and the colour scales every pair shares (the 99th percentile of the occupancy and of the absolute difference). The `flow` report draws the scores (`flow_jsd`), the maps (`flow_map`) and the per-stage table.
