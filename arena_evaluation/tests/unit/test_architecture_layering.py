@@ -46,6 +46,9 @@ _PRESENTATION_ALLOWED: tuple[str, ...] = (
 )
 _PRESENTATION_PINNED: dict[tuple[str, str], set[str]] = {
     ("manifest_registry.py", "arena_evaluation.benchmark.tree"): set(),
+    # the flow map draws the base world's zone outlines, which only the world model knows
+    ("plot_types/flow.py", "arena_evaluation.processing.flow"): {"zone_polygons"},
+    ("plot_types/flow.py", "arena_evaluation.processing.metrics.edge_case.provenance"): {"world_view"},
     (
         "plot_types/acoustic_field.py",
         "arena_evaluation.processing.acoustics.door_map",

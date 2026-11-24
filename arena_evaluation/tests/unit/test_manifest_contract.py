@@ -316,7 +316,35 @@ def full_registry_bench(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Pat
         ]
         pl.DataFrame(ra_rows, schema=ra_schema).write_parquet(topics_dir / f"{RobotAcoustics.table_name}.parquet")
 
+    _write_flow_tables(bench)
     return bench
+
+
+def _write_flow_tables(bench: pathlib.Path) -> None:
+    """The run tables of a flowedit suite (`storage.run_tables`): a base world and one edit, two seeds each."""
+    import numpy as np
+
+    from arena_evaluation.processing.flow import FlowGrid
+    from arena_evaluation.processing.flow.plots import map_pairs
+    from arena_evaluation.storage.run_tables import FLOW_CELL_SCHEMA, FLOW_RUN_SCHEMA, FLOW_USES_SCHEMA, run_table_path
+
+    grid = FlowGrid.from_polygons([[(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (0.0, 2.0)]])
+    base, edit = "room", "room__move_fountain__ab"
+    cells, runs = [], []
+    for episode, (world, seed) in enumerate((w, s) for w in (base, edit) for s in (1, 2)):
+        counts = grid.empty()
+        counts[0 if world == base else 3, 0 if world == base else 7, grid.headings] = 4.0 * seed
+        counts[1, :, 4] = 1.0
+        labels = {"planner": "dwb", "stage": f"{world}__s{seed}", "flow_world": world, "flow_base": base, "flow_seed": seed}
+        cells.append(grid.cells(counts).with_columns(pl.lit(v).cast(FLOW_CELL_SCHEMA[k]).alias(k) for k, v in labels.items()).select(list(FLOW_CELL_SCHEMA)))
+        scored = world != base
+        runs.append({**dict.fromkeys(FLOW_RUN_SCHEMA), **labels, "episode": episode, "env": "env_0", "flow_peds": 3, "flow_room_ped_seconds": float(counts.sum()), "flow_reference_stage": f"{base}__s{seed}" if scored else None, "flow_jsd": 0.3 * seed if scored else None, "flow_jsd_occupancy": 0.2 if scored else None, "flow_paired_peds": 3 if scored else None, "flow_unpaired_peds": 0 if scored else None, "flow_jsd_pooled": 0.33 if scored else None, "flow_jsd_pooled_occupancy": 0.25 if scored else None, "flow_pooled_seeds": 2 if scored else None})
+    flow_cells = pl.concat(cells)
+    flow_cells.write_parquet(run_table_path(bench, "flow_cells"))
+    map_pairs(flow_cells).write_parquet(run_table_path(bench, "flow_map_pairs"))
+    pl.DataFrame(runs, schema=FLOW_RUN_SCHEMA).write_parquet(run_table_path(bench, "flow_runs"))
+    pl.DataFrame(schema=FLOW_USES_SCHEMA).write_parquet(run_table_path(bench, "flow_object_uses"))
+    assert np.isfinite(flow_cells["ped_seconds"].to_numpy()).all()
 
 
 @pytest.mark.parametrize("manifest_path", _manifest_paths(), ids=lambda p: p.parent.name)

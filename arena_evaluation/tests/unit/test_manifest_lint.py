@@ -22,7 +22,7 @@ def test_schema_only_lint_is_valid_without_a_benchmark() -> None:
 
     assert report.valid is True
     assert report.schema_valid is True
-    assert report.checked_manifests == 8
+    assert report.checked_manifests == 9
     assert report.checked_plots == 40
     assert report.bound_plots == 0
     assert report.unbound == ()

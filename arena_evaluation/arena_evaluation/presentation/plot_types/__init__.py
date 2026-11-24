@@ -11,6 +11,7 @@ from .bar import BarRenderer
 from .base import BasePlotRenderer
 from .box import BoxRenderer
 from .breakdown import BreakdownRenderer
+from .flow import FlowJsdRenderer, FlowMapRenderer
 from .heatmap import HeatmapRenderer
 from .hierarchy import HierarchyRenderer
 from .histogram import HistogramRenderer
@@ -31,6 +32,8 @@ RENDERER_REGISTRY: Mapping[str, type[BasePlotRenderer]] = {
     "bar": BarRenderer,
     "box": BoxRenderer,
     "breakdown": BreakdownRenderer,
+    "flow_jsd": FlowJsdRenderer,
+    "flow_map": FlowMapRenderer,
     "heatmap": HeatmapRenderer,
     "hierarchy": HierarchyRenderer,
     "histogram": HistogramRenderer,
@@ -84,6 +87,8 @@ __all__ = [
     "BasePlotRenderer",
     "BoxRenderer",
     "BreakdownRenderer",
+    "FlowJsdRenderer",
+    "FlowMapRenderer",
     "HeatmapRenderer",
     "HierarchyRenderer",
     "HistogramRenderer",

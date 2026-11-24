@@ -199,6 +199,7 @@ def test_repository_ships_the_restored_declarations_per_kind() -> None:
         "ecological",
         "everything",
         "failure_modes",
+        "flow",
         "reference",
         "safety",
         "social",
