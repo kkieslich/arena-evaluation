@@ -34,6 +34,8 @@ from arena_evaluation.processing.metrics.social.interaction_common import (
     PEDESTRIAN_ARENA_PEDS_TOPIC,
 )
 from arena_evaluation.processing.outcome import outcome_verdict
+from arena_evaluation.processing.episode_topics import episode_rows as _episode_rows
+from arena_evaluation.processing.episode_topics import episode_window as _episode_window
 from arena_evaluation.processing.parquet_store import TopicParquetStore
 from arena_evaluation.processing.pose_anchor import pose_frame, resolve_pose_source
 from arena_evaluation.processing.scoped_evaluator import (
@@ -320,24 +322,6 @@ def _metric_world(metadata: RunMetadata | None, ep: EpisodeDescriptor) -> str | 
     return None
 
 
-def _episode_window(
-    record: pl.DataFrame | pl.LazyFrame | None,
-) -> tuple[int | None, int | None]:
-    """[RUNNING stamp, terminal stamp] of the episode record, a bound is None when its row is missing."""
-    df = _frame(record)
-    if df is None or len(df) == 0:
-        return None, None
-    df = _episode_rows(df)
-    states = df["outcome_state"].to_numpy()
-    stamps = df["t_ns"].to_numpy()
-    start = next(
-        (int(t) for t, s in zip(stamps, states, strict=True) if s == _RECORD_RUNNING),
-        None,
-    )
-    end = None if states[-1] == _RECORD_RUNNING else int(stamps[-1])
-    return start, end
-
-
 def _episode_endpoints(
     aligned_df: pl.DataFrame,
     plan: pl.DataFrame | pl.LazyFrame | None,
@@ -485,24 +469,6 @@ class EpisodeEvaluation:
     rows: list[dict[str, typing.Any]]
     metrics_dir: pathlib.Path
     facts: ScopedFactTables | None = None
-
-
-def _episode_rows(record: pl.DataFrame) -> pl.DataFrame:
-    """The episode's own records in publish order, up to its first terminal record after it ran, without the next episode's queued records that share its last timestamp."""
-    df = record.sort("t_ns", maintain_order=True)
-    states = df["outcome_state"].to_numpy()
-    started = next((i for i, state in enumerate(states) if state == _RECORD_RUNNING), None)
-    if started is None:
-        return df
-    if df["episode_id"][started] is not None:
-        df = df.filter(pl.col("episode_id") == df["episode_id"][started])
-        states = df["outcome_state"].to_numpy()
-        started = next(i for i, state in enumerate(states) if state == _RECORD_RUNNING)
-    end = next(
-        (i for i in range(started, len(states)) if states[i] is not None and states[i] >= _RECORD_SUCCESS),
-        None,
-    )
-    return df if end is None else df.head(end + 1)
 
 
 def _record_conditions(record: pl.DataFrame | pl.LazyFrame) -> list[dict] | None:
@@ -708,7 +674,7 @@ def _keep_tracks(ep: EpisodeDescriptor, episode_dir: pathlib.Path) -> None:
 
 def _write_paired_pedestrians(benchmark_dir: pathlib.Path) -> None:
     """The paired pedestrian measures of every run against its stage's run without robots (`paired_peds.PAIRED_FILE`)."""
-    from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_FILE, write_paired_table
+    from arena_evaluation.processing.paired_peds import PAIRED_FILE, write_paired_table
 
     table = write_paired_table(benchmark_dir)
     if len(table):

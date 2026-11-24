@@ -13,12 +13,10 @@ import numpy as np
 import polars as pl
 
 from arena_evaluation.processing.metrics.social.pedestrian_disturbance import PedestrianDisturbanceCalculator
-from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group, by_group, worst_group
+from arena_evaluation.processing.pedestrian_groups import agent_group, by_group, worst_group
 
 if typing.TYPE_CHECKING:
     from arena_evaluation.processing.ped_track_store import Pairing
-
-# The track store is imported where it is used: metric discovery imports this module while the store's own imports load.
 
 _PER_PED = pl.List(pl.Struct({"ped": pl.String, "value": pl.Float64}))
 _BY_GROUP = pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64}))

@@ -10,6 +10,7 @@ from collections.abc import Mapping
 
 import polars as pl
 
+from arena_evaluation.processing.alignment import asof_join
 from arena_evaluation.processing.episode_topics import episode_start_stamp, episode_window
 from arena_evaluation.processing.mcap_reader import bundle_env
 from arena_evaluation.processing.parquet_store import TopicParquetStore
@@ -129,8 +130,8 @@ def track_table(topics: Mapping[str, pl.DataFrame | None], start_ns: int | None 
     frames = frames.sort("time_ns")
     meta = _meta(topics.get(META_TABLE))
     if len(meta) > 0:
-        before = frames.join_asof(meta, on="time_ns", by="agent_id", strategy="backward", check_sortedness=False)
-        after = frames.join_asof(meta, on="time_ns", by="agent_id", strategy="forward", check_sortedness=False)
+        before = asof_join(frames, meta, tolerance_ns=None, on="time_ns", by="agent_id", strategy="backward")
+        after = asof_join(frames, meta, tolerance_ns=None, on="time_ns", by="agent_id", strategy="forward")
         later = after.select(pl.col(c).alias(f"{c}_after") for c in _META_COLUMNS)
         frames = pl.concat([before, later], how="horizontal").with_columns(pl.coalesce(pl.col(c), pl.col(f"{c}_after")).alias(c) for c in _META_COLUMNS).drop(f"{c}_after" for c in _META_COLUMNS)
     else:

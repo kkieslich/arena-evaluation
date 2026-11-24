@@ -9,7 +9,7 @@ import polars as pl
 import pytest
 
 from arena_evaluation import cli
-from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_DTYPES, PAIRED_FILE
+from arena_evaluation.processing.paired_peds import PAIRED_DTYPES, PAIRED_FILE
 from arena_evaluation.processing.ped_groups import GROUP_DIRECTIONS, PED_GROUPS_FILE, PED_GROUPS_SCHEMA, format_group_table, group_rows, ped_group_table
 
 BY_GROUP = pl.List(pl.Struct({"group": pl.String, "value": pl.Float64, "peds": pl.Int64}))

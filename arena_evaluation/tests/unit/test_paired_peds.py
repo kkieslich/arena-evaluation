@@ -5,7 +5,7 @@ import pytest
 
 pl = pytest.importorskip("polars")
 
-from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_DTYPES, PAIRED_FILE, paired_deflection, paired_ped_measures, paired_table, paired_travel_time_delay, write_paired_table
+from arena_evaluation.processing.paired_peds import PAIRED_DTYPES, PAIRED_FILE, paired_deflection, paired_ped_measures, paired_table, paired_travel_time_delay, write_paired_table
 from arena_evaluation.processing.ped_track_store import TRACK_SCHEMA, pair
 
 S = 1_000_000_000

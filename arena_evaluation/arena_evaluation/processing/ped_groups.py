@@ -19,8 +19,8 @@ import polars as pl
 
 from arena_evaluation.processing.benchmark_runs import EpisodeRun, episode_runs
 from arena_evaluation.processing.edit_pairs import parse_stage
-from arena_evaluation.processing.metrics.social.paired_peds import PAIRED_FILE, PAIRED_MEASURES
-from arena_evaluation.processing.metrics.social.pedestrian_groups import FLEET_MEASURES, PED_MEASURES, agent_group, worst_group
+from arena_evaluation.processing.paired_peds import PAIRED_FILE, PAIRED_MEASURES
+from arena_evaluation.processing.pedestrian_groups import FLEET_MEASURES, PED_MEASURES, agent_group, worst_group
 from arena_evaluation.processing.ped_track_store import DEFAULT_AGENT_TYPE, strip_env
 
 PED_GROUPS_FILE = "ped_groups.parquet"

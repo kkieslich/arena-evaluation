@@ -78,9 +78,10 @@ import typing
 import numpy as np
 import polars as pl
 
-from arena_evaluation.processing.metrics.social.paired_peds import _travel_times
-from arena_evaluation.processing.metrics.social.pedestrian_groups import agent_group
+from arena_evaluation.processing.paired_peds import _travel_times
+from arena_evaluation.processing.pedestrian_groups import agent_group
 from arena_evaluation.processing import ped_track_store
+from arena_evaluation.processing.alignment import interpolate_values
 from arena_evaluation.processing.benchmark_runs import FACTS_FILE, episode_runs
 from arena_evaluation.processing.parquet_store import TopicParquetStore
 from arena_evaluation.processing.ped_track_store import DERIVED_DIR, TOPICS_DIR, topics_envs, tracks_for_episode
@@ -526,7 +527,7 @@ def _times_code() -> str:
     import hashlib
     import inspect
 
-    from arena_evaluation.processing.metrics.social import paired_peds
+    from arena_evaluation.processing import paired_peds
 
     try:
         source = inspect.getsource(_times) + inspect.getsource(paired_peds._travel_times)
@@ -694,7 +695,7 @@ def conflict_exposure(tracks: pl.DataFrame, robots: typing.Mapping[str, pl.DataF
             rt = track["time_ns"].to_numpy() / 1e9 - t0
             rx, ry = track["x"].to_numpy(), track["y"].to_numpy()
             speed = np.hypot(np.gradient(rx, rt), np.gradient(ry, rt))
-            px, py, pv = np.interp(t, rt, rx), np.interp(t, rt, ry), np.interp(t, rt, speed)
+            px, py, pv = interpolate_values(rt, rx, t), interpolate_values(rt, ry, t), interpolate_values(rt, speed, t)
             inside = (t >= rt[0]) & (t <= rt[-1])
             near |= inside & (pv > moving_mps) & (np.hypot(x - px, y - py) <= band_m)
         groups = sample["group"].to_numpy()

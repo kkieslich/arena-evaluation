@@ -56,8 +56,14 @@ def asof_join[FrameT: (pl.DataFrame, pl.LazyFrame)](
     on: str = "t_ns",
     left_on: str | None = None,
     right_on: str | None = None,
+    by: str | None = None,
+    strategy: typing.Literal["backward", "forward"] = "backward",
 ) -> FrameT:
-    """Each query row joined to the last source row at or before its time, null where none lies within tolerance_ns (no bound when None)."""
+    """Each query row joined to the last source row at or before its time (`strategy` "forward": the first at or after
+    it), null where none lies within tolerance_ns (no bound when None); with `by`, only to source rows of the same
+    value of that column (both sides sorted by time)."""
+    if by is not None:
+        return query.join_asof(source, on=on, by=by, strategy=strategy, tolerance=tolerance_ns, check_sortedness=False)
     if left_on is None:
-        return query.join_asof(source, on=on, strategy="backward", tolerance=tolerance_ns)
-    return query.join_asof(source, left_on=left_on, right_on=right_on or on, strategy="backward", tolerance=tolerance_ns)
+        return query.join_asof(source, on=on, strategy=strategy, tolerance=tolerance_ns)
+    return query.join_asof(source, left_on=left_on, right_on=right_on or on, strategy=strategy, tolerance=tolerance_ns)
