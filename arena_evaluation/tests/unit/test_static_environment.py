@@ -6,9 +6,11 @@ from types import SimpleNamespace
 import pytest
 import shapely
 
+from arena_evaluation.processing.path import static_environment
 from arena_evaluation.processing.path.static_environment import (
     build_static_grid_from_parts,
     circumradius_m,
+    grid_for_map,
     obstacle_footprint,
 )
 from arena_evaluation.processing.path.theta_star import StaticGrid, plan_route
@@ -132,3 +134,21 @@ def test_endpoint_inside_the_inflated_area_gives_an_explicit_null(start, goal, r
     assert (path.null_reason, path.refusal) == ("not_applicable", reason)
     assert path.points is None
     assert path.length_m is None
+
+
+def test_a_world_that_does_not_resolve_is_compacted_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[float] = []
+
+    def unresolved(map_name: str, run_dir: object, robot_radius_m: float) -> StaticGrid:
+        calls.append(robot_radius_m)
+        raise ValueError(f"static obstacle 'scan' of {map_name} has no bounding box")
+
+    monkeypatch.setattr(static_environment, "_world_grid", unresolved)
+    monkeypatch.setattr(static_environment, "_UNRESOLVED_WORLDS", {})
+    for radius in (0.3, 0.3, 0.25):
+        with pytest.raises(ValueError, match="no bounding box"):
+            grid_for_map("twin", None, radius)
+    assert calls == [0.3]
+    with pytest.raises(ValueError, match="no bounding box"):
+        grid_for_map("other", None, 0.3)
+    assert calls == [0.3, 0.3]

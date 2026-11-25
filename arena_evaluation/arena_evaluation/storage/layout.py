@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 from collections.abc import Callable
+from collections.abc import Set as AbstractSet
 from typing import Final
 
 import yaml
@@ -22,6 +23,7 @@ __all__ = [
     "NATIVE_LAYOUT_VERSION",
     "check_benchmark_layout",
     "episode_is_complete",
+    "episode_stamp_is_current",
     "registry_schema_hash",
     "retire_legacy_outputs",
     "write_benchmark_stamp",
@@ -73,18 +75,16 @@ def write_benchmark_stamp(benchmark_dir: pathlib.Path) -> None:
     )
 
 
-def write_episode_stamp(metrics_dir: pathlib.Path) -> None:
-    """Write the episode completion stamp in one rename, creating the metrics directory."""
-    atomic_write_text(
-        metrics_dir / _EPISODE_STAMP_FILE,
-        json.dumps(
-            {
-                "layout_version": NATIVE_LAYOUT_VERSION,
-                "schema_hash": registry_schema_hash(),
-            },
-            sort_keys=True,
-        ),
-    )
+def write_episode_stamp(metrics_dir: pathlib.Path, calculators: AbstractSet[str] | None = None) -> None:
+    """Write the episode completion stamp in one rename, creating the metrics directory; `calculators` marks an
+    evaluation of those calculators only (`evaluation process --measures`), None one of every calculator."""
+    payload: dict[str, object] = {
+        "layout_version": NATIVE_LAYOUT_VERSION,
+        "schema_hash": registry_schema_hash(),
+    }
+    if calculators is not None:
+        payload["calculators"] = sorted(calculators)
+    atomic_write_text(metrics_dir / _EPISODE_STAMP_FILE, json.dumps(payload, sort_keys=True))
 
 
 def _stamp(
@@ -105,12 +105,29 @@ def _is_current_stamp(payload: dict[str, object]) -> bool:
     return payload.get("layout_version") == NATIVE_LAYOUT_VERSION and payload.get("schema_hash") == registry_schema_hash()
 
 
-def episode_is_complete(metrics_dir: pathlib.Path) -> bool:
-    """Whether the episode metrics directory carries the current completion stamp; unreadable is incomplete."""
+def _episode_stamp(metrics_dir: pathlib.Path) -> dict[str, object] | None:
+    """The current completion stamp of an episode metrics directory, None when absent, unreadable or stale."""
     payload = _stamp(metrics_dir / _EPISODE_STAMP_FILE, json.loads, (json.JSONDecodeError,))
+    return payload if payload is not None and _is_current_stamp(payload) else None
+
+
+def episode_stamp_is_current(metrics_dir: pathlib.Path) -> bool:
+    """Whether the episode metrics directory carries a completion stamp of the native layout, whichever calculators it
+    evaluated; unreadable is not."""
+    return _episode_stamp(metrics_dir) is not None
+
+
+def episode_is_complete(metrics_dir: pathlib.Path, calculators: AbstractSet[str] | None = None) -> bool:
+    """Whether the episode metrics directory carries the current completion stamp of an evaluation that ran
+    `calculators` (None: every calculator); unreadable is incomplete. An evaluation of every calculator covers any
+    selection, one of some calculators (`write_episode_stamp`) only a selection among them."""
+    payload = _episode_stamp(metrics_dir)
     if payload is None:
         return False
-    return _is_current_stamp(payload)
+    stamped = payload.get("calculators")
+    if stamped is None:
+        return True
+    return calculators is not None and isinstance(stamped, list) and set(calculators) <= {str(name) for name in stamped}
 
 
 def _episode_directories(benchmark_dir: pathlib.Path) -> tuple[pathlib.Path, ...]:
@@ -149,7 +166,7 @@ def check_benchmark_layout(benchmark_dir: pathlib.Path) -> None:
     if legacy:
         raise _stale(root, f"{legacy[0].name} predates the native layout")
     facts = _episode_fact_files(_episode_directories(root))
-    incomplete = tuple(path for path in facts if not episode_is_complete(path.parent))
+    incomplete = tuple(path for path in facts if not episode_stamp_is_current(path.parent))
     if incomplete:
         raise _stale(root, f"{incomplete[0]} has no complete episode stamp")
     if not (root / _BENCHMARK_STAMP_FILE).is_file():
@@ -186,5 +203,5 @@ def retire_legacy_outputs(benchmark_dir: pathlib.Path) -> tuple[pathlib.Path, ..
     sources = [root / name for name in _LEGACY_BENCHMARK_FILES if (root / name).is_file()]
     if _benchmark_stamp_is_stale(root):
         sources.append(root / _BENCHMARK_STAMP_FILE)
-    sources.extend(path for path in _episode_fact_files(_episode_directories(root)) if not episode_is_complete(path.parent))
+    sources.extend(path for path in _episode_fact_files(_episode_directories(root)) if not episode_stamp_is_current(path.parent))
     return tuple(_move_to_legacy(root, source) for source in sources)

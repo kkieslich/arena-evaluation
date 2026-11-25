@@ -101,6 +101,9 @@ Examples:
   # Process all runs in a benchmark:
   evaluation process --benchmark-dir /opt/arena_ws/data/my_benchmark
 
+  # Only the flow measures (track store, fleet log, flow tables), no per-episode calculator:
+  evaluation process --workers 1 --measures flow --benchmark-dir /opt/arena_ws/data/my_benchmark
+
   # Full pipeline (process + report) for a benchmark:
   evaluation run --benchmark-dir /opt/arena_ws/data/my_benchmark
 
@@ -127,7 +130,7 @@ Examples:
 """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    parser.set_defaults(run_dir=None, list_manifests=False)
+    parser.set_defaults(run_dir=None, list_manifests=False, measures=None)
 
     run_parent = argparse.ArgumentParser(add_help=False)
     run_group = run_parent.add_mutually_exclusive_group(required=False)
@@ -185,6 +188,13 @@ Examples:
         "--generate-gifs",
         action="store_true",
         help=("Render each trajectory or animation plot's GIF side artefact during the report build."),
+    )
+    run_parent.add_argument(
+        "--measures",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help="Compute only these measures: calculator names, categories, or `flow` (the flow measures, which need no calculator), with the calculators they depend on; the other metric columns are NULL with `not_selected`. Extraction, the pedestrian track store and the cross-run flow and paired pedestrian tables are the same as without. Default: every calculator. Used by run/process; ignored otherwise.",
     )
     run_parent.set_defaults(force_extract=False, force_process=False)
 
@@ -399,11 +409,20 @@ Examples:
     failed: list[pathlib.Path] = []
     if args.command in ("extract", "run", "process"):
         force_extract = args.force_extract
+        measures = None if args.command == "extract" else args.measures
+        if measures is not None:
+            from arena_evaluation.processing.metrics.registry import select_calculators
+
+            try:
+                selected = select_calculators(measures)
+            except ValueError as error:
+                parser.error(str(error))
+            print(f"Measures {' '.join(measures)}: calculators {', '.join(sorted(selected)) or 'none'}")
 
         if args.run_dir:
             for run_dir in args.run_dir:
                 fm = FolderManager(data_root=run_dir.parent)
-                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers)
+                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers, measures=measures)
 
                 if args.command == "extract":
                     print(f"Extracting single run: {run_dir}")
@@ -424,7 +443,7 @@ Examples:
         else:
             for benchmark_dir in target_dirs:
                 fm = FolderManager(data_root=benchmark_dir.parent)
-                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers)
+                pipeline = ProcessingPipeline(fm, profiler=profiler, workers=args.workers, measures=measures)
 
                 if args.command == "extract":
                     print(f"Extracting benchmark: {benchmark_dir.name}")
