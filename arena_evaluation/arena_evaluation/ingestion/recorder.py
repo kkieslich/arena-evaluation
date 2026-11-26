@@ -104,6 +104,17 @@ def _running_ns(history: dict[int, EpisodeRecord]) -> int | None:
     return stamp if stamp > 0 else None
 
 
+def _health(msg: EpisodeRecord) -> dict[str, float]:
+    """The record's health entries as seconds; a record from before the field, or a value that is no number, adds none."""
+    health: dict[str, float] = {}
+    for entry in getattr(msg, "health", ()):
+        try:
+            health[entry.key] = float(entry.value)
+        except ValueError:
+            continue
+    return health
+
+
 def _stamp_ns(stamp: Time) -> int:
     """A ROS time stamp in nanoseconds."""
     return int(stamp.sec) * _NS_PER_SECOND + int(stamp.nanosec)
@@ -1144,6 +1155,7 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
                 self.current_metadata.outcome_state = int(msg.outcome_state)
                 self.current_metadata.outcome_info = str(msg.outcome_info)
             self.current_metadata.integrity = list(msg.integrity)
+            self.current_metadata.health |= _health(msg)
 
             MetadataWriter.write(self.current_metadata, self.current_metadata_path)
         except Exception as e:
