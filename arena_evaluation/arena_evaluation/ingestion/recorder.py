@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, TypedDict, Unpack
 
 import rclpy
+import rclpy.clock
 import rosbag2_py
 import yaml
 from ament_index_python.packages import get_package_share_directory
@@ -576,7 +577,9 @@ class DataRecorderNode(ROSParamServer, EpisodeWriter):
         )
         self.get_logger().info(f"Subscribed to RecordedTopics on {topic_name}")
 
-        self.create_timer(1.0, self.discover_topics)
+        # topic discovery is a wall-time task: a steady timer, not one on the sim clock (a sim-time timer that falls behind is
+        # re-dispatched over and over by the EventsExecutor this node spins on)
+        self.create_timer(1.0, self.discover_topics, clock=rclpy.clock.Clock(clock_type=rclpy.clock.ClockType.STEADY_TIME))
 
     def _env_topic_binding(self, key: str, t_def: TopicDefinition) -> tuple[QoSProfile, Callable[..., Any]]:
         qos_profile = self.latched_qos if t_def.qos_transient_local else self.qos
