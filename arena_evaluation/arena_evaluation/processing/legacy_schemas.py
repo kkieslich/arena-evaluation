@@ -74,6 +74,7 @@ class _EpisodeRecordProto(typing.Protocol):
     obstacles_params: Iterable[object]
     conditions: str
     phases: str
+    health: Sequence[_ModeProto]
 
 
 NATIVE: typing.Final[str] = "native"
@@ -110,7 +111,7 @@ _EPISODE_FIELD_LINE: typing.Final[re.Pattern[str]] = re.compile(
     r"(?P<type>[A-Za-z][\w/]*(?:\[[^\]]*\])?)\s+(?P<name>[A-Za-z_]\w*)"
     r"(?:\s+\S.*)?"
 )
-_NATIVE_EPISODE_FIELDS: typing.Final[frozenset[str]] = frozenset(
+_NATIVE_REQUIRED_FIELDS: typing.Final[frozenset[str]] = frozenset(
     {
         "episode_id",
         "world",
@@ -132,6 +133,10 @@ _NATIVE_EPISODE_FIELDS: typing.Final[frozenset[str]] = frozenset(
         "phases",
     }
 )
+#: native fields a newer generation added: a recording from before them (Stage 1, set A, set B) is still native, the
+#: field then reads as absent (health: no entries)
+_NATIVE_OPTIONAL_FIELDS: typing.Final[tuple[str, ...]] = ("health",)
+_NATIVE_EPISODE_FIELDS: typing.Final[frozenset[str]] = _NATIVE_REQUIRED_FIELDS | frozenset(_NATIVE_OPTIONAL_FIELDS)
 _LEGACY_REQUIRED_FIELDS: typing.Final[frozenset[str]] = frozenset(
     {
         "episode_id",
@@ -251,6 +256,8 @@ class EpisodeFields:
     conditions: str | None
     phases: str | None
     not_recorded: tuple[str, ...]
+    #: how the env ran (`<window>_<measure>` -> seconds or counts), empty when the recording has no health field
+    health: tuple[tuple[str, float], ...] = ()
 
 
 def detect(recording: pathlib.Path) -> RecordingGeneration:
@@ -371,7 +378,7 @@ def _validated_fields(
 def episode_schema(name: str, definition: str) -> EpisodeSchema:
     """The declared fields of one recorded EpisodeRecord schema; loud on an unsupported construction."""
     if name == NATIVE_EPISODE_SCHEMA:
-        known, required = _NATIVE_EPISODE_FIELDS, _NATIVE_EPISODE_FIELDS
+        known, required = _NATIVE_EPISODE_FIELDS, _NATIVE_REQUIRED_FIELDS
     elif name == LEGACY_EPISODE_SCHEMA:
         known, required = _LEGACY_EPISODE_FIELDS, _LEGACY_REQUIRED_FIELDS
     else:
@@ -609,7 +616,22 @@ def _episode_fields(record: object, schema: EpisodeSchema, *, legacy: bool) -> E
         conditions=conditions,
         phases=phases,
         not_recorded=not_recorded,
+        health=_health(typed, schema),
     )
+
+
+def _health(record: _EpisodeRecordProto, schema: EpisodeSchema) -> tuple[tuple[str, float], ...]:
+    """The record's health entries as (key, number); none when the generation has no health field, and an entry whose
+    value is no number is left out."""
+    if not schema.carries("health"):
+        return ()
+    entries: list[tuple[str, float]] = []
+    for entry in record.health:
+        try:
+            entries.append((str(entry.key), float(entry.value)))
+        except ValueError:
+            continue
+    return tuple(entries)
 
 
 def _topic_schemas(recording: pathlib.Path) -> dict[str, tuple[str, str]]:

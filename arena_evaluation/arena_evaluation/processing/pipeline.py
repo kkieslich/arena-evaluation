@@ -69,7 +69,7 @@ _log = logging.getLogger(__name__)
 _EpisodeStatus = MutableMapping[int, tuple[str, str, str, int, int, float]]
 
 # Frames shared across robots or scoped to the whole episode, never per-robot sample data.
-_SHARED_FRAMES = frozenset({"tf", "tf_static", "world_semantics", "episode_lifecycle", "episode_integrity"})
+_SHARED_FRAMES = frozenset({"tf", "tf_static", "world_semantics", "episode_lifecycle", "episode_integrity", "episode_health"})
 KEPT_EMPTY_TABLES = ("robot_collision_contacts", "pedestrian_gestures")
 _UNCLIPPED_TABLES = frozenset({"robot_hearing_search_state"})
 

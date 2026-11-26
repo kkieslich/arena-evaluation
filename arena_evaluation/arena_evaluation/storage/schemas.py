@@ -213,6 +213,7 @@ class TopicBundle:
     pedestrian_interaction_events: pl.DataFrame | pl.LazyFrame | None = None
     episode_lifecycle: pl.DataFrame | pl.LazyFrame | None = None
     episode_integrity: pl.DataFrame | pl.LazyFrame | None = None
+    episode_health: pl.DataFrame | pl.LazyFrame | None = None
     episode_fleet_log: pl.DataFrame | pl.LazyFrame | None = None
     environment_map: pl.DataFrame | pl.LazyFrame | None = None
     environment_map_cells: pl.DataFrame | pl.LazyFrame | None = None

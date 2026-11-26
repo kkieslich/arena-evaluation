@@ -623,6 +623,20 @@ class EpisodeIntegrity(
     flag = _TEXT
 
 
+class EpisodeHealth(
+    _EnvironmentTelemetry,
+    name="episode_health",
+    kind=TableKind.TELEMETRY,
+    scope=MetricScope.EPISODE,
+):
+    """One health entry of an episode record: how the env ran in a window (`<window>_<measure>`), seconds or a count.
+    Recordings from before the field have none."""
+
+    row_key: ClassVar[tuple[str, ...]] = ("env_id", "t_ns", "measure")
+    measure = _TEXT
+    value = _FLOAT
+
+
 class Tf(
     _TransformColumns,
     _GlobalTelemetry,

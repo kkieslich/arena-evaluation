@@ -328,6 +328,12 @@ _EXPECTED: dict[str, tuple[tuple[str, pa.DataType, bool], ...]] = {
         ("flag_idx", pa.int64(), True),
         ("flag", pa.string(), True),
     ),
+    "episode_health": (
+        ("t_ns", pa.int64(), False),
+        ("env_id", pa.string(), True),
+        ("measure", pa.string(), True),
+        ("value", pa.float64(), True),
+    ),
     "tf": (
         ("t_ns", pa.int64(), False),
         ("parent_frame", pa.string(), True),

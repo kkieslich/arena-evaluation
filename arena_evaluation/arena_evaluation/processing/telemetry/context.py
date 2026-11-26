@@ -39,7 +39,7 @@ _log = logging.getLogger(__name__)
 
 
 def record_episode(sink: TableSink, envelope: Envelope[object], fields: EpisodeFields) -> None:
-    """One lifecycle row and its integrity flags from the generation-normalised episode record."""
+    """One lifecycle row, its integrity flags and its health entries from the generation-normalised episode record."""
     sink.append(
         "episode_lifecycle",
         env_row(
@@ -65,6 +65,8 @@ def record_episode(sink: TableSink, envelope: Envelope[object], fields: EpisodeF
     )
     for flag_idx, flag in enumerate(fields.integrity):
         sink.append("episode_integrity", env_row(envelope, flag_idx=flag_idx, flag=flag))
+    for measure, value in fields.health:
+        sink.append("episode_health", env_row(envelope, measure=measure, value=value))
 
 
 class FleetRecorder:
