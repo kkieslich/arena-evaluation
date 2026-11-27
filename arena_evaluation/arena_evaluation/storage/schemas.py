@@ -36,6 +36,10 @@ class RunMetadata(BaseModel):
     outcome_state: int | None = None
     outcome_info: str = ""
     integrity: list[str] = Field(default_factory=list)
+    # How the env ran, from the episode record: <window>_executor_lag_peak_s and <window>_loop_lag_peak_s, seconds, for
+    # the windows env_start or prev_teardown (before this episode built), setup, episode and, on the last episode,
+    # teardown. Not an integrity flag.
+    health: dict[str, float] = Field(default_factory=dict)
     recording_started_at: str
     arena_git_sha: str | None = None
     arena_git_dirty: bool = False
@@ -209,6 +213,7 @@ class TopicBundle:
     pedestrian_interaction_events: pl.DataFrame | pl.LazyFrame | None = None
     episode_lifecycle: pl.DataFrame | pl.LazyFrame | None = None
     episode_integrity: pl.DataFrame | pl.LazyFrame | None = None
+    episode_health: pl.DataFrame | pl.LazyFrame | None = None
     episode_fleet_log: pl.DataFrame | pl.LazyFrame | None = None
     environment_map: pl.DataFrame | pl.LazyFrame | None = None
     environment_map_cells: pl.DataFrame | pl.LazyFrame | None = None
